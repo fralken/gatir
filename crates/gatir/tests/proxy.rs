@@ -16,16 +16,34 @@ use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
 use gatir_testkit::tcp::TcpServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 struct TestProxy {
     addr: SocketAddr,
     shutdown: CancellationToken,
+    force: CancellationToken,
+    task: Option<JoinHandle<()>>,
+}
+
+impl TestProxy {
+    /// Waits up to `limit` for `Server::run` to return.
+    async fn finished_within(&mut self, limit: Duration) -> bool {
+        let Some(task) = self.task.as_mut() else {
+            return true;
+        };
+        let finished = tokio::time::timeout(limit, task).await.is_ok();
+        if finished {
+            self.task = None;
+        }
+        finished
+    }
 }
 
 impl Drop for TestProxy {
     fn drop(&mut self) {
         self.shutdown.cancel();
+        self.force.cancel();
     }
 }
 
@@ -37,8 +55,14 @@ async fn start_proxy(extra: &str) -> TestProxy {
     let server = Server::bind(&config).await.expect("bind the proxy");
     let addr = server.local_addrs()[0];
     let shutdown = CancellationToken::new();
-    tokio::spawn(server.run(shutdown.clone()));
-    TestProxy { addr, shutdown }
+    let force = CancellationToken::new();
+    let task = tokio::spawn(server.run(shutdown.clone(), force.clone()));
+    TestProxy {
+        addr,
+        shutdown,
+        force,
+        task: Some(task),
+    }
 }
 
 /// A proxy-style GET request (absolute-form target).
@@ -743,4 +767,195 @@ async fn a_tunnel_can_follow_plain_requests_on_the_same_connection() {
     assert_eq!(client.read_response(true).await.unwrap().status, 200);
     client.send("after").await.unwrap();
     assert_eq!(client.read_exact(5).await.unwrap(), b"after");
+}
+
+// ---- client timeouts, request limits and shutdown ----
+
+#[tokio::test]
+async fn a_silent_client_connection_is_closed_after_the_idle_timeout() {
+    let proxy = start_proxy("[timeouts]\nclient_idle_secs = 1").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    let started = std::time::Instant::now();
+    assert!(client.read_to_end().await.unwrap().is_empty());
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(900),
+        "closed too early: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "closed too late: {waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_connection_is_closed_when_idle_between_requests() {
+    let origin = MockOrigin::start(|_| Reply::ok("hi")).await;
+    let proxy = start_proxy("[timeouts]\nclient_idle_secs = 1").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    client
+        .send(get(&origin.authority(), "/", ""))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(false).await.unwrap().body_text(), "hi");
+
+    let started = std::time::Instant::now();
+    assert!(client.read_to_end().await.unwrap().is_empty());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn a_request_head_that_never_completes_is_dropped() {
+    let proxy = start_proxy("[timeouts]\nclient_idle_secs = 1").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    // No blank line ends the header section.
+    client
+        .send("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n")
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let _ = client.read_to_end().await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// The proxy must answer 431 or, when it gives up mid-upload, just close.
+async fn assert_refused(client: &mut RawClient) {
+    if let Ok(response) = client.read_response(false).await {
+        assert_eq!(response.status, 431);
+    }
+}
+
+#[tokio::test]
+async fn large_but_reasonable_request_heads_are_forwarded() {
+    let origin = MockOrigin::start(|_| Reply::ok("ok")).await;
+    let proxy = start_proxy("").await;
+
+    // Big cookies are common in practice.
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    let cookie = format!("Cookie: {}\r\n", "c".repeat(50 * 1024));
+    client
+        .send(get(&origin.authority(), "/", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(false).await.unwrap().status, 200);
+
+    // Close to the field-count limit.
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    let fields: String = (0..90).map(|i| format!("X-{i}: v\r\n")).collect();
+    client
+        .send(get(&origin.authority(), "/", &fields))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(false).await.unwrap().status, 200);
+}
+
+#[tokio::test]
+async fn oversized_request_heads_are_refused() {
+    let origin = MockOrigin::start(|_| Reply::ok("must not be reached")).await;
+    let proxy = start_proxy("").await;
+
+    // Header fields larger than the limit, just over it and far over it. The
+    // proxy may close while we are still sending.
+    for size in [70 * 1024, 100 * 1024, 1024 * 1024] {
+        let mut client = RawClient::connect(proxy.addr).await.unwrap();
+        let big = format!("X-Big: {}\r\n", "a".repeat(size));
+        let _ = client.send(get(&origin.authority(), "/", &big)).await;
+        assert_refused(&mut client).await;
+    }
+
+    // Too many header fields.
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    let many: String = (0..150).map(|i| format!("X-{i}: v\r\n")).collect();
+    let _ = client.send(get(&origin.authority(), "/", &many)).await;
+    assert_refused(&mut client).await;
+
+    assert!(
+        origin.requests().is_empty(),
+        "the origin saw an oversized request"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_lets_an_active_request_finish_then_closes_the_connection() {
+    let origin = MockOrigin::start(|_| Reply::ok("late").after(Duration::from_millis(600))).await;
+    let mut proxy = start_proxy("").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    client
+        .send(get(&origin.authority(), "/", ""))
+        .await
+        .unwrap();
+    eventually("the origin to receive the request", || {
+        !origin.requests().is_empty()
+    })
+    .await;
+
+    proxy.shutdown.cancel();
+    let response = client.read_response(false).await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body_text(), "late");
+    assert!(client.closed_within(Duration::from_secs(2)).await);
+    assert!(proxy.finished_within(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn shutdown_closes_idle_keep_alive_connections_at_once() {
+    let origin = MockOrigin::start(|_| Reply::ok("hi")).await;
+    let mut proxy = start_proxy("").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    client
+        .send(get(&origin.authority(), "/", ""))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(false).await.unwrap().status, 200);
+
+    proxy.shutdown.cancel();
+    assert!(client.closed_within(Duration::from_secs(2)).await);
+    assert!(proxy.finished_within(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn shutdown_stops_accepting_connections() {
+    let mut proxy = start_proxy("").await;
+    proxy.shutdown.cancel();
+
+    assert!(proxy.finished_within(Duration::from_secs(2)).await);
+    assert!(tokio::net::TcpStream::connect(proxy.addr).await.is_err());
+}
+
+#[tokio::test]
+async fn shutdown_lets_a_tunnel_run_until_the_grace_period_ends() {
+    let echo = echo_server().await;
+    let mut proxy = start_proxy("[timeouts]\nshutdown_grace_secs = 1").await;
+    let mut client = open_tunnel(&proxy, &echo.authority()).await;
+
+    proxy.shutdown.cancel();
+
+    // The tunnel keeps working during the grace period...
+    client.send("still here").await.unwrap();
+    assert_eq!(client.read_exact(10).await.unwrap(), b"still here");
+    assert!(!proxy.finished_within(Duration::from_millis(200)).await);
+
+    // ...and is closed when the period ends.
+    assert!(proxy.finished_within(Duration::from_secs(4)).await);
+    assert!(client.closed_within(Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn a_second_interrupt_closes_everything_at_once() {
+    let echo = echo_server().await;
+    let mut proxy = start_proxy("[timeouts]\nshutdown_grace_secs = 30").await;
+    let mut client = open_tunnel(&proxy, &echo.authority()).await;
+
+    proxy.shutdown.cancel();
+    assert!(!proxy.finished_within(Duration::from_millis(200)).await);
+
+    proxy.force.cancel();
+    assert!(proxy.finished_within(Duration::from_secs(2)).await);
+    assert!(client.closed_within(Duration::from_secs(2)).await);
 }

@@ -23,18 +23,27 @@ pub async fn run(config: &Config) -> io::Result<()> {
     }
 
     let shutdown = CancellationToken::new();
+    let force = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();
+        let force = force.clone();
         async move {
-            match wait_for_signal().await {
-                Ok(()) => tracing::info!("shutdown requested"),
-                Err(err) => tracing::error!(%err, "cannot listen for shutdown signals"),
+            if let Err(err) = wait_for_signal().await {
+                tracing::error!(%err, "cannot listen for shutdown signals");
+                shutdown.cancel();
+                return;
             }
+            tracing::info!("shutdown requested; interrupt again to close everything now");
             shutdown.cancel();
+
+            if wait_for_signal().await.is_ok() {
+                tracing::warn!("second interrupt, closing everything now");
+            }
+            force.cancel();
         }
     });
 
-    server.run(shutdown).await;
+    server.run(shutdown, force).await;
     Ok(())
 }
 

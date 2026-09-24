@@ -12,6 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional};
+use tokio_util::sync::CancellationToken;
 
 use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
@@ -51,19 +52,21 @@ async fn open(request: Request<Incoming>, context: &Context) -> Result<Response<
     let upstream = connect_tcp(&address, context.timeouts.connect).await?;
 
     let idle = context.timeouts.tunnel_idle;
+    let force = context.force.clone();
     let upgrade = hyper::upgrade::on(request);
-    tokio::spawn(async move {
+    // Tracked, so a graceful shutdown waits for the tunnel.
+    context.tracker.spawn(async move {
         match upgrade.await {
-            Ok(upgraded) => relay(TokioIo::new(upgraded), upstream, idle).await,
+            Ok(upgraded) => relay(TokioIo::new(upgraded), upstream, idle, force).await,
             Err(err) => tracing::debug!(%err, "CONNECT upgrade failed"),
         }
     });
     Ok(Response::new(full(Bytes::new())))
 }
 
-/// Copies bytes both ways until both directions finish, one side fails, or no
-/// byte has moved in either direction for `idle`.
-async fn relay<C, U>(client: C, mut upstream: U, idle: Duration)
+/// Copies bytes both ways until both directions finish, one side fails, no
+/// byte has moved in either direction for `idle`, or `force` is cancelled.
+async fn relay<C, U>(client: C, mut upstream: U, idle: Duration, force: CancellationToken)
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -84,6 +87,7 @@ where
             Err(err) => tracing::debug!(%err, "tunnel ended with error"),
         },
         () = wait_until_idle(&activity, idle) => tracing::debug!("tunnel closed after being idle"),
+        () = force.cancelled() => tracing::debug!("tunnel closed at shutdown"),
     }
 }
 
@@ -181,7 +185,12 @@ mod tests {
     async fn bytes_flow_both_ways_and_close_propagates() {
         let (mut client, client_side) = duplex(1024);
         let (upstream_side, mut upstream) = duplex(1024);
-        let relay = tokio::spawn(relay(client_side, upstream_side, Duration::from_secs(30)));
+        let relay = tokio::spawn(relay(
+            client_side,
+            upstream_side,
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        ));
 
         client.write_all(b"ping").await.unwrap();
         let mut buffer = [0u8; 4];
@@ -202,7 +211,7 @@ mod tests {
         let (mut client, client_side) = duplex(1024);
         let (upstream_side, mut upstream) = duplex(1024);
         let started = Instant::now();
-        relay(client_side, upstream_side, IDLE).await;
+        relay(client_side, upstream_side, IDLE, CancellationToken::new()).await;
 
         assert!(started.elapsed() >= IDLE);
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -216,7 +225,12 @@ mod tests {
     async fn traffic_in_either_direction_keeps_the_tunnel_open() {
         let (mut client, client_side) = duplex(1024);
         let (upstream_side, mut upstream) = duplex(1024);
-        let mut relay = tokio::spawn(relay(client_side, upstream_side, IDLE));
+        let mut relay = tokio::spawn(relay(
+            client_side,
+            upstream_side,
+            IDLE,
+            CancellationToken::new(),
+        ));
 
         // Well past the idle limit in total, but never idle for that long.
         for round in 0..8 {
@@ -240,10 +254,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forced_shutdown_closes_an_active_tunnel() {
+        let (mut client, client_side) = duplex(1024);
+        let (upstream_side, mut upstream) = duplex(1024);
+        let force = CancellationToken::new();
+        let relay = tokio::spawn(relay(
+            client_side,
+            upstream_side,
+            Duration::from_secs(30),
+            force.clone(),
+        ));
+
+        client.write_all(b"x").await.unwrap();
+        let mut byte = [0u8; 1];
+        upstream.read_exact(&mut byte).await.unwrap();
+
+        force.cancel();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay should stop when forced")
+            .unwrap();
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn half_close_is_forwarded_and_the_other_direction_keeps_working() {
         let (mut client, client_side) = duplex(1024);
         let (upstream_side, mut upstream) = duplex(1024);
-        let relay = tokio::spawn(relay(client_side, upstream_side, Duration::from_secs(30)));
+        let relay = tokio::spawn(relay(
+            client_side,
+            upstream_side,
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        ));
 
         client.write_all(b"request").await.unwrap();
         client.shutdown().await.unwrap();

@@ -6,34 +6,47 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::Method;
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use super::body::error_response;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::config::{Config, Timeouts};
 
-/// Largest request head (start line plus header fields) accepted, in bytes.
+/// Largest request head (target plus header fields) accepted, in bytes.
+///
+/// hyper's own buffer limit is approximate (a head somewhat over it can still
+/// get through), so `head_size` enforces the exact figure.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Most header fields accepted in one request.
 const MAX_HEADERS: usize = 100;
 
-/// Settings shared by every connection.
+/// State shared by every connection of a running server.
 pub(super) struct Context {
     pub access: Acl,
     pub timeouts: Timeouts,
+    /// Every task serving a client, so shutdown can wait for them.
+    pub tracker: TaskTracker,
+    /// Cancelled to begin a graceful shutdown: stop accepting, finish what is
+    /// in flight.
+    pub shutdown: CancellationToken,
+    /// Cancelled to close everything immediately.
+    pub force: CancellationToken,
 }
 
 /// Bound listeners, ready to accept clients.
 pub struct Server {
     listeners: Vec<TcpListener>,
-    context: Arc<Context>,
+    access: Acl,
+    timeouts: Timeouts,
 }
 
 impl Server {
@@ -48,10 +61,8 @@ impl Server {
         }
         Ok(Self {
             listeners,
-            context: Arc::new(Context {
-                access: config.access.clone(),
-                timeouts: config.timeouts.clone(),
-            }),
+            access: config.access.clone(),
+            timeouts: config.timeouts.clone(),
         })
     }
 
@@ -63,30 +74,54 @@ impl Server {
             .collect()
     }
 
-    /// Serves clients until `shutdown` is cancelled.
-    pub async fn run(self, shutdown: CancellationToken) {
-        let tracker = TaskTracker::new();
+    /// Serves clients until shut down.
+    ///
+    /// Cancelling `shutdown` stops accepting new connections and lets active
+    /// requests and tunnels finish, for at most `timeouts.shutdown_grace`;
+    /// idle connections close at once. Cancelling `force`, or the end of the
+    /// grace period, closes everything that is left. Returns once every
+    /// connection is gone.
+    pub async fn run(self, shutdown: CancellationToken, force: CancellationToken) {
+        let context = Arc::new(Context {
+            access: self.access,
+            timeouts: self.timeouts,
+            tracker: TaskTracker::new(),
+            shutdown: shutdown.clone(),
+            force: force.clone(),
+        });
         for listener in self.listeners {
-            tracker.spawn(accept_loop(
-                listener,
-                self.context.clone(),
-                shutdown.clone(),
-                tracker.clone(),
-            ));
+            context
+                .tracker
+                .spawn(accept_loop(listener, context.clone()));
         }
+
         shutdown.cancelled().await;
+        context.tracker.close();
+        let grace = context.timeouts.shutdown_grace;
+        tracing::info!(
+            grace_secs = grace.as_secs(),
+            "shutting down, waiting for active connections"
+        );
+
+        tokio::select! {
+            () = context.tracker.wait() => {}
+            () = tokio::time::sleep(grace) => {
+                tracing::warn!("grace period over, closing the remaining connections");
+                force.cancel();
+                context.tracker.wait().await;
+            }
+            () = force.cancelled() => {
+                tracing::warn!("forced shutdown, closing the remaining connections");
+                context.tracker.wait().await;
+            }
+        }
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    context: Arc<Context>,
-    shutdown: CancellationToken,
-    tracker: TaskTracker,
-) {
+async fn accept_loop(listener: TcpListener, context: Arc<Context>) {
     loop {
         let accepted = tokio::select! {
-            () = shutdown.cancelled() => return,
+            () = context.shutdown.cancelled() => return,
             accepted = listener.accept() => accepted,
         };
         let (stream, peer) = match accepted {
@@ -101,10 +136,12 @@ async fn accept_loop(
 
         if context.access.check(peer.ip()) == Action::Deny {
             tracing::info!(peer = %peer.ip(), "connection denied by the access rules");
-            tracker.spawn(deny(stream));
+            context.tracker.spawn(deny(stream));
             continue;
         }
-        tracker.spawn(serve_connection(stream, peer, context.clone()));
+        context
+            .tracker
+            .spawn(serve_connection(stream, peer, context.clone()));
     }
 }
 
@@ -135,9 +172,18 @@ async fn serve_connection(stream: TcpStream, peer: SocketAddr, context: Arc<Cont
     }
 
     let client_idle = context.timeouts.client_idle;
+    let shutdown = context.shutdown.clone();
+    let force = context.force.clone();
     let service = service_fn(move |request| {
         let context = context.clone();
         async move {
+            if head_size(&request) > MAX_HEAD_BYTES {
+                return Ok(error_response(
+                    StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "The request headers are too large",
+                    true,
+                ));
+            }
             let response = if request.method() == Method::CONNECT {
                 tunnel::handle(request, &context, peer).await
             } else {
@@ -155,8 +201,38 @@ async fn serve_connection(stream: TcpStream, peer: SocketAddr, context: Arc<Cont
         .max_headers(MAX_HEADERS)
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
+    let mut connection = std::pin::pin!(connection);
 
-    if let Err(err) = connection.await {
-        tracing::debug!(%peer, %err, "client connection ended with error");
+    let mut draining = false;
+    loop {
+        tokio::select! {
+            result = connection.as_mut() => {
+                if let Err(err) = result {
+                    tracing::debug!(%peer, %err, "client connection ended with error");
+                }
+                return;
+            }
+            // Finish the request in flight, then close; an idle connection
+            // closes immediately.
+            () = shutdown.cancelled(), if !draining => {
+                draining = true;
+                connection.as_mut().graceful_shutdown();
+            }
+            () = force.cancelled() => {
+                tracing::debug!(%peer, "client connection closed at shutdown");
+                return;
+            }
+        }
     }
+}
+
+/// Size of the request head, counting the request target and every field.
+fn head_size(request: &Request<Incoming>) -> usize {
+    let target = request.uri().to_string().len();
+    let fields: usize = request
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len() + 4)
+        .sum();
+    target + fields
 }

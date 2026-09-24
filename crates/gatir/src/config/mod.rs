@@ -81,6 +81,9 @@ pub struct Timeouts {
     /// A CONNECT tunnel with no traffic in either direction is closed after
     /// this long.
     pub tunnel_idle: Duration,
+    /// On shutdown, how long to wait for active connections and tunnels to
+    /// finish before closing them.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for Timeouts {
@@ -89,6 +92,7 @@ impl Default for Timeouts {
             connect: Duration::from_secs(10),
             client_idle: Duration::from_secs(60),
             tunnel_idle: Duration::from_secs(600),
+            shutdown_grace: Duration::from_secs(10),
         }
     }
 }
@@ -140,6 +144,7 @@ struct RawTimeouts {
     connect_secs: Option<u64>,
     client_idle_secs: Option<u64>,
     tunnel_idle_secs: Option<u64>,
+    shutdown_grace_secs: Option<u64>,
 }
 
 impl RawTimeouts {
@@ -156,6 +161,11 @@ impl RawTimeouts {
                 "tunnel_idle_secs",
                 self.tunnel_idle_secs,
                 defaults.tunnel_idle,
+            )?,
+            shutdown_grace: timeout(
+                "shutdown_grace_secs",
+                self.shutdown_grace_secs,
+                defaults.shutdown_grace,
             )?,
         })
     }
@@ -257,10 +267,11 @@ impl Config {
             join(self.no_proxy.entries().iter())
         };
         let timeouts = format!(
-            "connect {}s, client idle {}s, tunnel idle {}s",
+            "connect {}s, client idle {}s, tunnel idle {}s, shutdown grace {}s",
             self.timeouts.connect.as_secs(),
             self.timeouts.client_idle.as_secs(),
-            self.timeouts.tunnel_idle.as_secs()
+            self.timeouts.tunnel_idle.as_secs(),
+            self.timeouts.shutdown_grace.as_secs()
         );
         format!(
             "listen:      {listen}\nparents:     {parents}\ncredentials: {credentials}\n\
@@ -746,9 +757,12 @@ mod tests {
     fn timeouts_have_defaults_and_can_be_overridden() {
         assert_eq!(load("").unwrap().timeouts, Timeouts::default());
 
-        let config = load("[timeouts]\nconnect_secs = 3\ntunnel_idle_secs = 90").unwrap();
+        let config =
+            load("[timeouts]\nconnect_secs = 3\ntunnel_idle_secs = 90\nshutdown_grace_secs = 2")
+                .unwrap();
         assert_eq!(config.timeouts.connect, Duration::from_secs(3));
         assert_eq!(config.timeouts.tunnel_idle, Duration::from_secs(90));
+        assert_eq!(config.timeouts.shutdown_grace, Duration::from_secs(2));
         assert_eq!(config.timeouts.client_idle, Timeouts::default().client_idle);
     }
 
@@ -758,6 +772,7 @@ mod tests {
             "[timeouts]\nconnect_secs = 0",
             "[timeouts]\nclient_idle_secs = 86401",
             "[timeouts]\ntunnel_idle_secs = -5",
+            "[timeouts]\nshutdown_grace_secs = 0",
             "[timeouts]\nconnect = 5",
         ] {
             assert!(load(toml).is_err(), "should reject {toml:?}");
