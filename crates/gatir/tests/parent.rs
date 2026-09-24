@@ -11,6 +11,8 @@ use common::*;
 use gatir_testkit::closed_port;
 use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
+use gatir_testkit::tcp::TcpServer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn parents_toml(parents: &[SocketAddr]) -> String {
     let list: Vec<String> = parents.iter().map(|addr| format!("\"{addr}\"")).collect();
@@ -279,4 +281,173 @@ async fn header_names_keep_their_capitalization_in_both_directions() {
 
     let names: Vec<&str> = response.headers.iter().map(|(name, _)| name).collect();
     assert!(names.contains(&"X-ReplY-CaSe"), "{names:?}");
+}
+
+// ---- CONNECT through a parent ----
+
+const ESTABLISHED: &str = "HTTP/1.1 200 Connection established\r\n\r\n";
+
+/// A parent that accepts every CONNECT and turns it into an echo tunnel.
+async fn tunnelling_parent() -> MockOrigin {
+    MockOrigin::start(|request| {
+        if request.method == "CONNECT" {
+            Reply::raw(ESTABLISHED).then_echo()
+        } else {
+            Reply::ok("plain")
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn connect_is_sent_to_the_parent_and_bytes_flow_through_it() {
+    let parent = tunnelling_parent().await;
+    let proxy = start_proxy(&parents_toml(&[parent.addr()])).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(
+            "CONNECT secure.example.com:443 HTTP/1.1\r\n\
+             Host: secure.example.com:443\r\n\
+             User-Agent: test-agent/1.0\r\n\
+             Proxy-Authorization: Basic c2VjcmV0\r\n\
+             Proxy-Connection: keep-alive\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(true).await.unwrap().status, 200);
+
+    client.send("hello through the parent").await.unwrap();
+    assert_eq!(
+        client.read_exact(24).await.unwrap(),
+        b"hello through the parent"
+    );
+
+    let seen = &parent.requests()[0];
+    assert_eq!(seen.method, "CONNECT");
+    assert_eq!(seen.target, "secure.example.com:443");
+    assert_eq!(seen.headers.get("host"), Some("secure.example.com:443"));
+    assert_eq!(seen.headers.get("user-agent"), Some("test-agent/1.0"));
+    for name in ["proxy-authorization", "proxy-connection"] {
+        assert!(!seen.headers.contains(name), "{name} reached the parent");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_from_the_parent_reaches_the_client() {
+    let parent = MockOrigin::start(|_| {
+        Reply::raw("HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nforbidden")
+    })
+    .await;
+    let proxy = start_proxy(&parents_toml(&[parent.addr()])).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(connect_request("blocked.example.com:443"))
+        .await
+        .unwrap();
+    let response = client.read_response(false).await.unwrap();
+
+    assert_eq!(response.status, 403);
+    assert_eq!(response.body_text(), "forbidden");
+}
+
+#[tokio::test]
+async fn connect_fails_over_to_the_next_parent() {
+    let dead = closed_port().await;
+    let live = tunnelling_parent().await;
+    let proxy = start_proxy(&parents_toml(&[dead, live.addr()])).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(connect_request("secure.example.com:443"))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(true).await.unwrap().status, 200);
+    client.send("ping").await.unwrap();
+    assert_eq!(client.read_exact(4).await.unwrap(), b"ping");
+}
+
+#[tokio::test]
+async fn connect_with_every_parent_down_gives_a_502() {
+    let proxy = start_proxy(&parents_toml(&[closed_port().await])).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(connect_request("secure.example.com:443"))
+        .await
+        .unwrap();
+    let response = client.read_response(false).await.unwrap();
+
+    assert_eq!(response.status, 502);
+    assert!(
+        response
+            .body_text()
+            .contains("No parent proxy is reachable")
+    );
+}
+
+#[tokio::test]
+async fn a_parent_that_hangs_up_on_connect_gives_a_502() {
+    let parent = TcpServer::start(|stream| async move { drop(stream) }).await;
+    let proxy = start_proxy(&parents_toml(&[parent.addr()])).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(connect_request("secure.example.com:443"))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(false).await.unwrap().status, 502);
+}
+
+#[tokio::test]
+async fn no_proxy_destinations_are_tunnelled_directly() {
+    let parent = tunnelling_parent().await;
+    let echo = echo_server().await;
+    let config = format!(
+        "{}no_proxy = [\"127.0.0.1\"]\n",
+        parents_toml(&[parent.addr()])
+    );
+    let proxy = start_proxy(&config).await;
+
+    let mut client = open_tunnel(&proxy, &echo.authority()).await;
+    client.send("direct").await.unwrap();
+    assert_eq!(client.read_exact(6).await.unwrap(), b"direct");
+    assert!(parent.requests().is_empty());
+}
+
+#[tokio::test]
+async fn half_close_passes_through_a_parent_tunnel() {
+    // A parent that accepts CONNECT, then answers only once the client has
+    // finished sending.
+    let parent = TcpServer::start(|mut stream| async move {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).await.is_err() {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let _ = stream.write_all(ESTABLISHED.as_bytes()).await;
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received).await;
+        let _ = stream
+            .write_all(format!("got:{}", received.len()).as_bytes())
+            .await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    let proxy = start_proxy(&parents_toml(&[parent.addr()])).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(connect_request("secure.example.com:443"))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(true).await.unwrap().status, 200);
+
+    client.send("hello").await.unwrap();
+    client.shutdown_write().await.unwrap();
+    assert_eq!(client.read_to_end().await.unwrap(), b"got:5");
 }

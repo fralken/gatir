@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -17,6 +17,7 @@ use crate::http::{Request, read_request};
 pub struct Reply {
     bytes: Vec<u8>,
     close: bool,
+    echo: bool,
     delay: Duration,
 }
 
@@ -25,6 +26,7 @@ impl Reply {
         Self {
             bytes: bytes.into(),
             close: false,
+            echo: false,
             delay: Duration::ZERO,
         }
     }
@@ -40,6 +42,13 @@ impl Reply {
     /// Close the connection after sending this reply.
     pub fn then_close(mut self) -> Self {
         self.close = true;
+        self
+    }
+
+    /// After this reply, echo back every byte received (an answer to CONNECT
+    /// that turns the connection into a tunnel to an echo server).
+    pub fn then_echo(mut self) -> Self {
+        self.echo = true;
         self
     }
 
@@ -135,6 +144,24 @@ where
         }
         if reply.close {
             let _ = stream.shutdown().await;
+            return;
+        }
+        if reply.echo {
+            echo(&mut reader).await;
+            return;
+        }
+    }
+}
+
+/// Sends back what the peer sends until it closes.
+async fn echo(reader: &mut BufReader<TcpStream>) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        if reader.get_mut().write_all(&buffer[..count]).await.is_err() {
             return;
         }
     }

@@ -8,15 +8,22 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
-use hyper::{Request, Response};
+use hyper::client::conn::http1;
+use hyper::header::{HOST, HeaderValue};
+use hyper::upgrade::{OnUpgrade, Upgraded};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional};
+use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
+use super::headers::strip_hop_by_hop;
 use super::server::Context;
+use super::upstream::Route;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -37,9 +44,13 @@ pub(super) async fn handle(
     response
 }
 
-/// Connects to the destination first, so a failure can still be reported to the
-/// client as an HTTP error; only then is the tunnel promised with a 200.
-async fn open(request: Request<Incoming>, context: &Context) -> Result<Response<Body>, Failure> {
+/// Connects to the destination first (directly, or by asking a parent proxy to),
+/// so a failure can still be reported to the client as an HTTP error; only then
+/// is the tunnel promised with a 200.
+async fn open(
+    mut request: Request<Incoming>,
+    context: &Context,
+) -> Result<Response<Body>, Failure> {
     let authority = request
         .uri()
         .authority()
@@ -47,21 +58,109 @@ async fn open(request: Request<Incoming>, context: &Context) -> Result<Response<
     let port = authority
         .port_u16()
         .ok_or(Failure::BadRequest("CONNECT needs a host:port target"))?;
-    let address = format!("{}:{port}", authority.host());
+    let host = authority.host().to_owned();
+    let address = format!("{host}:{port}");
+    let limit = context.timeouts.connect;
 
-    let upstream = connect_tcp(&address, context.timeouts.connect).await?;
+    let client_upgrade = hyper::upgrade::on(&mut request);
+    match context.upstreams.route(&host) {
+        Route::Direct => {
+            let upstream = connect_tcp(&address, limit).await?;
+            spawn_tunnel(context, client_upgrade, upstream);
+        }
+        Route::Parent => {
+            let stream = context.upstreams.connect_parent(limit).await?;
+            match connect_through_parent(stream, &address, &mut request).await? {
+                ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
+                ParentAnswer::Refused(response) => return Ok(response),
+            }
+        }
+    }
+    Ok(Response::new(full(Bytes::new())))
+}
 
+/// Relays between the client, once its connection is upgraded, and `upstream`.
+fn spawn_tunnel<U>(context: &Context, client: OnUpgrade, upstream: U)
+where
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let idle = context.timeouts.tunnel_idle;
     let force = context.force.clone();
-    let upgrade = hyper::upgrade::on(request);
     // Tracked, so a graceful shutdown waits for the tunnel.
     context.tracker.spawn(async move {
-        match upgrade.await {
+        match client.await {
             Ok(upgraded) => relay(TokioIo::new(upgraded), upstream, idle, force).await,
             Err(err) => tracing::debug!(%err, "CONNECT upgrade failed"),
         }
     });
-    Ok(Response::new(full(Bytes::new())))
+}
+
+enum ParentAnswer {
+    /// The parent agreed: the stream is now a pipe to the destination.
+    Tunnel(TokioIo<Upgraded>),
+    /// The parent said no: its answer is for the client.
+    Refused(Response<Body>),
+}
+
+/// Asks a parent proxy, over `stream`, to open a tunnel to `address`. The
+/// client's own header fields (User-Agent and the like) go along, minus the
+/// hop-by-hop ones and its proxy credentials.
+async fn connect_through_parent(
+    stream: TcpStream,
+    address: &str,
+    client_request: &mut Request<Incoming>,
+) -> Result<ParentAnswer, Failure> {
+    let mut headers = std::mem::take(client_request.headers_mut());
+    strip_hop_by_hop(&mut headers);
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(address)
+            .map_err(|_| Failure::BadRequest("the CONNECT target is invalid"))?,
+    );
+
+    let mut connect = Request::new(Empty::<Bytes>::new());
+    *connect.method_mut() = Method::CONNECT;
+    *connect.uri_mut() = address
+        .parse::<Uri>()
+        .map_err(|_| Failure::BadRequest("the CONNECT target is invalid"))?;
+    *connect.headers_mut() = headers;
+    // Carries the original capitalization of the header names.
+    *connect.extensions_mut() = std::mem::take(client_request.extensions_mut());
+
+    let (mut sender, connection) = http1::Builder::new()
+        .preserve_header_case(true)
+        .handshake(TokioIo::new(stream))
+        .await
+        .map_err(Failure::Upstream)?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.with_upgrades().await {
+            tracing::debug!(%err, "parent proxy connection ended with error");
+        }
+    });
+
+    let response = sender
+        .send_request(connect)
+        .await
+        .map_err(Failure::Upstream)?;
+    if response.status().is_success() {
+        let upgraded = hyper::upgrade::on(response)
+            .await
+            .map_err(Failure::Upstream)?;
+        return Ok(ParentAnswer::Tunnel(TokioIo::new(upgraded)));
+    }
+
+    if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        tracing::warn!(
+            "the parent proxy answered 407: it wants authentication, which is not supported yet"
+        );
+    }
+    let (mut parts, body) = response.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    parts.version = Version::HTTP_11;
+    Ok(ParentAnswer::Refused(Response::from_parts(
+        parts,
+        body.boxed_unsync(),
+    )))
 }
 
 /// Copies bytes both ways until both directions finish, one side fails, no
