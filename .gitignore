@@ -1,0 +1,15 @@
+/target
+
+# Never commit real credentials, hashes or internal PAC files.
+# Example configs must use the .example.toml suffix and synthetic values.
+*.conf
+*.pac
+/gatir.toml
+/*.local.toml
+.env
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.log

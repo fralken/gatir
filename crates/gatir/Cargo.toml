@@ -1,0 +1,22 @@
+[package]
+name = "gatir"
+description = "Authenticating HTTP proxy for corporate proxies (NTLM, Kerberos, SSPI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gatir"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gatir"
+path = "src/main.rs"
+
+[dev-dependencies]
+gatir-testkit = { path = "../testkit" }
+
+[lints]
+workspace = true
