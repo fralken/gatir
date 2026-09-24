@@ -120,7 +120,8 @@ mod tests {
         hex::encode(bytes)
     }
 
-    // MS-NLMP 4.2.1 and 4.2.4: User = "User", Domain = "Domain", Password = "Password".
+    // [MS-NLMP] v20210625, 4.2.1: User = "User", Domain = "Domain", Password = "Password".
+    // NTOWFv1 is in 4.2.2.1.2 and NTOWFv2 in 4.2.4.1.1.
     #[test]
     fn nt_hash_matches_the_ms_nlmp_vector() {
         assert_eq!(

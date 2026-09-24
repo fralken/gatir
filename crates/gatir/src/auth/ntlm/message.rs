@@ -734,6 +734,137 @@ mod tests {
     const NTLM2_LM: &str = "aaaaaaaaaaaaaaaa00000000000000000000000000000000";
     const NTLM2_NT: &str = "7537f803ae367128ca458204bde7caf81e97ed2683267232";
 
+    /// [MS-NLMP] v20210625, 4.2.3.3: the CHALLENGE_MESSAGE of the NTLM2 session
+    /// example. It has no target info and carries a version field.
+    const SPEC_CHALLENGE_MESSAGE: &str = concat!(
+        "4e544c4d53535000",         // signature
+        "02000000",                 // message type
+        "0c000c00",                 // target name: length, maximum length
+        "38000000",                 // target name: offset
+        "33820a82",                 // flags
+        "0123456789abcdef",         // server challenge
+        "0000000000000000",         // reserved
+        "0000000000000000",         // target info: none
+        "060070170000000f",         // version
+        "530065007200760065007200", // target name "Server"
+    );
+
+    fn unhex(text: &str) -> Vec<u8> {
+        hex::decode(text).unwrap()
+    }
+
+    #[test]
+    fn parses_the_challenge_message_printed_in_the_specification() {
+        let challenge = Challenge::parse(&unhex(SPEC_CHALLENGE_MESSAGE)).unwrap();
+        assert_eq!(challenge.flags, 0x820a_8233);
+        assert_eq!(challenge.server_challenge, SPEC_CHALLENGE);
+        assert!(challenge.target_info.is_empty());
+        assert_eq!(challenge.timestamp(), None);
+    }
+
+    #[test]
+    fn answers_the_specifications_ntlm2_session_example_with_its_field_contents() {
+        // 4.2.3.3 AUTHENTICATE_MESSAGE, field by field. The spec's message also
+        // carries a version and a larger flag set, so only the contents of the
+        // fields are compared, not the layout.
+        let challenge = Challenge::parse(&unhex(SPEC_CHALLENGE_MESSAGE)).unwrap();
+        let entropy = Entropy {
+            client_nonce: [0xaa; 8],
+            time: 0,
+        };
+        let identity = Identity {
+            user: "User",
+            domain: "Domain",
+            workstation: "COMPUTER",
+        };
+        let message = authenticate(
+            Dialect::V1Extended,
+            &identity,
+            &NtHash::from_password("Password"),
+            &challenge,
+            &entropy,
+        )
+        .unwrap();
+
+        let expected = [
+            (0, "aaaaaaaaaaaaaaaa00000000000000000000000000000000"), // LM
+            (1, "7537f803ae367128ca458204bde7caf81e97ed2683267232"), // NT
+            (2, "44006f006d00610069006e00"),                         // "Domain"
+            (3, "5500730065007200"),                                 // "User"
+            (4, "43004f004d0050005500540045005200"),                 // "COMPUTER"
+            (5, ""),                                                 // session key
+        ];
+        for (index, contents) in expected {
+            assert_eq!(
+                hex::encode(authenticate_field(&message, index)),
+                contents,
+                "field {index}"
+            );
+        }
+    }
+
+    /// [MS-NLMP] v20210625, 4.2.4.3: the CHALLENGE_MESSAGE of the NTLMv2
+    /// example, with its target info (Domain, Server and the end marker).
+    const SPEC_NTLMV2_CHALLENGE_MESSAGE: &str = concat!(
+        "4e544c4d53535000",                 // signature
+        "02000000",                         // message type
+        "0c000c00",                         // target name: length, maximum length
+        "38000000",                         // target name: offset
+        "33828ae2",                         // flags
+        "0123456789abcdef",                 // server challenge
+        "0000000000000000",                 // reserved
+        "24002400",                         // target info: length, maximum length
+        "44000000",                         // target info: offset
+        "060070170000000f",                 // version
+        "530065007200760065007200",         // target name "Server"
+        "02000c0044006f006d00610069006e00", // MsvAvNbDomainName "Domain"
+        "01000c00530065007200760065007200", // MsvAvNbComputerName "Server"
+        "00000000",                         // MsvAvEOL
+    );
+
+    #[test]
+    fn answers_the_specifications_ntlmv2_example_with_its_field_contents() {
+        // 4.2.4.3 AUTHENTICATE_MESSAGE: the spec's message also has a version, a
+        // MIC-era flag set and an encrypted session key, so as above only the
+        // contents of the fields are compared.
+        let challenge = Challenge::parse(&unhex(SPEC_NTLMV2_CHALLENGE_MESSAGE)).unwrap();
+        assert_eq!(challenge.flags, 0xe28a_8233);
+        assert_eq!(challenge.target_info.len(), 36);
+
+        let entropy = Entropy {
+            client_nonce: [0xaa; 8],
+            time: 0,
+        };
+        let identity = Identity {
+            user: "User",
+            domain: "Domain",
+            workstation: "COMPUTER",
+        };
+        let message = authenticate(
+            Dialect::V2,
+            &identity,
+            &NtHash::from_password("Password"),
+            &challenge,
+            &entropy,
+        )
+        .unwrap();
+
+        let expected = [
+            (0, "86c35097ac9cec102554764a57cccc19aaaaaaaaaaaaaaaa"), // LMv2
+            (1, crate::auth::ntlm::response::vectors::NTLMV2_NT_RESPONSE), // NTLMv2
+            (2, "44006f006d00610069006e00"),                         // "Domain"
+            (3, "5500730065007200"),                                 // "User"
+            (4, "43004f004d0050005500540045005200"),                 // "COMPUTER"
+        ];
+        for (index, contents) in expected {
+            assert_eq!(
+                hex::encode(authenticate_field(&message, index)),
+                contents,
+                "field {index}"
+            );
+        }
+    }
+
     #[test]
     fn negotiate_flags_depend_on_the_dialect() {
         for (dialect, extended) in [

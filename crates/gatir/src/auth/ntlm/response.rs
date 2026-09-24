@@ -150,7 +150,21 @@ fn hmac_md5(key: &Ntlmv2Hash, parts: &[&[u8]]) -> [u8; 16] {
 /// The MS-NLMP section 4.2 test inputs, shared with the message tests.
 #[cfg(test)]
 pub(super) mod vectors {
-    // User "User", Domain "Domain", Password "Password".
+    /// [MS-NLMP] v20210625, 4.2.4.2.2: the NTLMv2 response, an NT proof
+    /// followed by the client blob (4.2.4.1.3).
+    pub const NTLMV2_NT_RESPONSE: &str = concat!(
+        "68cd0ab851e51c96aabc927bebef6a1c", // NT proof
+        "0101000000000000",                 // versions, reserved
+        "0000000000000000",                 // time
+        "aaaaaaaaaaaaaaaa",                 // client nonce
+        "00000000",                         // reserved
+        "02000c0044006f006d00610069006e00", // MsvAvNbDomainName "Domain"
+        "01000c00530065007200760065007200", // MsvAvNbComputerName "Server"
+        "00000000",                         // end of the AV pairs
+        "00000000",                         // trailing reserved bytes
+    );
+
+    // [MS-NLMP] v20210625, 4.2.1: User "User", Domain "Domain", Password "Password".
     pub const SERVER_CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
     pub const CLIENT_NONCE: [u8; 8] = [0xaa; 8];
 
@@ -171,7 +185,7 @@ pub(super) mod vectors {
 
 #[cfg(test)]
 mod tests {
-    use super::vectors::{CLIENT_NONCE, SERVER_CHALLENGE, spec_target_info};
+    use super::vectors::{CLIENT_NONCE, NTLMV2_NT_RESPONSE, SERVER_CHALLENGE, spec_target_info};
     use super::*;
     use crate::auth::ntlm::NtHash;
 
@@ -179,6 +193,7 @@ mod tests {
         Ntlmv2Hash::new(&NtHash::from_password("Password"), "User", "Domain")
     }
 
+    /// 4.2.4.2.1.
     #[test]
     fn matches_the_ms_nlmp_lmv2_vector() {
         let responses = ntlmv2_responses(
@@ -194,6 +209,7 @@ mod tests {
         );
     }
 
+    /// 4.2.4.2.2, with the temp blob of 4.2.4.1.3.
     #[test]
     fn matches_the_ms_nlmp_ntlmv2_vector() {
         let responses = ntlmv2_responses(
@@ -203,15 +219,7 @@ mod tests {
             &spec_target_info(),
             0,
         );
-        assert_eq!(
-            hex::encode(responses.nt),
-            "68cd0ab851e51c96aabc927bebef6a1c\
-             01010000000000000000000000000000aaaaaaaaaaaaaaaa00000000\
-             02000c0044006f006d00610069006e00\
-             01000c00530065007200760065007200\
-             00000000\
-             00000000"
-        );
+        assert_eq!(hex::encode(responses.nt), NTLMV2_NT_RESPONSE);
     }
 
     /// A real exchange: the responses the C cntlm sent to a fake server with
@@ -245,7 +253,7 @@ mod tests {
 
     #[test]
     fn matches_the_ms_nlmp_ntlmv1_vector() {
-        // 4.2.2: the NT response of "Password" to the spec's server challenge.
+        // 4.2.2.2.1: the NT response, with extended session security not set.
         let responses = ntlmv1_responses(&NtHash::from_password("Password"), &SERVER_CHALLENGE);
         assert_eq!(
             hex::encode(responses.nt),
@@ -259,8 +267,8 @@ mod tests {
 
     #[test]
     fn matches_an_independent_ntlm2_session_response() {
-        // Computed with the same algorithm on OpenSSL's DES and MD5; the value
-        // is the one published in MS-NLMP 4.2.3.
+        // 4.2.3.2.1 (LM) and 4.2.3.2.2 (NT), also reproduced on OpenSSL's DES
+        // and MD5.
         let responses = ntlm2_session_responses(
             &NtHash::from_password("Password"),
             &SERVER_CHALLENGE,
