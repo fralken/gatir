@@ -58,6 +58,9 @@ pub struct OverrideArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the proxy until interrupted (Ctrl-C or SIGTERM)
+    Run,
+
     /// Inspect the configuration
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -98,6 +101,17 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::debug!(?config, "configuration loaded");
 
     match cli.command {
+        Command::Run => {
+            anyhow::ensure!(
+                config.parents.is_empty(),
+                "parent proxies are configured but not supported yet"
+            );
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("cannot start the async runtime")?
+                .block_on(crate::proxy::run(&config))?;
+        }
         Command::Config(ConfigCommand::Check) => {
             println!("configuration OK");
             println!("{}", config.summary());

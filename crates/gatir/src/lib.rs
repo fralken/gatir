@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod logging;
 pub mod noproxy;
+pub mod proxy;
 
 /// Crate version, as declared in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

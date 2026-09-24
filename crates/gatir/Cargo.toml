@@ -26,14 +26,20 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 globset = "0.4.20"
 hex = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "server-graceful"] }
 ipnet = "2.12.2"
 rpassword = "7.5.4"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
