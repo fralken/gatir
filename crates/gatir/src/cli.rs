@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use secrecy::SecretString;
 
 use crate::config::{AuthMethod, Config, LogLevel, Overrides, ParentAddr};
 use crate::logging;
@@ -45,6 +47,10 @@ pub struct OverrideArgs {
     #[arg(short, long, global = true, value_enum)]
     pub method: Option<AuthMethod>,
 
+    /// Ask for the password on the terminal (replaces any password or NT hash from the file)
+    #[arg(long, global = true)]
+    pub password_prompt: bool,
+
     /// Log verbosity (the RUST_LOG environment variable takes precedence)
     #[arg(long, global = true, value_enum)]
     pub log_level: Option<LogLevel>,
@@ -64,21 +70,29 @@ pub enum ConfigCommand {
 }
 
 impl OverrideArgs {
-    fn into_overrides(self) -> Overrides {
+    fn into_overrides(self, password: Option<SecretString>) -> Overrides {
         Overrides {
             listen: self.listen,
             parents: self.parents,
             username: self.username,
             domain: self.domain,
             method: self.method,
-            password: None,
+            password,
             log_level: self.log_level,
         }
     }
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
-    let config = Config::load(cli.config.as_deref(), cli.overrides.into_overrides())?;
+    let password = if cli.overrides.password_prompt {
+        Some(prompt_password()?)
+    } else {
+        None
+    };
+    let config = Config::load(
+        cli.config.as_deref(),
+        cli.overrides.into_overrides(password),
+    )?;
 
     logging::init(config.log_level);
     tracing::debug!(?config, "configuration loaded");
@@ -90,6 +104,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn prompt_password() -> anyhow::Result<SecretString> {
+    let password = rpassword::prompt_password("Password: ").context("cannot read the password")?;
+    Ok(SecretString::from(password))
 }
 
 #[cfg(test)]
@@ -129,10 +148,13 @@ mod tests {
     }
 
     #[test]
-    fn there_is_no_password_flag() {
+    fn the_password_is_never_taken_from_the_command_line() {
         // A password on the command line would be visible in the process list.
         assert!(Cli::try_parse_from(["gatir", "config", "check", "--password", "x"]).is_err());
         assert!(Cli::try_parse_from(["gatir", "config", "check", "-p", "x"]).is_err());
+
+        let cli = Cli::try_parse_from(["gatir", "config", "check", "--password-prompt"]).unwrap();
+        assert!(cli.overrides.password_prompt);
     }
 
     #[test]

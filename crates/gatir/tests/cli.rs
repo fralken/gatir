@@ -50,7 +50,8 @@ fn help_lists_the_options() {
         .stdout(
             predicate::str::contains("--config")
                 .and(predicate::str::contains("--parent"))
-                .and(predicate::str::contains("--password").not()),
+                .and(predicate::str::contains("--password-prompt"))
+                .and(predicate::str::contains("--password ").not()),
         );
 }
 
