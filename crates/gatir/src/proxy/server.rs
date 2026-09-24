@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::body::error_response;
+use super::pool::Pool;
 use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
@@ -35,6 +36,8 @@ pub(super) struct Context {
     pub access: Acl,
     pub timeouts: Timeouts,
     pub upstreams: Upstreams,
+    /// Idle connections to origin servers and parents, shared by all clients.
+    pub pool: Arc<Pool>,
     /// Every task serving a client, so shutdown can wait for them.
     pub tracker: TaskTracker,
     /// Cancelled to begin a graceful shutdown: stop accepting, finish what is
@@ -90,6 +93,7 @@ impl Server {
             access: self.access,
             timeouts: self.timeouts,
             upstreams: self.upstreams,
+            pool: Arc::new(Pool::default()),
             tracker: TaskTracker::new(),
             shutdown: shutdown.clone(),
             force: force.clone(),

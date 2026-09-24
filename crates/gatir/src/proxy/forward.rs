@@ -2,17 +2,20 @@
 
 use std::net::SocketAddr;
 
+use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use hyper::body::{Body as HttpBody, Incoming};
 use hyper::client::conn::http1;
-use hyper::header::{HOST, HeaderValue};
-use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper::header::{HOST, HeaderMap, HeaderValue};
+use hyper::http::Extensions;
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
-use super::body::Body;
+use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
 use super::headers::strip_hop_by_hop;
+use super::pool::{Lease, PoolKey};
 use super::server::Context;
 use super::upstream::Route;
 
@@ -49,33 +52,52 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     parts.headers.insert(HOST, target.host_header.clone());
 
     let route = context.upstreams.route(&target.host);
-    let limit = context.timeouts.connect;
-    let (stream, uri) = match route {
-        Route::Direct => (
-            connect_tcp(&target.address, limit).await?,
-            target.origin_form,
-        ),
-        // A proxy is addressed with the full URL, so it knows the destination.
-        Route::Parent => (
-            context.upstreams.connect_parent(limit).await?,
-            target.absolute,
-        ),
+    // A proxy is addressed with the full URL, so it knows the destination.
+    let uri = match route {
+        Route::Direct => target.origin_form.clone(),
+        Route::Parent => target.absolute.clone(),
     };
 
-    let mut upstream = Request::new(body);
-    *upstream.method_mut() = parts.method;
-    *upstream.uri_mut() = uri;
-    *upstream.headers_mut() = parts.headers;
-    *upstream.version_mut() = Version::HTTP_11;
+    // A request that never had a body and does not change anything can safely
+    // be sent again if a pooled connection turns out to be dead.
+    let replay = (body.is_end_stream() && is_idempotent(&parts.method)).then(|| Replay {
+        method: parts.method.clone(),
+        uri: uri.clone(),
+        headers: parts.headers.clone(),
+        extensions: parts.extensions.clone(),
+    });
+
+    let mut request = Request::new(body.boxed_unsync());
+    *request.method_mut() = parts.method;
+    *request.uri_mut() = uri;
+    *request.headers_mut() = parts.headers;
+    *request.version_mut() = Version::HTTP_11;
     // Carries the original capitalization of the header names (see the server
     // and client builders), which some proxies and firewalls are picky about.
-    *upstream.extensions_mut() = parts.extensions;
+    *request.extensions_mut() = parts.extensions;
 
-    let mut sender = handshake(stream).await?;
-    let response = sender
-        .send_request(upstream)
-        .await
-        .map_err(Failure::Upstream)?;
+    let mut lease = acquire(context, route, &target).await?;
+    let response = loop {
+        let mut failed = match lease.sender.try_send_request(request).await {
+            Ok(response) => break response,
+            Err(failed) => failed,
+        };
+        let returned = failed.take_message();
+        let error = failed.into_error();
+        // Only a pooled connection can have gone stale unnoticed. The request
+        // may be sent again if hyper never sent it, or if it is safe to repeat.
+        let repeatable = returned.is_some() || (replay.is_some() && is_stale(&error));
+        if !lease.reused || !repeatable {
+            return Err(Failure::Upstream(error));
+        }
+        tracing::debug!(%error, "pooled connection was stale, retrying on a new one");
+        request = match (returned, &replay) {
+            (Some(returned), _) => returned,
+            (None, Some(replay)) => replay.request(),
+            (None, None) => return Err(Failure::Upstream(error)),
+        };
+        lease = connect(context, route, &target).await?;
+    };
 
     if route == Route::Parent && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         tracing::warn!(
@@ -86,11 +108,50 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop(&mut parts.headers);
     parts.version = Version::HTTP_11;
-    Ok(Response::from_parts(parts, body.boxed_unsync()))
+    Ok(Response::from_parts(
+        parts,
+        lease.attach(&context.pool, body),
+    ))
+}
+
+/// A pooled connection if there is one for the destination, else a new one.
+async fn acquire(context: &Context, route: Route, target: &Target) -> Result<Lease, Failure> {
+    let key = match route {
+        Route::Direct => PoolKey::Origin(target.address.clone()),
+        Route::Parent => PoolKey::Parent(context.upstreams.current_parent()),
+    };
+    match context.pool.take(&key).await {
+        Some(sender) => Ok(Lease {
+            sender,
+            key,
+            reused: true,
+        }),
+        None => connect(context, route, target).await,
+    }
+}
+
+/// Opens a new connection to the destination, or to a parent proxy.
+async fn connect(context: &Context, route: Route, target: &Target) -> Result<Lease, Failure> {
+    let limit = context.timeouts.connect;
+    let (stream, key) = match route {
+        Route::Direct => (
+            connect_tcp(&target.address, limit).await?,
+            PoolKey::Origin(target.address.clone()),
+        ),
+        Route::Parent => {
+            let (index, stream) = context.upstreams.connect_parent(limit).await?;
+            (stream, PoolKey::Parent(index))
+        }
+    };
+    Ok(Lease {
+        sender: handshake(stream).await?,
+        key,
+        reused: false,
+    })
 }
 
 /// Starts the HTTP/1 client driver on a connected stream.
-async fn handshake(stream: TcpStream) -> Result<http1::SendRequest<Incoming>, Failure> {
+async fn handshake(stream: TcpStream) -> Result<http1::SendRequest<Body>, Failure> {
     let (sender, connection) = http1::Builder::new()
         .preserve_header_case(true)
         .handshake(TokioIo::new(stream))
@@ -102,6 +163,39 @@ async fn handshake(stream: TcpStream) -> Result<http1::SendRequest<Incoming>, Fa
         }
     });
     Ok(sender)
+}
+
+/// Methods that RFC 9110 defines as idempotent: repeating them is harmless.
+fn is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    )
+}
+
+/// Whether an error means the server had already closed the connection.
+fn is_stale(error: &hyper::Error) -> bool {
+    error.is_canceled() || error.is_incomplete_message() || error.is_closed()
+}
+
+/// What is needed to build the same body-less request again.
+struct Replay {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    extensions: Extensions,
+}
+
+impl Replay {
+    fn request(&self) -> Request<Body> {
+        let mut request = Request::new(full(Bytes::new()));
+        *request.method_mut() = self.method.clone();
+        *request.uri_mut() = self.uri.clone();
+        *request.headers_mut() = self.headers.clone();
+        *request.version_mut() = Version::HTTP_11;
+        *request.extensions_mut() = self.extensions.clone();
+        request
+    }
 }
 
 /// Where a request is going, taken from its absolute-form request target.

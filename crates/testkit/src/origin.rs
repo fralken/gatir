@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::http::{Request, read_request};
 
@@ -62,6 +62,8 @@ impl Reply {
 struct State {
     requests: Mutex<Vec<Request>>,
     connections: AtomicUsize,
+    /// One per accepted connection, so dropping the origin closes them all.
+    tasks: Mutex<Vec<AbortHandle>>,
 }
 
 /// Listens on a loopback port, records every request and answers with
@@ -82,6 +84,7 @@ impl MockOrigin {
         let state = Arc::new(State {
             requests: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
+            tasks: Mutex::new(Vec::new()),
         });
         let handler = Arc::new(handler);
 
@@ -90,7 +93,12 @@ impl MockOrigin {
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     state.connections.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(serve(stream, handler.clone(), state.clone()));
+                    let connection = tokio::spawn(serve(stream, handler.clone(), state.clone()));
+                    state
+                        .tasks
+                        .lock()
+                        .expect("tasks lock")
+                        .push(connection.abort_handle());
                 }
             }
         });
@@ -117,9 +125,14 @@ impl MockOrigin {
     }
 }
 
+/// Dropping the origin makes it disappear: it stops listening and closes
+/// every connection it had open.
 impl Drop for MockOrigin {
     fn drop(&mut self) {
         self.task.abort();
+        for connection in self.state.tasks.lock().expect("tasks lock").iter() {
+            connection.abort();
+        }
     }
 }
 

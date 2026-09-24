@@ -45,9 +45,18 @@ impl Upstreams {
         }
     }
 
+    /// Index of the parent that requests currently start with.
+    pub(super) fn current_parent(&self) -> usize {
+        self.current.load(Ordering::Relaxed) % self.parents.len().max(1)
+    }
+
     /// Connects to a parent proxy, trying the others in order when it is
-    /// unreachable. The parent that answers becomes the current one.
-    pub(super) async fn connect_parent(&self, limit: Duration) -> Result<TcpStream, Failure> {
+    /// unreachable. The parent that answers becomes the current one; its index
+    /// is returned with the connection.
+    pub(super) async fn connect_parent(
+        &self,
+        limit: Duration,
+    ) -> Result<(usize, TcpStream), Failure> {
         let count = self.parents.len();
         let start = self.current.load(Ordering::Relaxed) % count;
         let mut attempts = Vec::new();
@@ -61,7 +70,7 @@ impl Upstreams {
                         tracing::info!(parent = %address, "switched to another parent proxy");
                     }
                     self.current.store(index, Ordering::Relaxed);
-                    return Ok(stream);
+                    return Ok((index, stream));
                 }
                 Err(error) => {
                     tracing::warn!(parent = %address, %error, "cannot connect to the parent proxy");

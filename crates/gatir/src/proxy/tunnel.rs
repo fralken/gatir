@@ -69,7 +69,7 @@ async fn open(
             spawn_tunnel(context, client_upgrade, upstream);
         }
         Route::Parent => {
-            let stream = context.upstreams.connect_parent(limit).await?;
+            let (_, stream) = context.upstreams.connect_parent(limit).await?;
             match connect_through_parent(stream, &address, &mut request).await? {
                 ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
                 ParentAnswer::Refused(response) => return Ok(response),
