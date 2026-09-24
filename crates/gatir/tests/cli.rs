@@ -188,3 +188,79 @@ fn header_values_are_never_printed() {
         )
         .stderr(predicate::str::contains("super-secret-key").not());
 }
+
+#[test]
+fn hash_prints_the_nt_hash_line_for_the_configuration() {
+    // The NT hash of "Password" is a published MS-NLMP test vector.
+    gatir()
+        .args(["hash", "--stdin"])
+        .write_stdin("Password\n")
+        .assert()
+        .success()
+        .stdout("nt_hash = \"a4f49c406510bdcab6824ee7c30fd852\"\n")
+        .stderr(predicate::str::contains("[credentials]"));
+}
+
+#[test]
+fn hash_ignores_the_line_ending_of_the_input() {
+    for input in ["Password\n", "Password\r\n", "Password"] {
+        gatir()
+            .args(["hash", "--stdin"])
+            .write_stdin(input)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("a4f49c406510bdcab6824ee7c30fd852"));
+    }
+}
+
+#[test]
+fn hash_uses_utf16_for_non_ascii_passwords() {
+    // Cross-checked against an independent MD4 implementation.
+    gatir()
+        .args(["hash", "--stdin"])
+        .write_stdin("p\u{e4}ssw\u{f6}rd\n")
+        .assert()
+        .success()
+        .stdout("nt_hash = \"0553152250ac01adb4213cb9938663e4\"\n");
+}
+
+#[test]
+fn hash_rejects_an_empty_password() {
+    gatir()
+        .args(["hash", "--stdin"])
+        .write_stdin("\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("empty"));
+}
+
+#[test]
+fn hash_never_echoes_the_password() {
+    gatir()
+        .args(["hash", "--stdin"])
+        .write_stdin("my-very-secret-password\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("my-very-secret-password").not())
+        .stderr(predicate::str::contains("my-very-secret-password").not());
+}
+
+#[test]
+fn the_hash_line_is_accepted_by_the_configuration() {
+    let output = gatir()
+        .args(["hash", "--stdin"])
+        .write_stdin("Password\n")
+        .output()
+        .unwrap();
+    let hash_line = String::from_utf8(output.stdout).unwrap();
+
+    let file = config_file(&format!(
+        "[credentials]\nusername = \"alice\"\ndomain = \"EXAMPLE\"\n{hash_line}"
+    ));
+    gatir()
+        .args(["config", "check", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secret: nt_hash (hidden)"));
+}

@@ -3,9 +3,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use std::io::BufRead;
+
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
+use zeroize::Zeroizing;
+
+use crate::auth::ntlm::NtHash;
 
 use crate::config::{AuthMethod, Config, LogLevel, Overrides, ParentAddr};
 use crate::logging;
@@ -61,9 +66,19 @@ pub enum Command {
     /// Run the proxy until interrupted (Ctrl-C or SIGTERM)
     Run,
 
+    /// Compute the NT hash of a password, to store in the configuration in its place
+    Hash(HashArgs),
+
     /// Inspect the configuration
     #[command(subcommand)]
     Config(ConfigCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct HashArgs {
+    /// Read the password from standard input (one line) instead of asking on the terminal
+    #[arg(long)]
+    pub stdin: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,21 +102,10 @@ impl OverrideArgs {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
-    let password = if cli.overrides.password_prompt {
-        Some(prompt_password()?)
-    } else {
-        None
-    };
-    let config = Config::load(
-        cli.config.as_deref(),
-        cli.overrides.into_overrides(password),
-    )?;
-
-    logging::init(config.log_level);
-    tracing::debug!(?config, "configuration loaded");
-
     match cli.command {
+        Command::Hash(args) => hash_password(&args),
         Command::Run => {
+            let config = load_config(cli.config.as_deref(), cli.overrides)?;
             if !config.parents.is_empty() && config.credentials.is_some() {
                 tracing::warn!(
                     "credentials are configured, but authenticating to the parent proxy is not implemented yet"
@@ -112,13 +116,69 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 .build()
                 .context("cannot start the async runtime")?
                 .block_on(crate::proxy::run(&config))?;
+            Ok(())
         }
         Command::Config(ConfigCommand::Check) => {
+            let config = load_config(cli.config.as_deref(), cli.overrides)?;
             println!("configuration OK");
             println!("{}", config.summary());
+            Ok(())
         }
     }
+}
+
+/// Reads the configuration, applies the command-line overrides and starts logging.
+fn load_config(path: Option<&std::path::Path>, overrides: OverrideArgs) -> anyhow::Result<Config> {
+    let password = if overrides.password_prompt {
+        Some(prompt_password()?)
+    } else {
+        None
+    };
+    let config = Config::load(path, overrides.into_overrides(password))?;
+
+    logging::init(config.log_level);
+    tracing::debug!(?config, "configuration loaded");
+    Ok(config)
+}
+
+/// Prints the `nt_hash` line to paste into the configuration. Only that line
+/// goes to standard output, so it can be captured by a script.
+fn hash_password(args: &HashArgs) -> anyhow::Result<()> {
+    let password = if args.stdin {
+        read_password_line()?
+    } else {
+        let first = Zeroizing::new(
+            rpassword::prompt_password("Password: ").context("cannot read the password")?,
+        );
+        let second = Zeroizing::new(
+            rpassword::prompt_password("Confirm password: ").context("cannot read the password")?,
+        );
+        anyhow::ensure!(*first == *second, "the two passwords are different");
+        first
+    };
+    anyhow::ensure!(!password.is_empty(), "the password is empty");
+
+    println!(
+        "nt_hash = \"{}\"",
+        NtHash::from_password(&password).to_hex()
+    );
+    eprintln!(
+        "Put this line in the [credentials] table of your configuration, in place of `password`."
+    );
     Ok(())
+}
+
+/// One line from standard input, without its line ending.
+fn read_password_line() -> anyhow::Result<Zeroizing<String>> {
+    let mut line = Zeroizing::new(String::new());
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("cannot read the password from standard input")?;
+    while line.ends_with(['\n', '\r']) {
+        line.pop();
+    }
+    Ok(line)
 }
 
 fn prompt_password() -> anyhow::Result<SecretString> {

@@ -28,12 +28,18 @@ workspace = true
 anyhow = "1.0.104"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
+des = "0.9.0"
+gethostname = "1.1.0"
+getrandom = "0.4.3"
 globset = "0.4.20"
 hex = "0.4.3"
+hmac = "0.13.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-graceful"] }
 ipnet = "2.12.2"
+md-5 = "0.11.0"
+md4 = "0.11.0"
 rpassword = "7.5.4"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }

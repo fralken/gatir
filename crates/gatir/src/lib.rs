@@ -2,6 +2,7 @@
 //! (NTLM, Kerberos, SSPI) on behalf of the user.
 
 pub mod acl;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod logging;
