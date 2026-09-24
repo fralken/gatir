@@ -1,6 +1,5 @@
 //! Forwarding plain HTTP requests directly to the origin server.
 
-use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -8,12 +7,11 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::header::{HOST, HeaderValue};
-use hyper::{Method, Request, Response, StatusCode, Uri, Version};
+use hyper::{Request, Response, Uri, Version};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 
-use super::body::{Body, error_response};
+use super::body::Body;
+use super::failure::{Failure, connect_tcp};
 use super::headers::strip_hop_by_hop;
 use super::server::Context;
 
@@ -43,10 +41,6 @@ pub(super) async fn handle(
 }
 
 async fn forward(request: Request<Incoming>, context: &Context) -> Result<Response<Body>, Failure> {
-    if request.method() == Method::CONNECT {
-        return Err(Failure::NotImplemented("CONNECT is not supported yet"));
-    }
-
     let (mut parts, body) = request.into_parts();
     let target = Target::from_uri(&parts.uri)?;
 
@@ -73,20 +67,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
 
 /// Opens a connection to `address` and starts the HTTP/1 client driver on it.
 async fn connect(address: &str, limit: Duration) -> Result<http1::SendRequest<Incoming>, Failure> {
-    let stream = match timeout(limit, TcpStream::connect(address)).await {
-        Err(_) => return Err(Failure::ConnectTimeout(address.to_owned())),
-        Ok(Err(source)) => {
-            return Err(Failure::Connect {
-                address: address.to_owned(),
-                source,
-            });
-        }
-        Ok(Ok(stream)) => stream,
-    };
-    if let Err(err) = stream.set_nodelay(true) {
-        tracing::debug!(%err, "cannot set TCP_NODELAY on the upstream connection");
-    }
-
+    let stream = connect_tcp(address, limit).await?;
     let (sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .map_err(Failure::Upstream)?;
@@ -144,39 +125,5 @@ impl Target {
             host_header,
             origin_form,
         })
-    }
-}
-
-enum Failure {
-    BadRequest(&'static str),
-    NotImplemented(&'static str),
-    ConnectTimeout(String),
-    Connect { address: String, source: io::Error },
-    Upstream(hyper::Error),
-}
-
-impl Failure {
-    fn into_response(self) -> Response<Body> {
-        match self {
-            Self::BadRequest(message) => error_response(StatusCode::BAD_REQUEST, message, true),
-            Self::NotImplemented(message) => {
-                error_response(StatusCode::NOT_IMPLEMENTED, message, false)
-            }
-            Self::ConnectTimeout(address) => error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("Timed out connecting to {address}"),
-                false,
-            ),
-            Self::Connect { address, source } => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Cannot connect to {address}: {source}"),
-                false,
-            ),
-            Self::Upstream(err) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Invalid response from the origin server: {err}"),
-                false,
-            ),
-        }
     }
 }

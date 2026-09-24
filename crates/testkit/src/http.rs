@@ -202,7 +202,8 @@ pub async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result
     }))
 }
 
-/// Reads one response. `head_request` must be true when answering a HEAD.
+/// Reads one response. `head_request` must be true when no body follows the
+/// head: a reply to HEAD, or the `200` that opens a CONNECT tunnel.
 pub async fn read_response<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     head_request: bool,
@@ -254,7 +255,9 @@ impl RawClient {
         stream.flush().await
     }
 
-    /// Reads one response, failing instead of hanging if none arrives.
+    /// Reads one response, failing instead of hanging if none arrives. Pass
+    /// `head_request = true` when no body follows the head: a reply to HEAD, or
+    /// the `200` that opens a CONNECT tunnel.
     pub async fn read_response(&mut self, head_request: bool) -> io::Result<Response> {
         tokio::time::timeout(READ_TIMEOUT, read_response(&mut self.reader, head_request))
             .await

@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 
 pub mod http;
 pub mod origin;
+pub mod tcp;
 
 /// A loopback address where nothing is listening: connecting is refused.
 pub async fn closed_port() -> SocketAddr {

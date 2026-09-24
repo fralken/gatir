@@ -5,6 +5,8 @@
 //! is built on.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gatir::config::{Config, Overrides};
@@ -12,6 +14,8 @@ use gatir::proxy::Server;
 use gatir_testkit::closed_port;
 use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
+use gatir_testkit::tcp::TcpServer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 struct TestProxy {
@@ -481,4 +485,262 @@ async fn large_bodies_stream_through_intact_in_both_directions() {
     let response = client.read_response(false).await.unwrap();
     assert_eq!(response.body.len(), SIZE);
     assert_eq!(fnv(&response.body), fnv(&pattern(SIZE)));
+}
+
+// ---- CONNECT tunnels ----
+
+fn connect_request(authority: &str) -> String {
+    format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n")
+}
+
+/// Opens a tunnel to `authority` and returns the client, positioned right after
+/// the `200` head.
+async fn open_tunnel(proxy: &TestProxy, authority: &str) -> RawClient {
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client.send(connect_request(authority)).await.unwrap();
+    let response = client.read_response(true).await.unwrap();
+    assert_eq!(response.status, 200, "{}", response.body_text());
+    client
+}
+
+/// A destination that sends back whatever it receives.
+async fn echo_server() -> TcpServer {
+    TcpServer::start(|mut stream| async move {
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stream.write_all(&buffer[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+}
+
+async fn eventually(what: &str, condition: impl Fn() -> bool) {
+    for _ in 0..50 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn connect_relays_bytes_in_both_directions() {
+    let echo = echo_server().await;
+    let proxy = start_proxy("").await;
+    let mut client = open_tunnel(&proxy, &echo.authority()).await;
+
+    for message in [
+        "hello tunnel",
+        "a second message",
+        "\u{0}\u{1}\u{2} binary \u{ff}",
+    ] {
+        client.send(message).await.unwrap();
+        let echoed = client.read_exact(message.len()).await.unwrap();
+        assert_eq!(echoed, message.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn connect_relays_a_half_close() {
+    // The destination only answers after the client says it is done sending.
+    let server = TcpServer::start(|mut stream| async move {
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received).await;
+        let _ = stream
+            .write_all(format!("got:{}", received.len()).as_bytes())
+            .await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    let proxy = start_proxy("").await;
+    let mut client = open_tunnel(&proxy, &server.authority()).await;
+
+    client.send("hello").await.unwrap();
+    client.shutdown_write().await.unwrap();
+    assert_eq!(client.read_to_end().await.unwrap(), b"got:5");
+}
+
+#[tokio::test]
+async fn connect_ends_when_the_destination_closes() {
+    let server = TcpServer::start(|mut stream| async move {
+        let _ = stream.write_all(b"bye").await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    let proxy = start_proxy("").await;
+    let mut client = open_tunnel(&proxy, &server.authority()).await;
+
+    assert_eq!(client.read_to_end().await.unwrap(), b"bye");
+}
+
+#[tokio::test]
+async fn connect_ends_when_the_client_closes() {
+    let saw_eof = Arc::new(AtomicBool::new(false));
+    let server = TcpServer::start({
+        let saw_eof = saw_eof.clone();
+        move |mut stream| {
+            let saw_eof = saw_eof.clone();
+            async move {
+                let mut buffer = [0u8; 64];
+                while matches!(stream.read(&mut buffer).await, Ok(n) if n > 0) {}
+                saw_eof.store(true, Ordering::SeqCst);
+            }
+        }
+    })
+    .await;
+    let proxy = start_proxy("").await;
+
+    let client = open_tunnel(&proxy, &server.authority()).await;
+    assert!(!saw_eof.load(Ordering::SeqCst));
+    drop(client);
+    eventually("the destination to see the client close", || {
+        saw_eof.load(Ordering::SeqCst)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn connect_to_an_unreachable_destination_gives_502() {
+    let dead = closed_port().await;
+    let proxy = start_proxy("").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    client
+        .send(connect_request(&dead.to_string()))
+        .await
+        .unwrap();
+    let response = client.read_response(false).await.unwrap();
+
+    assert_eq!(response.status, 502);
+    assert!(response.body_text().contains("Cannot connect to"));
+}
+
+#[tokio::test]
+async fn connect_without_a_port_is_rejected() {
+    let proxy = start_proxy("").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    client.send(connect_request("example.com")).await.unwrap();
+    let response = client.read_response(false).await.unwrap();
+
+    assert_eq!(response.status, 400);
+    assert!(response.body_text().contains("host:port"));
+}
+
+#[tokio::test]
+async fn an_idle_tunnel_is_closed() {
+    let echo = echo_server().await;
+    let proxy = start_proxy("[timeouts]\ntunnel_idle_secs = 1").await;
+    let mut client = open_tunnel(&proxy, &echo.authority()).await;
+
+    assert!(client.closed_within(Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn a_busy_tunnel_outlives_the_idle_timeout() {
+    let echo = echo_server().await;
+    let proxy = start_proxy("[timeouts]\ntunnel_idle_secs = 1").await;
+    let mut client = open_tunnel(&proxy, &echo.authority()).await;
+
+    // 2.4 seconds in total, but never silent for a full second.
+    for round in 0..6 {
+        client.send("x").await.unwrap();
+        assert_eq!(client.read_exact(1).await.unwrap(), b"x", "round {round}");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
+
+#[tokio::test]
+async fn many_tunnels_work_at_the_same_time() {
+    let echo = echo_server().await;
+    let proxy = start_proxy("").await;
+
+    let mut tasks = Vec::new();
+    for id in 0..25u8 {
+        let authority = echo.authority();
+        let proxy_addr = proxy.addr;
+        tasks.push(tokio::spawn(async move {
+            let mut client = RawClient::connect(proxy_addr).await.unwrap();
+            client.send(connect_request(&authority)).await.unwrap();
+            assert_eq!(client.read_response(true).await.unwrap().status, 200);
+
+            let payload: Vec<u8> = (0..10_000).map(|i| (i as u8).wrapping_add(id)).collect();
+            client.send(&payload).await.unwrap();
+            assert_eq!(client.read_exact(payload.len()).await.unwrap(), payload);
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn large_transfers_through_a_tunnel_are_intact() {
+    const SIZE: usize = 16 * 1024 * 1024;
+
+    // Download: the destination pushes a large body and closes.
+    let source = TcpServer::start(|mut stream| async move {
+        let _ = stream.write_all(&pattern(SIZE)).await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    // Upload: the destination hashes everything it receives.
+    let sink = TcpServer::start(|mut stream| async move {
+        let mut received = Vec::new();
+        let _ = stream.read_to_end(&mut received).await;
+        let _ = stream
+            .write_all(format!("{}:{}", received.len(), fnv(&received)).as_bytes())
+            .await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+    let proxy = start_proxy("").await;
+
+    let mut downloader = open_tunnel(&proxy, &source.authority()).await;
+    let downloaded = downloader.read_to_end().await.unwrap();
+    assert_eq!(downloaded.len(), SIZE);
+    assert_eq!(fnv(&downloaded), fnv(&pattern(SIZE)));
+
+    let mut uploader = open_tunnel(&proxy, &sink.authority()).await;
+    let upload = pattern(SIZE);
+    uploader.send(&upload).await.unwrap();
+    uploader.shutdown_write().await.unwrap();
+    let reply = uploader.read_to_end().await.unwrap();
+    assert_eq!(
+        String::from_utf8(reply).unwrap(),
+        format!("{SIZE}:{}", fnv(&upload))
+    );
+}
+
+#[tokio::test]
+async fn a_tunnel_can_follow_plain_requests_on_the_same_connection() {
+    let origin = MockOrigin::start(|_| Reply::ok("plain")).await;
+    let echo = echo_server().await;
+    let proxy = start_proxy("").await;
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+
+    client
+        .send(get(&origin.authority(), "/", ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.read_response(false).await.unwrap().body_text(),
+        "plain"
+    );
+
+    client
+        .send(connect_request(&echo.authority()))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(true).await.unwrap().status, 200);
+    client.send("after").await.unwrap();
+    assert_eq!(client.read_exact(5).await.unwrap(), b"after");
 }

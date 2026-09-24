@@ -1,9 +1,11 @@
 //! The proxy server: accepts clients and forwards their requests.
 
 mod body;
+mod failure;
 mod forward;
 mod headers;
 mod server;
+mod tunnel;
 
 use std::io;
 

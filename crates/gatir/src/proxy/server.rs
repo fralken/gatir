@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyper::Method;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -14,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use super::forward;
+use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::config::{Config, Timeouts};
 
@@ -136,7 +137,14 @@ async fn serve_connection(stream: TcpStream, peer: SocketAddr, context: Arc<Cont
     let client_idle = context.timeouts.client_idle;
     let service = service_fn(move |request| {
         let context = context.clone();
-        async move { Ok::<_, Infallible>(forward::handle(request, &context, peer).await) }
+        async move {
+            let response = if request.method() == Method::CONNECT {
+                tunnel::handle(request, &context, peer).await
+            } else {
+                forward::handle(request, &context, peer).await
+            };
+            Ok::<_, Infallible>(response)
+        }
     });
 
     let connection = http1::Builder::new()
