@@ -14,6 +14,9 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use crate::acl::{Acl, Action, Rule};
+use crate::noproxy::NoProxy;
+
 pub use addr::{ParentAddr, ParentAddrError};
 use credentials::RawCredentials;
 pub use credentials::{AuthMethod, Credentials, NT_HASH_LEN, Secret};
@@ -70,6 +73,10 @@ pub struct Config {
     /// Parent proxies in order of preference. Empty means direct connections.
     pub parents: Vec<ParentAddr>,
     pub credentials: Option<Credentials>,
+    /// Which client addresses may use the proxy.
+    pub access: Acl,
+    /// Destinations contacted directly instead of through a parent proxy.
+    pub no_proxy: NoProxy,
     pub log_level: LogLevel,
 }
 
@@ -93,7 +100,16 @@ struct RawConfig {
     listen: Option<Vec<SocketAddr>>,
     parents: Option<Vec<ParentAddr>>,
     credentials: Option<RawCredentials>,
+    access: Option<RawAccess>,
+    no_proxy: Option<Vec<String>>,
     log: Option<RawLog>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAccess {
+    default: Option<Action>,
+    rules: Option<Vec<Rule>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -152,8 +168,31 @@ impl Config {
                 }
             }
         };
+        let access = if self.access.rules().is_empty() {
+            format!(
+                "default {}, no rules",
+                self.access.default_action().as_str()
+            )
+        } else {
+            let rules = join(
+                self.access
+                    .rules()
+                    .iter()
+                    .map(|rule| format!("{} {}", rule.action.as_str(), rule.source)),
+            );
+            format!(
+                "default {}; first match wins: {rules}",
+                self.access.default_action().as_str()
+            )
+        };
+        let no_proxy = if self.no_proxy.entries().is_empty() {
+            "none".to_owned()
+        } else {
+            join(self.no_proxy.entries().iter())
+        };
         format!(
-            "listen:      {listen}\nparents:     {parents}\ncredentials: {credentials}\nlog level:   {}",
+            "listen:      {listen}\nparents:     {parents}\ncredentials: {credentials}\n\
+             access:      {access}\nno_proxy:    {no_proxy}\nlog level:   {}",
             self.log_level.as_str()
         )
     }
@@ -230,6 +269,19 @@ impl RawConfig {
         }
         let credentials = credentials.map(RawCredentials::validate).transpose()?;
 
+        let access = self
+            .access
+            .map(|raw| {
+                Acl::new(
+                    raw.rules.unwrap_or_default(),
+                    raw.default.unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+
+        let no_proxy = NoProxy::new(self.no_proxy.unwrap_or_default())
+            .map_err(|err| ConfigError::invalid(err.to_string()))?;
+
         let log_level = overrides
             .log_level
             .or(self.log.and_then(|log| log.level))
@@ -239,6 +291,8 @@ impl RawConfig {
             listen,
             parents,
             credentials,
+            access,
+            no_proxy,
             log_level,
         })
     }
@@ -500,6 +554,112 @@ mod tests {
                 assert!(!text.contains(secret), "{toml:?} leaked {secret:?}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn access_and_no_proxy_default_to_open_and_empty() {
+        let config = load("").unwrap();
+        assert!(config.access.rules().is_empty());
+        assert_eq!(config.access.default_action(), Action::Allow);
+        assert!(config.no_proxy.entries().is_empty());
+    }
+
+    #[test]
+    fn parses_access_rules_in_order() {
+        let config = load(
+            r#"
+            [access]
+            default = "deny"
+            rules = [
+                { allow = "127.0.0.1" },
+                { allow = "10.0.0.0/8" },
+                { deny = "*" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.access.default_action(), Action::Deny);
+        let shown: Vec<_> = config
+            .access
+            .rules()
+            .iter()
+            .map(|rule| format!("{} {}", rule.action.as_str(), rule.source))
+            .collect();
+        assert_eq!(shown, ["allow 127.0.0.1/32", "allow 10.0.0.0/8", "deny *"]);
+        assert_eq!(
+            config.access.check("10.1.2.3".parse().unwrap()),
+            Action::Allow
+        );
+        assert_eq!(
+            config.access.check("192.0.2.1".parse().unwrap()),
+            Action::Deny
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_access_configuration() {
+        let cases = [
+            (
+                "[access]\nrules = [{ allow = \"example.com\" }]",
+                "host names are not supported",
+            ),
+            (
+                "[access]\nrules = [{ allow = \"10.0.0.0/40\" }]",
+                "invalid access rule source",
+            ),
+            (
+                "[access]\nrules = [{ permit = \"10.0.0.0/8\" }]",
+                "unknown variant",
+            ),
+            (
+                "[access]\nrules = [{ allow = \"10.0.0.1\", deny = \"*\" }]",
+                "invalid config at <string>:2:",
+            ),
+            ("[access]\ndefault = \"maybe\"", "unknown variant"),
+            ("[access]\nrule = []", "unknown field"),
+        ];
+        for (toml, expected) in cases {
+            let text = error_text(toml);
+            assert!(text.contains(expected), "{toml:?} -> {text}");
+        }
+    }
+
+    #[test]
+    fn parses_no_proxy_entries() {
+        let config =
+            load(r#"no_proxy = ["localhost", "*.corp.example.com", "10.0.0.0/8"]"#).unwrap();
+        assert!(config.no_proxy.matches("LocalHost"));
+        assert!(config.no_proxy.matches("intranet.corp.example.com"));
+        assert!(config.no_proxy.matches("10.9.8.7"));
+        assert!(!config.no_proxy.matches("example.com"));
+    }
+
+    #[test]
+    fn rejects_invalid_no_proxy_entries() {
+        let text = error_text(r#"no_proxy = ["localhost", "[unclosed"]"#);
+        assert!(text.contains("[unclosed"), "{text}");
+        assert!(error_text(r#"no_proxy = [""]"#).contains("must not be empty"));
+    }
+
+    #[test]
+    fn the_summary_describes_access_and_no_proxy() {
+        let config = load(
+            "no_proxy = [\"localhost\"]\n[access]\ndefault = \"deny\"\nrules = [{ allow = \"10.0.0.0/8\" }]",
+        )
+        .unwrap();
+        let summary = config.summary();
+        assert!(
+            summary.contains("default deny; first match wins: allow 10.0.0.0/8"),
+            "{summary}"
+        );
+        assert!(summary.contains("no_proxy:    localhost"), "{summary}");
+        assert!(
+            load("")
+                .unwrap()
+                .summary()
+                .contains("default allow, no rules")
+        );
     }
 
     #[test]

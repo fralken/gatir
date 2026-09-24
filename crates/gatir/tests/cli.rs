@@ -132,6 +132,41 @@ fn command_line_options_override_the_file() {
 }
 
 #[test]
+fn config_check_summarizes_access_rules_and_no_proxy() {
+    let file = config_file(
+        r#"
+        no_proxy = ["localhost", "*.corp.example.com"]
+
+        [access]
+        default = "deny"
+        rules = [{ allow = "127.0.0.1" }, { allow = "10.0.0.0/8" }]
+        "#,
+    );
+    gatir()
+        .args(["config", "check", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(
+                "default deny; first match wins: allow 127.0.0.1/32, allow 10.0.0.0/8",
+            )
+            .and(predicate::str::contains("localhost, *.corp.example.com")),
+        );
+}
+
+#[test]
+fn config_check_rejects_a_host_name_in_an_access_rule() {
+    let file = config_file("[access]\nrules = [{ allow = \"example.com\" }]\n");
+    gatir()
+        .args(["config", "check", "--config"])
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("host names are not supported"));
+}
+
+#[test]
 fn config_check_works_without_a_file() {
     gatir().args(["config", "check"]).assert().success().stdout(
         predicate::str::contains("127.0.0.1:3128")
