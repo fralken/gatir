@@ -102,10 +102,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run => {
-            anyhow::ensure!(
-                config.parents.is_empty(),
-                "parent proxies are configured but not supported yet"
-            );
+            if !config.parents.is_empty() && config.credentials.is_some() {
+                tracing::warn!(
+                    "credentials are configured, but authenticating to the parent proxy is not implemented yet"
+                );
+            }
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

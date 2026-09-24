@@ -1,19 +1,20 @@
-//! Forwarding plain HTTP requests directly to the origin server.
+//! Forwarding plain HTTP requests, to the origin server or to a parent proxy.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::header::{HOST, HeaderValue};
-use hyper::{Request, Response, Uri, Version};
+use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
 
 use super::body::Body;
 use super::failure::{Failure, connect_tcp};
 use super::headers::strip_hop_by_hop;
 use super::server::Context;
+use super::upstream::Route;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -47,17 +48,40 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     strip_hop_by_hop(&mut parts.headers);
     parts.headers.insert(HOST, target.host_header.clone());
 
+    let route = context.upstreams.route(&target.host);
+    let limit = context.timeouts.connect;
+    let (stream, uri) = match route {
+        Route::Direct => (
+            connect_tcp(&target.address, limit).await?,
+            target.origin_form,
+        ),
+        // A proxy is addressed with the full URL, so it knows the destination.
+        Route::Parent => (
+            context.upstreams.connect_parent(limit).await?,
+            target.absolute,
+        ),
+    };
+
     let mut upstream = Request::new(body);
     *upstream.method_mut() = parts.method;
-    *upstream.uri_mut() = target.origin_form;
+    *upstream.uri_mut() = uri;
     *upstream.headers_mut() = parts.headers;
     *upstream.version_mut() = Version::HTTP_11;
+    // Carries the original capitalization of the header names (see the server
+    // and client builders), which some proxies and firewalls are picky about.
+    *upstream.extensions_mut() = parts.extensions;
 
-    let mut sender = connect(&target.address, context.timeouts.connect).await?;
+    let mut sender = handshake(stream).await?;
     let response = sender
         .send_request(upstream)
         .await
         .map_err(Failure::Upstream)?;
+
+    if route == Route::Parent && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        tracing::warn!(
+            "the parent proxy answered 407: it wants authentication, which is not supported yet"
+        );
+    }
 
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop(&mut parts.headers);
@@ -65,10 +89,11 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     Ok(Response::from_parts(parts, body.boxed_unsync()))
 }
 
-/// Opens a connection to `address` and starts the HTTP/1 client driver on it.
-async fn connect(address: &str, limit: Duration) -> Result<http1::SendRequest<Incoming>, Failure> {
-    let stream = connect_tcp(address, limit).await?;
-    let (sender, connection) = http1::handshake(TokioIo::new(stream))
+/// Starts the HTTP/1 client driver on a connected stream.
+async fn handshake(stream: TcpStream) -> Result<http1::SendRequest<Incoming>, Failure> {
+    let (sender, connection) = http1::Builder::new()
+        .preserve_header_case(true)
+        .handshake(TokioIo::new(stream))
         .await
         .map_err(Failure::Upstream)?;
     tokio::spawn(async move {
@@ -81,10 +106,14 @@ async fn connect(address: &str, limit: Duration) -> Result<http1::SendRequest<In
 
 /// Where a request is going, taken from its absolute-form request target.
 struct Target {
+    /// The host, as written in the URL (IPv6 literals keep their brackets).
+    host: String,
     /// `host:port`, ready for `TcpStream::connect`.
     address: String,
     host_header: HeaderValue,
     origin_form: Uri,
+    /// The URL without any user information.
+    absolute: Uri,
 }
 
 impl Target {
@@ -108,22 +137,27 @@ impl Target {
 
         let host = authority.host();
         let port = authority.port_u16().unwrap_or(80);
-        let host_header = match authority.port_u16() {
+        let host_and_port = match authority.port_u16() {
             Some(explicit) => format!("{host}:{explicit}"),
             None => host.to_owned(),
         };
-        let host_header = HeaderValue::from_str(&host_header)
+        let host_header = HeaderValue::from_str(&host_and_port)
             .map_err(|_| Failure::BadRequest("the request URL has an invalid host"))?;
 
         let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
         let origin_form = path_and_query
             .parse::<Uri>()
             .map_err(|_| Failure::BadRequest("the request URL has an invalid path"))?;
+        let absolute = format!("http://{host_and_port}{path_and_query}")
+            .parse::<Uri>()
+            .map_err(|_| Failure::BadRequest("the request URL is invalid"))?;
 
         Ok(Self {
+            host: host.to_owned(),
             address: format!("{host}:{port}"),
             host_header,
             origin_form,
+            absolute,
         })
     }
 }

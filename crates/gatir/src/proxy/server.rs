@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::body::error_response;
+use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::config::{Config, Timeouts};
@@ -33,6 +34,7 @@ const MAX_HEADERS: usize = 100;
 pub(super) struct Context {
     pub access: Acl,
     pub timeouts: Timeouts,
+    pub upstreams: Upstreams,
     /// Every task serving a client, so shutdown can wait for them.
     pub tracker: TaskTracker,
     /// Cancelled to begin a graceful shutdown: stop accepting, finish what is
@@ -47,6 +49,7 @@ pub struct Server {
     listeners: Vec<TcpListener>,
     access: Acl,
     timeouts: Timeouts,
+    upstreams: Upstreams,
 }
 
 impl Server {
@@ -63,6 +66,7 @@ impl Server {
             listeners,
             access: config.access.clone(),
             timeouts: config.timeouts.clone(),
+            upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone()),
         })
     }
 
@@ -85,6 +89,7 @@ impl Server {
         let context = Arc::new(Context {
             access: self.access,
             timeouts: self.timeouts,
+            upstreams: self.upstreams,
             tracker: TaskTracker::new(),
             shutdown: shutdown.clone(),
             force: force.clone(),
@@ -197,6 +202,7 @@ async fn serve_connection(stream: TcpStream, peer: SocketAddr, context: Arc<Cont
         .timer(TokioTimer::new())
         .header_read_timeout(client_idle)
         .half_close(true)
+        .preserve_header_case(true)
         .max_buf_size(MAX_HEAD_BYTES)
         .max_headers(MAX_HEADERS)
         .serve_connection(TokioIo::new(stream), service)

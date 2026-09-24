@@ -6,6 +6,7 @@ mod forward;
 mod headers;
 mod server;
 mod tunnel;
+mod upstream;
 
 use std::io;
 
