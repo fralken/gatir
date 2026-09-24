@@ -1,9 +1,13 @@
-//! NTLMv2 challenge responses (MS-NLMP 3.3.2 and 2.2.2.7).
+//! NTLM challenge responses (MS-NLMP 3.3): NTLMv2, and the older NTLMv1 and
+//! NTLM2 session response that some proxies still require.
 
+use des::Des;
+use des::cipher::BlockCipherEncrypt;
 use hmac::{Hmac, KeyInit, Mac};
-use md5::Md5;
+use md5::{Digest, Md5};
+use zeroize::Zeroizing;
 
-use super::hash::Ntlmv2Hash;
+use super::hash::{HASH_LEN, NtHash, Ntlmv2Hash};
 
 /// Length of the server challenge and of the client nonce.
 pub const CHALLENGE_LEN: usize = 8;
@@ -51,6 +55,85 @@ pub fn ntlmv2_responses(
     lm[16..].copy_from_slice(client_nonce);
 
     Ntlmv2Responses { lm, nt }
+}
+
+/// Length of an NTLMv1 response, and of the LM field that carries it.
+pub const V1_RESPONSE_LEN: usize = 24;
+
+/// The two responses of an NTLMv1 authentication.
+pub struct Ntlmv1Responses {
+    pub lm: [u8; V1_RESPONSE_LEN],
+    pub nt: [u8; V1_RESPONSE_LEN],
+}
+
+/// NTLMv1 with the NT response only.
+///
+/// The LM field repeats the NT response: no LM hash is ever computed, since
+/// it is cryptographically broken (MS-NLMP: "NoLMResponseNTLMv1").
+pub fn ntlmv1_responses(
+    nt_hash: &NtHash,
+    server_challenge: &[u8; CHALLENGE_LEN],
+) -> Ntlmv1Responses {
+    let nt = desl(nt_hash.expose(), server_challenge);
+    Ntlmv1Responses { lm: nt, nt }
+}
+
+/// NTLMv1 with extended session security, "NTLM2 session response": the NT
+/// response is over the first 8 bytes of MD5(server challenge, client nonce),
+/// and the LM field holds the nonce followed by 16 zero bytes.
+pub fn ntlm2_session_responses(
+    nt_hash: &NtHash,
+    server_challenge: &[u8; CHALLENGE_LEN],
+    client_nonce: &[u8; CHALLENGE_LEN],
+) -> Ntlmv1Responses {
+    let mut hasher = Md5::new();
+    hasher.update(server_challenge);
+    hasher.update(client_nonce);
+    let mut session_challenge = [0u8; CHALLENGE_LEN];
+    session_challenge.copy_from_slice(&hasher.finalize()[..CHALLENGE_LEN]);
+
+    let mut lm = [0u8; V1_RESPONSE_LEN];
+    lm[..CHALLENGE_LEN].copy_from_slice(client_nonce);
+    Ntlmv1Responses {
+        lm,
+        nt: desl(nt_hash.expose(), &session_challenge),
+    }
+}
+
+/// DESL (MS-NLMP 6): DES-encrypts `data` three times, keyed with consecutive
+/// 7-byte slices of the 16-byte hash padded with zeros to 21 bytes.
+fn desl(hash: &[u8; HASH_LEN], data: &[u8; CHALLENGE_LEN]) -> [u8; V1_RESPONSE_LEN] {
+    let mut padded = Zeroizing::new([0u8; 21]);
+    padded[..HASH_LEN].copy_from_slice(hash);
+
+    let mut response = [0u8; V1_RESPONSE_LEN];
+    for part in 0..3 {
+        let mut seven = [0u8; 7];
+        seven.copy_from_slice(&padded[part * 7..part * 7 + 7]);
+        let key = Zeroizing::new(des_key(&seven));
+        let cipher = Des::new_from_slice(&*key).expect("a DES key is 8 bytes");
+        let mut block = des::cipher::Block::<Des>::from(*data);
+        cipher.encrypt_block(&mut block);
+        response[part * CHALLENGE_LEN..(part + 1) * CHALLENGE_LEN].copy_from_slice(&block);
+    }
+    response
+}
+
+/// Spreads 56 key bits over 8 bytes, 7 bits each, and sets odd parity in the
+/// low bit of every byte.
+fn des_key(seven: &[u8; 7]) -> [u8; 8] {
+    let bits = seven
+        .iter()
+        .fold(0u64, |all, byte| (all << 8) | u64::from(*byte));
+    let mut key = [0u8; 8];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let group = ((bits >> (49 - 7 * index)) & 0x7f) as u8;
+        *byte = group << 1;
+        if byte.count_ones() % 2 == 0 {
+            *byte |= 1;
+        }
+    }
+    key
 }
 
 fn hmac_md5(key: &Ntlmv2Hash, parts: &[&[u8]]) -> [u8; 16] {
@@ -158,6 +241,93 @@ mod tests {
             hex::encode(responses.nt),
             "ec5758338aafa101f250608ed516db1f010100000000000080a6f982404cdd0149f98e2c578506d10000000002000e00540045005300540044004f004d0001001200500052004f005800590048004f005300540004002600740065007300740064006f006d002e006500780061006d0070006c0065002e0063006f006d0003003a00700072006f007800790068006f00730074002e00740065007300740064006f006d002e006500780061006d0070006c0065002e0063006f006d000000000000000000"
         );
+    }
+
+    #[test]
+    fn matches_the_ms_nlmp_ntlmv1_vector() {
+        // 4.2.2: the NT response of "Password" to the spec's server challenge.
+        let responses = ntlmv1_responses(&NtHash::from_password("Password"), &SERVER_CHALLENGE);
+        assert_eq!(
+            hex::encode(responses.nt),
+            "67c43011f30298a2ad35ece64f16331c44bdbed927841f94"
+        );
+        assert_eq!(
+            responses.lm, responses.nt,
+            "the LM field repeats the NT response"
+        );
+    }
+
+    #[test]
+    fn matches_an_independent_ntlm2_session_response() {
+        // Computed with the same algorithm on OpenSSL's DES and MD5; the value
+        // is the one published in MS-NLMP 4.2.3.
+        let responses = ntlm2_session_responses(
+            &NtHash::from_password("Password"),
+            &SERVER_CHALLENGE,
+            &CLIENT_NONCE,
+        );
+        assert_eq!(
+            hex::encode(responses.lm),
+            "aaaaaaaaaaaaaaaa00000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex::encode(responses.nt),
+            "7537f803ae367128ca458204bde7caf81e97ed2683267232"
+        );
+    }
+
+    /// Real exchanges captured from the C cntlm against a fake server whose
+    /// challenge was 1122334455667788. Synthetic credentials.
+    const C_CHALLENGE: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+    #[test]
+    fn reproduces_an_ntlmv1_response_generated_by_another_implementation() {
+        let responses =
+            ntlmv1_responses(&NtHash::from_password("not-a-real-password"), &C_CHALLENGE);
+        assert_eq!(
+            hex::encode(responses.nt),
+            "834c9205d932b4879d6e135b99d1a6fafbf9ec2fc76f3b01"
+        );
+    }
+
+    #[test]
+    fn reproduces_an_ntlm2_session_response_generated_by_another_implementation() {
+        let nonce = [0xb1, 0xa3, 0xa7, 0xa8, 0x46, 0x8e, 0x2e, 0xb0];
+        let responses = ntlm2_session_responses(
+            &NtHash::from_password("not-a-real-password"),
+            &C_CHALLENGE,
+            &nonce,
+        );
+        assert_eq!(
+            hex::encode(responses.lm),
+            "b1a3a7a8468e2eb000000000000000000000000000000000"
+        );
+        assert_eq!(
+            hex::encode(responses.nt),
+            "69f548f94884f026cf40b8d0e405ce5b683919f2684032de"
+        );
+    }
+
+    #[test]
+    fn des_keys_spread_56_bits_over_8_bytes_with_odd_parity() {
+        assert_eq!(des_key(&[0; 7]), [0x01; 8]);
+        assert_eq!(des_key(&[0xff; 7]), [0xfe; 8]);
+
+        for seven in [
+            [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde],
+            [0xa4, 0xf4, 0x9c, 0x40, 0x65, 0x10, 0xbd],
+            [0x00, 0x01, 0x80, 0x7f, 0xfe, 0x55, 0xaa],
+        ] {
+            let key = des_key(&seven);
+            for byte in key {
+                assert_eq!(byte.count_ones() % 2, 1, "{byte:#04x} has even parity");
+            }
+            // Dropping the parity bits gives back the 56 bits that went in.
+            let packed = key
+                .iter()
+                .fold(0u64, |all, byte| (all << 7) | u64::from(byte >> 1));
+            assert_eq!(packed.to_be_bytes()[1..], seven);
+        }
     }
 
     #[test]

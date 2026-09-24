@@ -7,6 +7,9 @@ mod response;
 
 pub use hash::{HASH_LEN, NtHash, Ntlmv2Hash};
 pub use message::{
-    Challenge, Entropy, Identity, MessageError, authenticate_v2, filetime, flags, negotiate,
+    Challenge, Dialect, Entropy, Identity, MessageError, authenticate, filetime, flags, negotiate,
 };
-pub use response::{CHALLENGE_LEN, LMV2_RESPONSE_LEN, Ntlmv2Responses, ntlmv2_responses};
+pub use response::{
+    CHALLENGE_LEN, LMV2_RESPONSE_LEN, Ntlmv1Responses, Ntlmv2Responses, V1_RESPONSE_LEN,
+    ntlm2_session_responses, ntlmv1_responses, ntlmv2_responses,
+};

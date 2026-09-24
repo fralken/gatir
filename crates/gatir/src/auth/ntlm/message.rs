@@ -7,7 +7,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::hash::{NtHash, Ntlmv2Hash};
-use super::response::{CHALLENGE_LEN, ntlmv2_responses};
+use super::response::{CHALLENGE_LEN, ntlm2_session_responses, ntlmv1_responses, ntlmv2_responses};
+use crate::config::AuthMethod;
 
 /// NEGOTIATE flags (MS-NLMP 2.2.2.5), the subset used here.
 pub mod flags {
@@ -161,19 +162,42 @@ pub fn filetime(time: SystemTime) -> u64 {
         + u64::from(since_epoch.subsec_nanos() / 100)
 }
 
+/// Which NTLM authentication to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// NTLMv2.
+    V2,
+    /// NTLMv1 with extended session security ("NTLM2 session response"). If
+    /// the server does not offer extended session security, plain NTLMv1 is
+    /// answered instead.
+    V1Extended,
+    /// NTLMv1, NT response only.
+    V1,
+}
+
+impl Dialect {
+    /// The NTLM dialect for a configured method; `None` for Negotiate/Kerberos,
+    /// which does not use NTLM messages.
+    pub fn from_method(method: AuthMethod) -> Option<Self> {
+        match method {
+            AuthMethod::Ntlmv2 => Some(Self::V2),
+            AuthMethod::Ntlm2sr => Some(Self::V1Extended),
+            AuthMethod::Nt => Some(Self::V1),
+            AuthMethod::Negotiate => None,
+        }
+    }
+}
+
 /// Builds the NEGOTIATE message (type 1) that opens the exchange. The domain
 /// and workstation are sent in upper case, in the OEM character set.
-pub fn negotiate(identity: &Identity<'_>) -> Result<Vec<u8>, MessageError> {
+pub fn negotiate(dialect: Dialect, identity: &Identity<'_>) -> Result<Vec<u8>, MessageError> {
     let domain = identity.domain.to_ascii_uppercase().into_bytes();
     let workstation = identity.workstation.to_ascii_uppercase().into_bytes();
 
-    let mut negotiated = flags::UNICODE
-        | flags::REQUEST_TARGET
-        | flags::NTLM
-        | flags::ALWAYS_SIGN
-        | flags::EXTENDED_SESSION_SECURITY
-        | flags::KEY_128
-        | flags::KEY_56;
+    let mut negotiated = flags::UNICODE | flags::REQUEST_TARGET | flags::NTLM | flags::ALWAYS_SIGN;
+    if dialect != Dialect::V1 {
+        negotiated |= flags::EXTENDED_SESSION_SECURITY | flags::KEY_128 | flags::KEY_56;
+    }
     if !domain.is_empty() {
         negotiated |= flags::OEM_DOMAIN_SUPPLIED;
     }
@@ -195,26 +219,46 @@ pub fn negotiate(identity: &Identity<'_>) -> Result<Vec<u8>, MessageError> {
     Ok(message)
 }
 
-/// Builds the AUTHENTICATE message (type 3) answering `challenge` with NTLMv2.
-pub fn authenticate_v2(
+/// Builds the AUTHENTICATE message (type 3) answering `challenge`.
+pub fn authenticate(
+    dialect: Dialect,
     identity: &Identity<'_>,
     nt_hash: &NtHash,
     challenge: &Challenge,
     entropy: &Entropy,
 ) -> Result<Vec<u8>, MessageError> {
-    let key = Ntlmv2Hash::new(nt_hash, identity.user, identity.domain);
-    // Use the server's clock when it gave one, so a skewed local clock cannot
-    // make the response look stale.
-    let time = challenge.timestamp().unwrap_or(entropy.time);
-    let responses = ntlmv2_responses(
-        &key,
-        &challenge.server_challenge,
-        &entropy.client_nonce,
-        &challenge.target_info,
-        time,
-    );
+    let mut negotiated = challenge.flags & flags::AGREED;
+    let server_challenge = &challenge.server_challenge;
 
-    let negotiated = challenge.flags & flags::AGREED;
+    let (lm, nt): (Vec<u8>, Vec<u8>) = match dialect {
+        Dialect::V2 => {
+            let key = Ntlmv2Hash::new(nt_hash, identity.user, identity.domain);
+            // Use the server's clock when it gave one, so a skewed local
+            // clock cannot make the response look stale.
+            let time = challenge.timestamp().unwrap_or(entropy.time);
+            let responses = ntlmv2_responses(
+                &key,
+                server_challenge,
+                &entropy.client_nonce,
+                &challenge.target_info,
+                time,
+            );
+            (responses.lm.to_vec(), responses.nt)
+        }
+        Dialect::V1Extended if negotiated & flags::EXTENDED_SESSION_SECURITY != 0 => {
+            let responses =
+                ntlm2_session_responses(nt_hash, server_challenge, &entropy.client_nonce);
+            (responses.lm.to_vec(), responses.nt.to_vec())
+        }
+        Dialect::V1Extended | Dialect::V1 => {
+            // The flag tells the server how to read the response, so it must
+            // not claim extended session security for a plain NTLMv1 one.
+            negotiated &= !flags::EXTENDED_SESSION_SECURITY;
+            let responses = ntlmv1_responses(nt_hash, server_challenge);
+            (responses.lm.to_vec(), responses.nt.to_vec())
+        }
+    };
+
     let unicode = negotiated & flags::UNICODE != 0;
     let encode = |text: &str| -> Vec<u8> {
         if unicode {
@@ -240,8 +284,8 @@ pub fn authenticate_v2(
         AUTHENTICATE_HEADER_LEN,
         &encode(&identity.workstation.to_ascii_uppercase()),
     )?;
-    let lm = place(&mut payload, AUTHENTICATE_HEADER_LEN, &responses.lm)?;
-    let nt = place(&mut payload, AUTHENTICATE_HEADER_LEN, &responses.nt)?;
+    let lm = place(&mut payload, AUTHENTICATE_HEADER_LEN, &lm)?;
+    let nt = place(&mut payload, AUTHENTICATE_HEADER_LEN, &nt)?;
     let session_key = place(&mut payload, AUTHENTICATE_HEADER_LEN, &[])?;
 
     let mut message = Vec::with_capacity(AUTHENTICATE_HEADER_LEN + payload.len());
@@ -467,7 +511,7 @@ mod tests {
 
     #[test]
     fn negotiate_carries_flags_domain_and_workstation() {
-        let message = negotiate(&identity()).unwrap();
+        let message = negotiate(Dialect::V2, &identity()).unwrap();
 
         assert_eq!(&message[..8], b"NTLMSSP\0");
         assert_eq!(u32_at(&message, 8), 1);
@@ -487,11 +531,14 @@ mod tests {
 
     #[test]
     fn negotiate_without_domain_or_workstation_omits_their_flags() {
-        let message = negotiate(&Identity {
-            user: "u",
-            domain: "",
-            workstation: "",
-        })
+        let message = negotiate(
+            Dialect::V2,
+            &Identity {
+                user: "u",
+                domain: "",
+                workstation: "",
+            },
+        )
         .unwrap();
         let negotiated = u32_at(&message, 12);
         assert_eq!(negotiated & flags::OEM_DOMAIN_SUPPLIED, 0);
@@ -515,7 +562,8 @@ mod tests {
             time: 0,
         };
         let nt_hash = NtHash::from_password("Password");
-        let message = authenticate_v2(&identity(), &nt_hash, &challenge, &entropy).unwrap();
+        let message =
+            authenticate(Dialect::V2, &identity(), &nt_hash, &challenge, &entropy).unwrap();
 
         assert_eq!(&message[..8], b"NTLMSSP\0");
         assert_eq!(u32_at(&message, 8), 3);
@@ -561,7 +609,8 @@ mod tests {
             client_nonce: [0; 8],
             time: 0,
         };
-        let message = authenticate_v2(
+        let message = authenticate(
+            Dialect::V2,
             &identity(),
             &NtHash::from_password("p"),
             &challenge,
@@ -582,7 +631,8 @@ mod tests {
             client_nonce: [7; 8],
             time: 999,
         };
-        let message = authenticate_v2(
+        let message = authenticate(
+            Dialect::V2,
             &identity(),
             &NtHash::from_password("p"),
             &challenge,
@@ -602,7 +652,8 @@ mod tests {
             client_nonce: [7; 8],
             time: 999,
         };
-        let message = authenticate_v2(
+        let message = authenticate(
+            Dialect::V2,
             &identity(),
             &NtHash::from_password("p"),
             &challenge,
@@ -623,7 +674,8 @@ mod tests {
             client_nonce: [0; 8],
             time: 0,
         };
-        let message = authenticate_v2(
+        let message = authenticate(
+            Dialect::V2,
             &identity(),
             &NtHash::from_password("p"),
             &challenge,
@@ -646,7 +698,8 @@ mod tests {
             time: 0,
         };
         assert_eq!(
-            authenticate_v2(
+            authenticate(
+                Dialect::V2,
                 &identity(),
                 &NtHash::from_password("p"),
                 &challenge,
@@ -654,6 +707,94 @@ mod tests {
             ),
             Err(MessageError::TooLarge)
         );
+    }
+
+    // ---- dialects ----
+
+    const SPEC_CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+
+    fn authenticate_with(dialect: Dialect, server_flags: u32) -> Vec<u8> {
+        let challenge =
+            Challenge::parse(&challenge_message(server_flags, SPEC_CHALLENGE, &[])).unwrap();
+        let entropy = Entropy {
+            client_nonce: [0xaa; 8],
+            time: 0,
+        };
+        authenticate(
+            dialect,
+            &identity(),
+            &NtHash::from_password("Password"),
+            &challenge,
+            &entropy,
+        )
+        .unwrap()
+    }
+
+    const NTLMV1_NT: &str = "67c43011f30298a2ad35ece64f16331c44bdbed927841f94";
+    const NTLM2_LM: &str = "aaaaaaaaaaaaaaaa00000000000000000000000000000000";
+    const NTLM2_NT: &str = "7537f803ae367128ca458204bde7caf81e97ed2683267232";
+
+    #[test]
+    fn negotiate_flags_depend_on_the_dialect() {
+        for (dialect, extended) in [
+            (Dialect::V2, true),
+            (Dialect::V1Extended, true),
+            (Dialect::V1, false),
+        ] {
+            let message = negotiate(dialect, &identity()).unwrap();
+            let negotiated = u32_at(&message, 12);
+            assert_eq!(
+                negotiated & flags::EXTENDED_SESSION_SECURITY != 0,
+                extended,
+                "{dialect:?}"
+            );
+            assert_ne!(negotiated & flags::UNICODE, 0);
+            assert_ne!(negotiated & flags::NTLM, 0);
+        }
+    }
+
+    #[test]
+    fn ntlmv1_answers_with_the_nt_response_in_both_fields() {
+        // The server offers extended session security, but the client did not
+        // ask for it: it must not be claimed.
+        let offered = flags::UNICODE | flags::NTLM | flags::EXTENDED_SESSION_SECURITY;
+        let message = authenticate_with(Dialect::V1, offered);
+
+        assert_eq!(hex::encode(authenticate_field(&message, 0)), NTLMV1_NT);
+        assert_eq!(hex::encode(authenticate_field(&message, 1)), NTLMV1_NT);
+        assert_eq!(u32_at(&message, 60) & flags::EXTENDED_SESSION_SECURITY, 0);
+        assert!(authenticate_field(&message, 5).is_empty());
+    }
+
+    #[test]
+    fn ntlm2_session_response_is_used_when_the_server_offers_it() {
+        let offered = flags::UNICODE | flags::NTLM | flags::EXTENDED_SESSION_SECURITY;
+        let message = authenticate_with(Dialect::V1Extended, offered);
+
+        assert_eq!(hex::encode(authenticate_field(&message, 0)), NTLM2_LM);
+        assert_eq!(hex::encode(authenticate_field(&message, 1)), NTLM2_NT);
+        assert_ne!(u32_at(&message, 60) & flags::EXTENDED_SESSION_SECURITY, 0);
+    }
+
+    #[test]
+    fn ntlm2_session_falls_back_to_plain_ntlmv1_when_the_server_does_not_offer_it() {
+        let offered = flags::UNICODE | flags::NTLM;
+        let message = authenticate_with(Dialect::V1Extended, offered);
+
+        assert_eq!(hex::encode(authenticate_field(&message, 0)), NTLMV1_NT);
+        assert_eq!(hex::encode(authenticate_field(&message, 1)), NTLMV1_NT);
+        assert_eq!(u32_at(&message, 60) & flags::EXTENDED_SESSION_SECURITY, 0);
+    }
+
+    #[test]
+    fn the_configured_method_selects_the_dialect() {
+        assert_eq!(Dialect::from_method(AuthMethod::Ntlmv2), Some(Dialect::V2));
+        assert_eq!(
+            Dialect::from_method(AuthMethod::Ntlm2sr),
+            Some(Dialect::V1Extended)
+        );
+        assert_eq!(Dialect::from_method(AuthMethod::Nt), Some(Dialect::V1));
+        assert_eq!(Dialect::from_method(AuthMethod::Negotiate), None);
     }
 
     #[test]
