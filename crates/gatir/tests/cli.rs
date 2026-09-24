@@ -173,3 +173,18 @@ fn config_check_works_without_a_file() {
             .and(predicate::str::contains("direct connections")),
     );
 }
+
+#[test]
+fn header_values_are_never_printed() {
+    let file = config_file("[headers]\nX-Api-Key = \"super-secret-key\"\n");
+    gatir()
+        .args(["config", "check", "--log-level", "trace", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("x-api-key")
+                .and(predicate::str::contains("super-secret-key").not()),
+        )
+        .stderr(predicate::str::contains("super-secret-key").not());
+}

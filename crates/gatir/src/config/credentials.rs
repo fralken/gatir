@@ -165,6 +165,16 @@ where
     deserializer.deserialize_str(SecretVisitor).map(Some)
 }
 
+/// A secret read from a TOML string, for use as a value in a table.
+#[derive(Debug)]
+pub(super) struct SecretValue(pub SecretString);
+
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(SecretVisitor).map(Self)
+    }
+}
+
 struct SecretVisitor;
 
 impl SecretVisitor {

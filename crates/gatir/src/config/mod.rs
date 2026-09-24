@@ -5,7 +5,9 @@
 
 mod addr;
 mod credentials;
+mod headers;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,8 +21,9 @@ use crate::acl::{Acl, Action, Rule};
 use crate::noproxy::NoProxy;
 
 pub use addr::{ParentAddr, ParentAddrError};
-use credentials::RawCredentials;
 pub use credentials::{AuthMethod, Credentials, NT_HASH_LEN, Secret};
+use credentials::{RawCredentials, SecretValue};
+pub use headers::HeaderRule;
 
 const DEFAULT_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3128);
@@ -108,6 +111,9 @@ pub struct Config {
     pub access: Acl,
     /// Destinations contacted directly instead of through a parent proxy.
     pub no_proxy: NoProxy,
+    /// Header fields set on every forwarded request, replacing any the client
+    /// sent. Values are sensitive.
+    pub request_headers: Vec<HeaderRule>,
     pub timeouts: Timeouts,
     pub log_level: LogLevel,
 }
@@ -134,6 +140,7 @@ struct RawConfig {
     credentials: Option<RawCredentials>,
     access: Option<RawAccess>,
     no_proxy: Option<Vec<String>>,
+    headers: Option<BTreeMap<String, SecretValue>>,
     timeouts: Option<RawTimeouts>,
     log: Option<RawLog>,
 }
@@ -266,6 +273,12 @@ impl Config {
         } else {
             join(self.no_proxy.entries().iter())
         };
+        // Names only: the values are secrets.
+        let headers = if self.request_headers.is_empty() {
+            "none".to_owned()
+        } else {
+            join(self.request_headers.iter().map(|(name, _)| name))
+        };
         let timeouts = format!(
             "connect {}s, client idle {}s, tunnel idle {}s, shutdown grace {}s",
             self.timeouts.connect.as_secs(),
@@ -275,7 +288,7 @@ impl Config {
         );
         format!(
             "listen:      {listen}\nparents:     {parents}\ncredentials: {credentials}\n\
-             access:      {access}\nno_proxy:    {no_proxy}\ntimeouts:    {timeouts}\n\
+             access:      {access}\nno_proxy:    {no_proxy}\nheaders:     {headers} (set on every request)\ntimeouts:    {timeouts}\n\
              log level:   {}",
             self.log_level.as_str()
         )
@@ -366,6 +379,12 @@ impl RawConfig {
         let no_proxy = NoProxy::new(self.no_proxy.unwrap_or_default())
             .map_err(|err| ConfigError::invalid(err.to_string()))?;
 
+        let request_headers = self
+            .headers
+            .map(headers::parse)
+            .transpose()?
+            .unwrap_or_default();
+
         let timeouts = self
             .timeouts
             .map(RawTimeouts::resolve)
@@ -383,6 +402,7 @@ impl RawConfig {
             credentials,
             access,
             no_proxy,
+            request_headers,
             timeouts,
             log_level,
         })
@@ -751,6 +771,44 @@ mod tests {
                 .summary()
                 .contains("default allow, no rules")
         );
+    }
+
+    #[test]
+    fn parses_request_headers() {
+        let config =
+            load("[headers]\n\"User-Agent\" = \"corp/1.0\"\n\"X-Requested-By\" = \"gatir\"")
+                .unwrap();
+        let names: Vec<&str> = config
+            .request_headers
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["user-agent", "x-requested-by"]);
+        assert!(config.request_headers.iter().all(|(_, v)| v.is_sensitive()));
+        assert!(
+            config
+                .summary()
+                .contains("headers:     user-agent, x-requested-by")
+        );
+        assert!(load("").unwrap().request_headers.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_request_headers() {
+        assert!(error_text("[headers]\nHost = \"example.com\"").contains("managed by gatir"));
+        assert!(error_text("[headers]\n\"X-Thing\" = 12345").contains("quoted strings"));
+    }
+
+    #[test]
+    fn header_values_never_appear_in_debug_summary_or_errors() {
+        let config = load("[headers]\nX-Api-Key = \"super-secret-key\"").unwrap();
+        for text in [format!("{config:?}"), config.summary()] {
+            assert!(!text.contains("super-secret-key"), "{text}");
+        }
+        let text = error_text("[headers]\nX-Api-Key = 424242");
+        assert!(!text.contains("424242"), "{text}");
+        let text = error_text("[headers]\nHost = \"super-secret-key\"");
+        assert!(!text.contains("super-secret-key"), "{text}");
     }
 
     #[test]

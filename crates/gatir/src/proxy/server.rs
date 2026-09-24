@@ -21,7 +21,7 @@ use super::pool::Pool;
 use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
-use crate::config::{Config, Timeouts};
+use crate::config::{Config, HeaderRule, Timeouts};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
 ///
@@ -36,6 +36,8 @@ pub(super) struct Context {
     pub access: Acl,
     pub timeouts: Timeouts,
     pub upstreams: Upstreams,
+    /// Fields set on every request sent upstream.
+    pub request_headers: Vec<HeaderRule>,
     /// Idle connections to origin servers and parents, shared by all clients.
     pub pool: Arc<Pool>,
     /// Every task serving a client, so shutdown can wait for them.
@@ -53,6 +55,7 @@ pub struct Server {
     access: Acl,
     timeouts: Timeouts,
     upstreams: Upstreams,
+    request_headers: Vec<HeaderRule>,
 }
 
 impl Server {
@@ -70,6 +73,7 @@ impl Server {
             access: config.access.clone(),
             timeouts: config.timeouts.clone(),
             upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone()),
+            request_headers: config.request_headers.clone(),
         })
     }
 
@@ -93,6 +97,7 @@ impl Server {
             access: self.access,
             timeouts: self.timeouts,
             upstreams: self.upstreams,
+            request_headers: self.request_headers,
             pool: Arc::new(Pool::default()),
             tracker: TaskTracker::new(),
             shutdown: shutdown.clone(),

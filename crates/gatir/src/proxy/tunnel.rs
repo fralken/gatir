@@ -21,9 +21,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
-use super::headers::strip_hop_by_hop;
+use super::headers::{apply_rules, strip_hop_by_hop};
 use super::server::Context;
 use super::upstream::Route;
+use crate::config::HeaderRule;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -70,7 +71,9 @@ async fn open(
         }
         Route::Parent => {
             let (_, stream) = context.upstreams.connect_parent(limit).await?;
-            match connect_through_parent(stream, &address, &mut request).await? {
+            match connect_through_parent(stream, &address, &mut request, &context.request_headers)
+                .await?
+            {
                 ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
                 ParentAnswer::Refused(response) => return Ok(response),
             }
@@ -109,9 +112,11 @@ async fn connect_through_parent(
     stream: TcpStream,
     address: &str,
     client_request: &mut Request<Incoming>,
+    rules: &[HeaderRule],
 ) -> Result<ParentAnswer, Failure> {
     let mut headers = std::mem::take(client_request.headers_mut());
     strip_hop_by_hop(&mut headers);
+    apply_rules(&mut headers, rules);
     headers.insert(
         HOST,
         HeaderValue::from_str(address)

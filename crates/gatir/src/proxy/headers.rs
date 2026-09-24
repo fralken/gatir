@@ -2,6 +2,8 @@
 
 use hyper::header::{CONNECTION, HeaderMap, HeaderName};
 
+use crate::config::HeaderRule;
+
 /// Fields that apply to a single connection (RFC 9110 section 7.6.1) plus the
 /// proxy authentication fields, which are meant for this proxy only.
 const HOP_BY_HOP: [&str; 9] = [
@@ -31,6 +33,13 @@ pub(super) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
     for name in named_by_connection {
         headers.remove(name);
+    }
+}
+
+/// Sets the configured fields, replacing any the client sent.
+pub(super) fn apply_rules(headers: &mut HeaderMap, rules: &[HeaderRule]) {
+    for (name, value) in rules {
+        headers.insert(name.clone(), value.clone());
     }
 }
 
@@ -80,6 +89,26 @@ mod tests {
         strip_hop_by_hop(&mut map);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("x-public"));
+    }
+
+    #[test]
+    fn configured_fields_replace_or_add() {
+        let mut map = headers(&[("user-agent", "client"), ("x-keep", "yes")]);
+        let rules = vec![
+            (
+                HeaderName::from_static("user-agent"),
+                HeaderValue::from_static("corp"),
+            ),
+            (
+                HeaderName::from_static("x-added"),
+                HeaderValue::from_static("1"),
+            ),
+        ];
+        apply_rules(&mut map, &rules);
+        assert_eq!(map["user-agent"], "corp");
+        assert_eq!(map["x-added"], "1");
+        assert_eq!(map["x-keep"], "yes");
+        assert_eq!(map.get_all("user-agent").iter().count(), 1);
     }
 
     #[test]

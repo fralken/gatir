@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
-use super::headers::strip_hop_by_hop;
+use super::headers::{apply_rules, strip_hop_by_hop};
 use super::pool::{Lease, PoolKey};
 use super::server::Context;
 use super::upstream::Route;
@@ -49,6 +49,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     let target = Target::from_uri(&parts.uri)?;
 
     strip_hop_by_hop(&mut parts.headers);
+    apply_rules(&mut parts.headers, &context.request_headers);
     parts.headers.insert(HOST, target.host_header.clone());
 
     let route = context.upstreams.route(&target.host);
