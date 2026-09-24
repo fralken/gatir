@@ -1,6 +1,10 @@
 //! gatir: an authenticating HTTP proxy that logs into a corporate parent proxy
 //! (NTLM, Kerberos, SSPI) on behalf of the user.
 
+pub mod cli;
+pub mod config;
+pub mod logging;
+
 /// Crate version, as declared in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
