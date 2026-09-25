@@ -222,8 +222,8 @@ mod tests {
         assert_eq!(hex::encode(responses.nt), NTLMV2_NT_RESPONSE);
     }
 
-    /// A real exchange: the responses the C cntlm sent to a fake server with
-    /// this challenge and target info. Synthetic credentials.
+    /// A real exchange: the responses another NTLM implementation sent to a
+    /// fake server with this challenge and target info. Synthetic credentials.
     #[test]
     fn reproduces_a_response_generated_by_another_implementation() {
         let key = Ntlmv2Hash::new(
@@ -284,8 +284,8 @@ mod tests {
         );
     }
 
-    /// Real exchanges captured from the C cntlm against a fake server whose
-    /// challenge was 1122334455667788. Synthetic credentials.
+    /// Real exchanges captured from another NTLM implementation against a
+    /// fake server whose challenge was 1122334455667788. Synthetic credentials.
     const C_CHALLENGE: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
 
     #[test]

@@ -20,6 +20,8 @@ CNTLM.
   translate code, comments, tests, help text or documentation from other
   projects. Documentation mentions CNTLM only to say that gatir is inspired
   by it.
+- The specifications the code follows are listed in `docs/references.md`, with
+  the revision used. Add a new one there when code starts to depend on it.
 
 ## Security rules
 
