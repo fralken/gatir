@@ -1,0 +1,422 @@
+//! The NTLM exchange with a parent proxy, as HTTP header fields.
+//!
+//! NTLM authenticates a connection, not a request. The client opens with a
+//! NEGOTIATE message in `Proxy-Authorization`, the proxy answers `407` with a
+//! CHALLENGE in `Proxy-Authenticate`, and the client repeats the request with
+//! an AUTHENTICATE message. [`Authenticator`] builds the two header values and
+//! reads the challenge; sending the requests is up to the caller.
+
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_PAD_INDIFFERENT};
+use hyper::header::HeaderValue;
+use secrecy::ExposeSecret;
+use zeroize::Zeroize;
+
+use super::ntlm::{
+    Challenge, Dialect, Entropy, Identity, MessageError, NtHash, authenticate, negotiate,
+};
+use crate::config::{Credentials, Secret};
+
+const SCHEME: &str = "NTLM";
+/// The longest NetBIOS computer name; Windows truncates its own names to this.
+const WORKSTATION_MAX: usize = 15;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("credentials.method = \"negotiate\" is not implemented yet")]
+    Unsupported,
+    #[error("the credentials have neither a password nor an NT hash")]
+    NoSecret,
+    #[error("the parent proxy does not offer NTLM authentication{}", offered_list(.offered))]
+    NtlmNotOffered { offered: Vec<String> },
+    #[error("the parent proxy did not send an NTLM challenge")]
+    NoChallenge,
+    #[error("the parent proxy sent an invalid NTLM challenge: {0}")]
+    BadChallenge(String),
+    #[error("cannot build the NTLM message: {0}")]
+    Message(#[from] MessageError),
+    #[error("cannot get random bytes for the NTLM response: {0}")]
+    Entropy(getrandom::Error),
+}
+
+fn offered_list(offered: &[String]) -> String {
+    if offered.is_empty() {
+        String::new()
+    } else {
+        format!(" (it offers: {})", offered.join(", "))
+    }
+}
+
+/// Produces the `Proxy-Authorization` values of an NTLM exchange. One
+/// instance serves every connection: it holds no per-connection state.
+#[derive(Debug)]
+pub struct Authenticator {
+    dialect: Dialect,
+    user: String,
+    domain: String,
+    workstation: String,
+    nt_hash: NtHash,
+}
+
+impl Authenticator {
+    pub fn new(credentials: &Credentials) -> Result<Self, AuthError> {
+        let dialect = Dialect::from_method(credentials.method).ok_or(AuthError::Unsupported)?;
+        // The plain password is not kept: the NT hash is all NTLM needs.
+        let nt_hash = match &credentials.secret {
+            Some(Secret::Password(password)) => NtHash::from_password(password.expose_secret()),
+            Some(Secret::NtHash(hash)) => {
+                let mut bytes = *hash.expose_secret();
+                let nt_hash = NtHash::from_bytes(bytes);
+                bytes.zeroize();
+                nt_hash
+            }
+            None => return Err(AuthError::NoSecret),
+        };
+        Ok(Self {
+            dialect,
+            user: credentials.username.clone(),
+            domain: credentials.domain.clone(),
+            workstation: credentials
+                .workstation
+                .clone()
+                .unwrap_or_else(default_workstation),
+            nt_hash,
+        })
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            user: &self.user,
+            domain: &self.domain,
+            workstation: &self.workstation,
+        }
+    }
+
+    /// The `Proxy-Authorization` value that opens the exchange (NEGOTIATE).
+    pub fn first(&self) -> Result<HeaderValue, AuthError> {
+        Ok(header(&negotiate(self.dialect, &self.identity())?))
+    }
+
+    /// Answers the proxy's `407`: reads the challenge out of its
+    /// `Proxy-Authenticate` fields and returns the `Proxy-Authorization`
+    /// value holding the AUTHENTICATE message.
+    pub fn respond<'a>(
+        &self,
+        fields: impl IntoIterator<Item = &'a HeaderValue>,
+    ) -> Result<HeaderValue, AuthError> {
+        let entropy = Entropy::fresh().map_err(AuthError::Entropy)?;
+        self.respond_with(fields, &entropy)
+    }
+
+    fn respond_with<'a>(
+        &self,
+        fields: impl IntoIterator<Item = &'a HeaderValue>,
+        entropy: &Entropy,
+    ) -> Result<HeaderValue, AuthError> {
+        let token = find_challenge(fields)?;
+        let bytes = STANDARD_PAD_INDIFFERENT
+            .decode(token)
+            .map_err(|err| AuthError::BadChallenge(err.to_string()))?;
+        let challenge =
+            Challenge::parse(&bytes).map_err(|err| AuthError::BadChallenge(err.to_string()))?;
+        let message = authenticate(
+            self.dialect,
+            &self.identity(),
+            &self.nt_hash,
+            &challenge,
+            entropy,
+        )?;
+        Ok(header(&message))
+    }
+}
+
+/// The name Windows would give this machine, when none is configured.
+fn default_workstation() -> String {
+    let name = gethostname::gethostname().to_string_lossy().into_owned();
+    let short = name.split('.').next().unwrap_or_default();
+    short.chars().take(WORKSTATION_MAX).collect()
+}
+
+/// `NTLM <base64>`, marked sensitive so it never shows up in debug output.
+fn header(message: &[u8]) -> HeaderValue {
+    let mut value = HeaderValue::from_str(&format!("{SCHEME} {}", STANDARD.encode(message)))
+        .expect("base64 text is a valid header value");
+    value.set_sensitive(true);
+    value
+}
+
+/// One challenge of a `Proxy-Authenticate` field: a scheme and what follows it.
+struct Offer<'a> {
+    scheme: &'a str,
+    token: Option<&'a str>,
+}
+
+/// The token of the NTLM challenge among the `Proxy-Authenticate` fields.
+fn find_challenge<'a>(
+    fields: impl IntoIterator<Item = &'a HeaderValue>,
+) -> Result<&'a str, AuthError> {
+    let offers: Vec<Offer<'a>> = fields
+        .into_iter()
+        .filter_map(|field| field.to_str().ok())
+        .flat_map(offers)
+        .collect();
+
+    let mut ntlm = offers
+        .iter()
+        .filter(|offer| offer.scheme.eq_ignore_ascii_case(SCHEME))
+        .peekable();
+    if ntlm.peek().is_none() {
+        return Err(AuthError::NtlmNotOffered {
+            offered: offers.iter().map(|offer| offer.scheme.to_owned()).collect(),
+        });
+    }
+    ntlm.find_map(|offer| offer.token)
+        .ok_or(AuthError::NoChallenge)
+}
+
+fn offers(field: &str) -> impl Iterator<Item = Offer<'_>> {
+    split_outside_quotes(field).into_iter().filter_map(|part| {
+        let part = part.trim();
+        let (scheme, rest) = part
+            .split_once(char::is_whitespace)
+            .map_or((part, ""), |(scheme, rest)| (scheme, rest.trim()));
+        // A part like `charset="UTF-8"` goes on with the previous challenge; it
+        // does not start a new one.
+        if scheme.is_empty() || scheme.contains('=') {
+            return None;
+        }
+        Some(Offer {
+            scheme,
+            token: (!rest.is_empty()).then_some(rest),
+        })
+    })
+}
+
+/// Splits at the commas that are not inside a quoted string.
+fn split_outside_quotes(field: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, character) in field.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(&field[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&field[start..]);
+    parts
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::config::AuthMethod;
+
+    fn credentials(method: AuthMethod) -> Credentials {
+        Credentials {
+            method,
+            username: "User".to_owned(),
+            domain: "Domain".to_owned(),
+            workstation: Some("Computer".to_owned()),
+            secret: Some(Secret::Password(SecretString::from("Password"))),
+        }
+    }
+
+    fn authenticator() -> Authenticator {
+        Authenticator::new(&credentials(AuthMethod::Ntlmv2)).unwrap()
+    }
+
+    fn fields(values: &[&str]) -> Vec<HeaderValue> {
+        values
+            .iter()
+            .map(|value| HeaderValue::from_str(value).unwrap())
+            .collect()
+    }
+
+    /// The NTLMv2 example CHALLENGE_MESSAGE of MS-NLMP 4.2.4.3.
+    const SPEC_CHALLENGE_HEX: &str = concat!(
+        "4e544c4d53535000020000000c000c003800000033828ae20123456789abcdef",
+        "00000000000000002400240044000000060070170000000f",
+        "530065007200760065007200",
+        "02000c0044006f006d00610069006e00",
+        "01000c00530065007200760065007200",
+        "00000000",
+    );
+
+    /// The same message as it travels in `Proxy-Authenticate`.
+    fn spec_challenge() -> String {
+        STANDARD.encode(hex::decode(SPEC_CHALLENGE_HEX).unwrap())
+    }
+
+    fn decoded(value: &HeaderValue) -> Vec<u8> {
+        let text = value.to_str().unwrap();
+        let token = text.strip_prefix("NTLM ").expect("NTLM scheme");
+        STANDARD.decode(token).unwrap()
+    }
+
+    #[test]
+    fn the_first_message_is_a_negotiate_message() {
+        let value = authenticator().first().unwrap();
+        let message = decoded(&value);
+        assert_eq!(&message[..8], b"NTLMSSP\0");
+        assert_eq!(u32::from_le_bytes(message[8..12].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn answers_a_challenge_with_an_authenticate_message() {
+        let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
+        let value = authenticator().respond(&challenge).unwrap();
+        let message = decoded(&value);
+        assert_eq!(&message[..8], b"NTLMSSP\0");
+        assert_eq!(u32::from_le_bytes(message[8..12].try_into().unwrap()), 3);
+    }
+
+    #[test]
+    fn matches_the_ms_nlmp_ntlmv2_example_when_the_entropy_is_fixed() {
+        let entropy = Entropy {
+            client_nonce: [0xaa; 8],
+            time: 0,
+        };
+        let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
+        let value = authenticator().respond_with(&challenge, &entropy).unwrap();
+        let message = decoded(&value);
+        // The NT response field (at 20) holds the proof of MS-NLMP 4.2.4.2.2
+        // followed by the blob of 4.2.4.1.3.
+        let length = usize::from(u16::from_le_bytes(message[20..22].try_into().unwrap()));
+        let offset = u32::from_le_bytes(message[24..28].try_into().unwrap()) as usize;
+        assert_eq!(
+            hex::encode(&message[offset..offset + length]),
+            concat!(
+                "68cd0ab851e51c96aabc927bebef6a1c", // NT proof
+                "0101000000000000",                 // versions, reserved
+                "0000000000000000",                 // time
+                "aaaaaaaaaaaaaaaa",                 // client nonce
+                "00000000",                         // reserved
+                "02000c0044006f006d00610069006e00", // MsvAvNbDomainName "Domain"
+                "01000c00530065007200760065007200", // MsvAvNbComputerName "Server"
+                "00000000",                         // end of the AV pairs
+                "00000000",                         // trailing reserved bytes
+            )
+        );
+    }
+
+    #[test]
+    fn the_messages_never_show_up_in_debug_output() {
+        let auth = authenticator();
+        let first = auth.first().unwrap();
+        assert_eq!(format!("{first:?}"), "Sensitive");
+        assert!(format!("{auth:?}").contains("REDACTED"));
+    }
+
+    #[test]
+    fn reads_the_challenge_among_several_fields() {
+        let offered = fields(&[
+            "Negotiate",
+            "Basic realm=\"corp, main\"",
+            &format!("ntlm {}", spec_challenge()),
+        ]);
+        assert!(authenticator().respond(&offered).is_ok());
+    }
+
+    #[test]
+    fn reads_the_challenge_when_the_schemes_share_one_field() {
+        let offered = fields(&[&format!(
+            "Basic realm=\"a, b\", charset=\"UTF-8\", NTLM {}, Negotiate",
+            spec_challenge()
+        )]);
+        assert!(authenticator().respond(&offered).is_ok());
+    }
+
+    #[test]
+    fn a_challenge_without_padding_is_accepted() {
+        let token = spec_challenge();
+        assert!(token.ends_with('='), "the test needs a padded token");
+        let offered = fields(&[&format!("NTLM {}", token.trim_end_matches('='))]);
+        assert!(authenticator().respond(&offered).is_ok());
+    }
+
+    #[test]
+    fn says_which_schemes_the_parent_offers_when_ntlm_is_not_among_them() {
+        let offered = fields(&["Basic realm=\"corp\"", "Negotiate"]);
+        let error = authenticator().respond(&offered).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the parent proxy does not offer NTLM authentication (it offers: Basic, Negotiate)"
+        );
+        let nothing = authenticator().respond(&fields(&[])).unwrap_err();
+        assert_eq!(
+            nothing.to_string(),
+            "the parent proxy does not offer NTLM authentication"
+        );
+    }
+
+    #[test]
+    fn a_bare_ntlm_offer_is_not_a_challenge() {
+        let error = authenticator().respond(&fields(&["NTLM"])).unwrap_err();
+        assert!(matches!(error, AuthError::NoChallenge), "{error}");
+    }
+
+    #[test]
+    fn rejects_challenges_that_are_not_valid() {
+        for text in [
+            "NTLM !!!not base64!!!",
+            "NTLM AAAA",
+            "NTLM TlRMTVNTUAABAAAA",
+        ] {
+            let error = authenticator().respond(&fields(&[text])).unwrap_err();
+            assert!(
+                matches!(error, AuthError::BadChallenge(_)),
+                "{text}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn negotiate_is_not_available_yet() {
+        let mut creds = credentials(AuthMethod::Negotiate);
+        creds.secret = None;
+        assert!(matches!(
+            Authenticator::new(&creds),
+            Err(AuthError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn an_nt_hash_works_in_place_of_the_password() {
+        let mut with_hash = credentials(AuthMethod::Ntlmv2);
+        let hash = NtHash::from_password("Password");
+        with_hash.secret = Some(Secret::NtHash(secrecy::SecretBox::new(Box::new(
+            *hash.expose(),
+        ))));
+
+        let entropy = Entropy {
+            client_nonce: [1; 8],
+            time: 0,
+        };
+        let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
+        let from_password = authenticator().respond_with(&challenge, &entropy).unwrap();
+        let from_hash = Authenticator::new(&with_hash)
+            .unwrap()
+            .respond_with(&challenge, &entropy)
+            .unwrap();
+        assert_eq!(decoded(&from_password), decoded(&from_hash));
+    }
+
+    #[test]
+    fn the_default_workstation_is_a_short_name() {
+        let name = default_workstation();
+        assert!(name.len() <= WORKSTATION_MAX);
+        assert!(!name.contains('.'));
+    }
+}

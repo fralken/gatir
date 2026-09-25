@@ -1,11 +1,12 @@
 //! Test support for gatir. Dev-only: never a dependency of the shipped binary.
 //!
-//! Later steps add mock parent proxies (plain, NTLM, failing, slow) and
-//! injectable clock/nonce sources here.
+//! Mock origin servers and parent proxies (plain and NTLM). Later steps add
+//! failing and slow ones, and injectable clock/nonce sources.
 
 use std::net::SocketAddr;
 
 pub mod http;
+pub mod ntlm_parent;
 pub mod origin;
 pub mod tcp;
 

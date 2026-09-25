@@ -15,10 +15,10 @@ use crate::http::{Request, read_request};
 /// chunked, truncated or malformed responses.
 #[derive(Debug, Clone)]
 pub struct Reply {
-    bytes: Vec<u8>,
-    close: bool,
-    echo: bool,
-    delay: Duration,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) close: bool,
+    pub(crate) echo: bool,
+    pub(crate) delay: Duration,
 }
 
 impl Reply {
