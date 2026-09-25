@@ -734,7 +734,7 @@ mod tests {
     const NTLM2_LM: &str = "aaaaaaaaaaaaaaaa00000000000000000000000000000000";
     const NTLM2_NT: &str = "7537f803ae367128ca458204bde7caf81e97ed2683267232";
 
-    /// [MS-NLMP] v20210625, 4.2.3.3: the CHALLENGE_MESSAGE of the NTLM2 session
+    /// [MS-NLMP] v20260330, 4.2.3.3: the CHALLENGE_MESSAGE of the NTLM2 session
     /// example. It has no target info and carries a version field.
     const SPEC_CHALLENGE_MESSAGE: &str = concat!(
         "4e544c4d53535000",         // signature
@@ -803,7 +803,7 @@ mod tests {
         }
     }
 
-    /// [MS-NLMP] v20210625, 4.2.4.3: the CHALLENGE_MESSAGE of the NTLMv2
+    /// [MS-NLMP] v20260330, 4.2.4.3: the CHALLENGE_MESSAGE of the NTLMv2
     /// example, with its target info (Domain, Server and the end marker).
     const SPEC_NTLMV2_CHALLENGE_MESSAGE: &str = concat!(
         "4e544c4d53535000",                 // signature

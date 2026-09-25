@@ -150,7 +150,7 @@ fn hmac_md5(key: &Ntlmv2Hash, parts: &[&[u8]]) -> [u8; 16] {
 /// The MS-NLMP section 4.2 test inputs, shared with the message tests.
 #[cfg(test)]
 pub(super) mod vectors {
-    /// [MS-NLMP] v20210625, 4.2.4.2.2: the NTLMv2 response, an NT proof
+    /// [MS-NLMP] v20260330, 4.2.4.2.2: the NTLMv2 response, an NT proof
     /// followed by the client blob (4.2.4.1.3).
     pub const NTLMV2_NT_RESPONSE: &str = concat!(
         "68cd0ab851e51c96aabc927bebef6a1c", // NT proof
@@ -164,7 +164,7 @@ pub(super) mod vectors {
         "00000000",                         // trailing reserved bytes
     );
 
-    // [MS-NLMP] v20210625, 4.2.1: User "User", Domain "Domain", Password "Password".
+    // [MS-NLMP] v20260330, 4.2.1: User "User", Domain "Domain", Password "Password".
     pub const SERVER_CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
     pub const CLIENT_NONCE: [u8; 8] = [0xaa; 8];
 
