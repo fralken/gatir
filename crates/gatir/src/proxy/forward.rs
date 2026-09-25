@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Incoming};
 use hyper::client::conn::http1;
-use hyper::header::{HOST, HeaderMap, HeaderValue};
+use hyper::header::{HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
 use hyper::http::Extensions;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
@@ -15,9 +15,11 @@ use tokio::net::TcpStream;
 use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
 use super::headers::{apply_rules, strip_hop_by_hop};
+use super::parent_auth::{Admission, Outcome, ParentAuth, reusable};
 use super::pool::{Lease, PoolKey};
 use super::server::Context;
 use super::upstream::Route;
+use crate::config::HeaderRule;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -59,17 +61,20 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         Route::Parent => target.absolute.clone(),
     };
 
-    // A request that never had a body and does not change anything can safely
-    // be sent again if a pooled connection turns out to be dead.
-    let replay = (body.is_end_stream() && is_idempotent(&parts.method)).then(|| Replay {
+    // A request that never had a body can be built again: to send it after a
+    // failed attempt, or to open the authentication with.
+    let head = body.is_end_stream().then(|| Head {
         method: parts.method.clone(),
         uri: uri.clone(),
         headers: parts.headers.clone(),
         extensions: parts.extensions.clone(),
     });
+    // If a pooled connection turns out to be dead, it may be sent again only
+    // when that cannot change anything twice.
+    let replay = head.as_ref().filter(|_| is_idempotent(&parts.method));
 
     let mut request = Request::new(body.boxed_unsync());
-    *request.method_mut() = parts.method;
+    *request.method_mut() = parts.method.clone();
     *request.uri_mut() = uri;
     *request.headers_mut() = parts.headers;
     *request.version_mut() = Version::HTTP_11;
@@ -78,9 +83,58 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     *request.extensions_mut() = parts.extensions;
 
     let mut lease = acquire(context, route, &target).await?;
+    // Set once a proof has been sent on `lease`, until the parent has said
+    // whether it accepts it.
+    let mut admission: Option<Admission<'_>> = None;
+    // Whether the request was already repeated because a connection had lost
+    // its authentication. Once is enough.
+    let mut lapsed = false;
+
     let response = loop {
+        if lease.needs_auth {
+            let auth = context
+                .auth
+                .as_ref()
+                .expect("a connection needs authentication only when there are credentials");
+            match authenticate(
+                auth,
+                context,
+                &mut lease,
+                &mut request,
+                head.as_ref(),
+                &target,
+                lapsed,
+            )
+            .await?
+            {
+                Authenticated::Answered(response) => break response,
+                Authenticated::Proof(sent) => admission = Some(sent),
+                Authenticated::Ready => {}
+            }
+        }
+
         let mut failed = match lease.sender.try_send_request(request).await {
-            Ok(response) => break response,
+            Ok(response) if demands_authentication(&response, route, context) => {
+                if let Some(sent) = admission.take() {
+                    return Err(sent.refused());
+                }
+                // No proof went out on this connection: it had been
+                // authenticated, and is not any more.
+                let Some(head) = head.as_ref().filter(|_| !lapsed) else {
+                    return Err(Failure::AuthenticationLapsed);
+                };
+                tracing::debug!("a connection lost its authentication, retrying on a new one");
+                lapsed = true;
+                request = head.request();
+                lease = connect(context, route, &target).await?;
+                continue;
+            }
+            Ok(response) => {
+                if let Some(sent) = admission.take() {
+                    sent.accepted();
+                }
+                break response;
+            }
             Err(failed) => failed,
         };
         let returned = failed.take_message();
@@ -92,7 +146,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             return Err(Failure::Upstream(error));
         }
         tracing::debug!(%error, "pooled connection was stale, retrying on a new one");
-        request = match (returned, &replay) {
+        request = match (returned, replay) {
             (Some(returned), _) => returned,
             (None, Some(replay)) => replay.request(),
             (None, None) => return Err(Failure::Upstream(error)),
@@ -100,9 +154,12 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         lease = connect(context, route, &target).await?;
     };
 
-    if route == Route::Parent && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+    if route == Route::Parent
+        && context.auth.is_none()
+        && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    {
         tracing::warn!(
-            "the parent proxy answered 407: it wants authentication, which is not supported yet"
+            "the parent proxy answered 407: it wants authentication, but no credentials are configured"
         );
     }
 
@@ -113,6 +170,79 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         parts,
         lease.attach(&context.pool, body),
     ))
+}
+
+/// Whether the parent is asking for authentication, and has been given the
+/// means to provide it.
+fn demands_authentication(response: &Response<Incoming>, route: Route, context: &Context) -> bool {
+    route == Route::Parent
+        && context.auth.is_some()
+        && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+}
+
+/// What came of authenticating a new connection to a parent.
+enum Authenticated<'a> {
+    /// The parent asked for nothing, and this is its answer to the request.
+    Answered(Response<Incoming>),
+    /// The request now carries a proof. The parent has yet to accept it.
+    Proof(Admission<'a>),
+    /// The parent asked for nothing: the connection is ready as it is.
+    Ready,
+}
+
+/// Runs the first half of the NTLM exchange on a new connection to a parent.
+///
+/// A request without a body opens the exchange itself, so when the parent asks
+/// for nothing its answer is the real one. Otherwise a probe does: a `GET`,
+/// never the method of the request, so that nothing is done twice if the parent
+/// answers it. That also goes for `HEAD`, which some proxies do not accept
+/// there, unless a first attempt has already gone wrong.
+async fn authenticate<'a>(
+    auth: &'a ParentAuth,
+    context: &Context,
+    lease: &mut Lease,
+    request: &mut Request<Body>,
+    head: Option<&Head>,
+    target: &Target,
+    lapsed: bool,
+) -> Result<Authenticated<'a>, Failure> {
+    let admission = auth.admit().await?;
+    let carrier = head
+        .filter(|head| lapsed || head.method != Method::HEAD)
+        .map(Head::request);
+    let is_real = carrier.is_some();
+    let first = carrier.unwrap_or_else(|| probe(target, &context.request_headers));
+
+    lease.needs_auth = false;
+    match auth.negotiate(&mut lease.sender, first).await? {
+        Outcome::Proof(proof) => {
+            request.headers_mut().insert(PROXY_AUTHORIZATION, proof);
+            Ok(Authenticated::Proof(admission))
+        }
+        Outcome::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
+        Outcome::Answered(response) => {
+            // The probe got an answer, which is not for the client. If it
+            // cannot be read to the end, the connection is of no further use.
+            let (_, body) = response.into_parts();
+            if !reusable(body, &mut lease.sender).await {
+                *lease = connect(context, Route::Parent, target).await?;
+                lease.needs_auth = false;
+            }
+            Ok(Authenticated::Ready)
+        }
+    }
+}
+
+/// A request that only serves to open the authentication.
+fn probe(target: &Target, rules: &[HeaderRule]) -> Request<Body> {
+    let mut request = Request::new(full(Bytes::new()));
+    *request.method_mut() = Method::GET;
+    *request.uri_mut() = target.absolute.clone();
+    *request.version_mut() = Version::HTTP_11;
+    let headers = request.headers_mut();
+    headers.insert(HOST, target.host_header.clone());
+    apply_rules(headers, rules);
+    request
 }
 
 /// A pooled connection if there is one for the destination, else a new one.
@@ -126,6 +256,7 @@ async fn acquire(context: &Context, route: Route, target: &Target) -> Result<Lea
             sender,
             key,
             reused: true,
+            needs_auth: false,
         }),
         None => connect(context, route, target).await,
     }
@@ -140,6 +271,10 @@ async fn connect(context: &Context, route: Route, target: &Target) -> Result<Lea
             PoolKey::Origin(target.address.clone()),
         ),
         Route::Parent => {
+            // No point opening a connection that could not be authenticated.
+            if let Some(auth) = &context.auth {
+                auth.check()?;
+            }
             let (index, stream) = context.upstreams.connect_parent(limit).await?;
             (stream, PoolKey::Parent(index))
         }
@@ -148,6 +283,7 @@ async fn connect(context: &Context, route: Route, target: &Target) -> Result<Lea
         sender: handshake(stream).await?,
         key,
         reused: false,
+        needs_auth: route == Route::Parent && context.auth.is_some(),
     })
 }
 
@@ -180,14 +316,14 @@ fn is_stale(error: &hyper::Error) -> bool {
 }
 
 /// What is needed to build the same body-less request again.
-struct Replay {
+struct Head {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     extensions: Extensions,
 }
 
-impl Replay {
+impl Head {
     fn request(&self) -> Request<Body> {
         let mut request = Request::new(full(Bytes::new()));
         *request.method_mut() = self.method.clone();

@@ -106,9 +106,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Hash(args) => hash_password(&args),
         Command::Run => {
             let config = load_config(cli.config.as_deref(), cli.overrides)?;
-            if !config.parents.is_empty() && config.credentials.is_some() {
+            if config.parents.is_empty() && config.credentials.is_some() {
                 tracing::warn!(
-                    "credentials are configured, but authenticating to the parent proxy is not implemented yet"
+                    "credentials are configured, but there is no parent proxy to authenticate to"
                 );
             }
             tokio::runtime::Builder::new_multi_thread()

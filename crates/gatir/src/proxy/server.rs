@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::body::error_response;
+use super::parent_auth::ParentAuth;
 use super::pool::Pool;
 use super::upstream::Upstreams;
 use super::{forward, tunnel};
@@ -36,6 +37,9 @@ pub(super) struct Context {
     pub access: Acl,
     pub timeouts: Timeouts,
     pub upstreams: Upstreams,
+    /// How connections to a parent proxy authenticate; `None` if no
+    /// credentials are configured.
+    pub auth: Option<ParentAuth>,
     /// Fields set on every request sent upstream.
     pub request_headers: Vec<HeaderRule>,
     /// Idle connections to origin servers and parents, shared by all clients.
@@ -55,12 +59,21 @@ pub struct Server {
     access: Acl,
     timeouts: Timeouts,
     upstreams: Upstreams,
+    auth: Option<ParentAuth>,
     request_headers: Vec<HeaderRule>,
 }
 
 impl Server {
     /// Binds every `listen` address of the configuration.
     pub async fn bind(config: &Config) -> io::Result<Self> {
+        // Credentials only matter when there is a parent proxy to give them to.
+        let auth = match &config.credentials {
+            Some(credentials) if !config.parents.is_empty() => Some(
+                ParentAuth::new(credentials)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?,
+            ),
+            _ => None,
+        };
         let mut listeners = Vec::with_capacity(config.listen.len());
         for addr in &config.listen {
             let listener = TcpListener::bind(addr).await.map_err(|err| {
@@ -73,6 +86,7 @@ impl Server {
             access: config.access.clone(),
             timeouts: config.timeouts.clone(),
             upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone()),
+            auth,
             request_headers: config.request_headers.clone(),
         })
     }
@@ -97,6 +111,7 @@ impl Server {
             access: self.access,
             timeouts: self.timeouts,
             upstreams: self.upstreams,
+            auth: self.auth,
             request_headers: self.request_headers,
             pool: Arc::new(Pool::default()),
             tracker: TaskTracker::new(),

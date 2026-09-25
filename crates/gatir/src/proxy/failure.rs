@@ -4,11 +4,14 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
+use hyper::header::{HeaderValue, RETRY_AFTER};
 use hyper::{Response, StatusCode};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::body::{Body, error_response};
+use super::parent_auth::COOLDOWN;
+use crate::auth::AuthError;
 
 /// Why opening a TCP connection failed.
 pub(super) enum ConnectError {
@@ -34,9 +37,31 @@ pub(super) struct ParentAttempt {
 pub(super) enum Failure {
     BadRequest(&'static str),
     ConnectTimeout(String),
-    Connect { address: String, source: io::Error },
+    Connect {
+        address: String,
+        source: io::Error,
+    },
     ParentsUnavailable(Vec<ParentAttempt>),
     Upstream(hyper::Error),
+    /// The parent proxy did something unexpected; the text says what.
+    Parent(&'static str),
+    /// The NTLM exchange with the parent could not be carried out.
+    Authentication(AuthError),
+    /// The parent answered the credentials with another `407`.
+    CredentialsRejected {
+        user: String,
+    },
+    /// The parent refused the credentials recently, so nobody is trying yet.
+    CoolingDown(Duration),
+    /// A connection the parent had authenticated asked for authentication
+    /// again, and the request cannot be sent twice.
+    AuthenticationLapsed,
+}
+
+impl From<AuthError> for Failure {
+    fn from(error: AuthError) -> Self {
+        Self::Authentication(error)
+    }
 }
 
 impl Failure {
@@ -76,6 +101,43 @@ impl Failure {
             Self::Upstream(err) => error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("Invalid response from the upstream server: {err}"),
+                false,
+            ),
+            Self::Parent(message) => error_response(StatusCode::BAD_GATEWAY, message, false),
+            Self::Authentication(err) => error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Cannot authenticate to the parent proxy: {err}"),
+                false,
+            ),
+            Self::CredentialsRejected { user } => error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "The parent proxy rejected the credentials of {user}. Check the user name, \
+                     domain and password. gatir will not try again for {} minutes, so that the \
+                     account does not get locked.",
+                    COOLDOWN.as_secs() / 60
+                ),
+                false,
+            ),
+            Self::CoolingDown(remaining) => {
+                let seconds = remaining.as_secs() + 1;
+                let mut response = error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "The parent proxy rejected the credentials recently. Not trying again for \
+                         {seconds} seconds, so that the account does not get locked."
+                    ),
+                    false,
+                );
+                response
+                    .headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from(seconds));
+                response
+            }
+            Self::AuthenticationLapsed => error_response(
+                StatusCode::BAD_GATEWAY,
+                "The parent proxy asked for authentication again on a connection it had \
+                 authenticated, and this request cannot be sent twice. Try again.",
                 false,
             ),
         }

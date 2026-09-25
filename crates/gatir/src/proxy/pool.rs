@@ -103,6 +103,10 @@ pub(super) struct Lease {
     pub key: PoolKey,
     /// True if it came from the pool, so it may have gone stale unnoticed.
     pub reused: bool,
+    /// True for a new connection to a parent that wants authentication: the
+    /// exchange must run on it before it carries the request. Pooled
+    /// connections have been through it already.
+    pub needs_auth: bool,
 }
 
 impl Lease {
