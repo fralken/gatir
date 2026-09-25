@@ -60,6 +60,16 @@ pub async fn start_proxy(extra: &str) -> TestProxy {
     }
 }
 
+/// Configuration for a proxy whose only parent wants NTLM: the parent, and the
+/// credentials of the account `alice` in the domain `CORP`.
+pub fn ntlm_parent_config(parent: SocketAddr, method: &str, password: &str) -> String {
+    format!(
+        "parents = [\"{parent}\"]\n\
+         [credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"{password}\"\n\
+         method = \"{method}\"\n"
+    )
+}
+
 /// A proxy-style GET request (absolute-form target).
 pub fn get(authority: &str, path: &str, extra_headers: &str) -> String {
     format!("GET http://{authority}{path} HTTP/1.1\r\nHost: {authority}\r\n{extra_headers}\r\n")

@@ -8,10 +8,10 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
-use hyper::header::{HOST, HeaderValue};
+use hyper::header::{HOST, HeaderValue, PROXY_AUTHORIZATION};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
@@ -22,9 +22,9 @@ use tokio_util::sync::CancellationToken;
 use super::body::{Body, full};
 use super::failure::{Failure, connect_tcp};
 use super::headers::{apply_rules, strip_hop_by_hop};
+use super::parent_auth::Outcome;
 use super::server::Context;
 use super::upstream::Route;
-use crate::config::HeaderRule;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -70,10 +70,12 @@ async fn open(
             spawn_tunnel(context, client_upgrade, upstream);
         }
         Route::Parent => {
+            // No point opening a connection that could not be authenticated.
+            if let Some(auth) = &context.auth {
+                auth.check()?;
+            }
             let (_, stream) = context.upstreams.connect_parent(limit).await?;
-            match connect_through_parent(stream, &address, &mut request, &context.request_headers)
-                .await?
-            {
+            match connect_through_parent(stream, &address, &mut request, context).await? {
                 ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
                 ParentAnswer::Refused(response) => return Ok(response),
             }
@@ -108,33 +110,44 @@ enum ParentAnswer {
 /// Asks a parent proxy, over `stream`, to open a tunnel to `address`. The
 /// client's own header fields (User-Agent and the like) go along, minus the
 /// hop-by-hop ones and its proxy credentials.
+///
+/// If the parent wants NTLM, the CONNECT request itself opens the exchange and
+/// is sent again with the proof. The connection then becomes the tunnel, so it
+/// is never reused.
 async fn connect_through_parent(
     stream: TcpStream,
     address: &str,
     client_request: &mut Request<Incoming>,
-    rules: &[HeaderRule],
+    context: &Context,
 ) -> Result<ParentAnswer, Failure> {
     let mut headers = std::mem::take(client_request.headers_mut());
     strip_hop_by_hop(&mut headers);
-    apply_rules(&mut headers, rules);
+    apply_rules(&mut headers, &context.request_headers);
     headers.insert(
         HOST,
         HeaderValue::from_str(address)
             .map_err(|_| Failure::BadRequest("the CONNECT target is invalid"))?,
     );
-
-    let mut connect = Request::new(Empty::<Bytes>::new());
-    *connect.method_mut() = Method::CONNECT;
-    *connect.uri_mut() = address
+    let uri = address
         .parse::<Uri>()
         .map_err(|_| Failure::BadRequest("the CONNECT target is invalid"))?;
-    *connect.headers_mut() = headers;
     // Carries the original capitalization of the header names.
-    *connect.extensions_mut() = std::mem::take(client_request.extensions_mut());
+    let extensions = std::mem::take(client_request.extensions_mut());
+    let connect = |proof: Option<HeaderValue>| {
+        let mut request = Request::new(full(Bytes::new()));
+        *request.method_mut() = Method::CONNECT;
+        *request.uri_mut() = uri.clone();
+        *request.headers_mut() = headers.clone();
+        *request.extensions_mut() = extensions.clone();
+        if let Some(proof) = proof {
+            request.headers_mut().insert(PROXY_AUTHORIZATION, proof);
+        }
+        request
+    };
 
     let (mut sender, connection) = http1::Builder::new()
         .preserve_header_case(true)
-        .handshake(TokioIo::new(stream))
+        .handshake::<_, Body>(TokioIo::new(stream))
         .await
         .map_err(Failure::Upstream)?;
     tokio::spawn(async move {
@@ -143,10 +156,42 @@ async fn connect_through_parent(
         }
     });
 
-    let response = sender
-        .send_request(connect)
-        .await
-        .map_err(Failure::Upstream)?;
+    // Set once a proof has been sent, until the parent has said whether it
+    // accepts it.
+    let mut admission = None;
+    let response = match &context.auth {
+        None => sender
+            .send_request(connect(None))
+            .await
+            .map_err(Failure::Upstream)?,
+        Some(auth) => {
+            let admitted = auth.admit().await?;
+            match auth.negotiate(&mut sender, connect(None)).await? {
+                // The parent asked for nothing: this is its answer.
+                Outcome::Answered(response) => response,
+                Outcome::Proof(proof) => {
+                    admission = Some(admitted);
+                    sender
+                        .send_request(connect(Some(proof)))
+                        .await
+                        .map_err(Failure::Upstream)?
+                }
+            }
+        }
+    };
+
+    if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        if let Some(sent) = admission {
+            return Err(sent.refused());
+        }
+        tracing::warn!(
+            "the parent proxy answered 407: it wants authentication, but no credentials are configured"
+        );
+    } else if let Some(sent) = admission {
+        // Whatever the parent thinks of the tunnel, it took the credentials.
+        sent.accepted();
+    }
+
     if response.status().is_success() {
         let upgraded = hyper::upgrade::on(response)
             .await
@@ -154,11 +199,6 @@ async fn connect_through_parent(
         return Ok(ParentAnswer::Tunnel(TokioIo::new(upgraded)));
     }
 
-    if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-        tracing::warn!(
-            "the parent proxy answered 407: it wants authentication, which is not supported yet"
-        );
-    }
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop(&mut parts.headers);
     parts.version = Version::HTTP_11;

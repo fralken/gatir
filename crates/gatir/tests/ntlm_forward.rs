@@ -24,16 +24,12 @@ async fn parent_with(options: Options) -> MockNtlmParent {
     .await
 }
 
-fn config_for(parent_addr: std::net::SocketAddr, method: &str, password: &str) -> String {
-    format!(
-        "parents = [\"{parent_addr}\"]\n\
-         [credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"{password}\"\n\
-         method = \"{method}\"\n"
-    )
+fn config_for(parent: std::net::SocketAddr, method: &str, password: &str) -> String {
+    ntlm_parent_config(parent, method, password)
 }
 
 fn config(parent: &MockNtlmParent, password: &str) -> String {
-    config_for(parent.addr(), "ntlmv2", password)
+    ntlm_parent_config(parent.addr(), "ntlmv2", password)
 }
 
 /// Sends `request` on a new connection to the proxy and reads the answer.
