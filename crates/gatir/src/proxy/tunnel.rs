@@ -269,7 +269,7 @@ async fn connect_through_parent(
             match auth.begin(parent_host, limit).await? {
                 // No challenge to wait for: the request carries the proof.
                 Begun::Ready(proof) => {
-                    admission = Some(admitted.made_for(proof.service));
+                    admission = Some(admitted.made_from(Some(proof.made)));
                     answer_within(limit, sender.send_request(connect(Some(proof.header))))
                         .await
                         .ok_or(timed_out)?
@@ -277,16 +277,13 @@ async fn connect_through_parent(
                 }
                 Begun::Challenge(pending) => {
                     match auth
-                        .negotiate(&mut sender, connect(None), pending, limit)
+                        .negotiate(&mut sender, || connect(None), pending, limit)
                         .await?
                     {
                         // The parent asked for nothing: this is its answer.
                         Outcome::Answered(response) => response,
-                        Outcome::Proof { header, service } => {
-                            admission = Some(match service {
-                                Some(service) => admitted.made_for(service),
-                                None => admitted,
-                            });
+                        Outcome::Proof { header, made } => {
+                            admission = Some(admitted.made_from(made));
                             answer_within(limit, sender.send_request(connect(Some(header))))
                                 .await
                                 .ok_or(timed_out)?

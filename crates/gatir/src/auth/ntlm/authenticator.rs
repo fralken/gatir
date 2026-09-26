@@ -112,10 +112,7 @@ impl Authenticator {
         fields: impl IntoIterator<Item = &'a HeaderValue>,
         entropy: &Entropy,
     ) -> Result<HeaderValue, AuthError> {
-        let token = find_challenge(fields)?;
-        let bytes = STANDARD_PAD_INDIFFERENT
-            .decode(token)
-            .map_err(|err| AuthError::BadChallenge(err.to_string()))?;
+        let bytes = challenge(fields)?;
         let challenge =
             Challenge::parse(&bytes).map_err(|err| AuthError::BadChallenge(err.to_string()))?;
         let key = match &self.secret {
@@ -135,11 +132,20 @@ fn default_workstation() -> String {
 }
 
 /// `NTLM <base64>`, marked sensitive so it never shows up in debug output.
-fn header(message: &[u8]) -> HeaderValue {
+pub fn header(message: &[u8]) -> HeaderValue {
     let mut value = HeaderValue::from_str(&format!("{SCHEME} {}", STANDARD.encode(message)))
         .expect("base64 text is a valid header value");
     value.set_sensitive(true);
     value
+}
+
+/// The NTLM challenge message that the `Proxy-Authenticate` fields carry.
+pub fn challenge<'a>(
+    fields: impl IntoIterator<Item = &'a HeaderValue>,
+) -> Result<Vec<u8>, AuthError> {
+    STANDARD_PAD_INDIFFERENT
+        .decode(find_challenge(fields)?)
+        .map_err(|err| AuthError::BadChallenge(err.to_string()))
 }
 
 /// The token of the NTLM challenge among the `Proxy-Authenticate` fields.

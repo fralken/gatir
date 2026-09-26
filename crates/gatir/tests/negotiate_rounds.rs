@@ -311,3 +311,37 @@ async fn a_system_that_cannot_answer_the_parents_token_is_reported() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn a_refused_second_token_is_not_tried_again_for_a_while() {
+    // The second round is NTLM, made from the password of the logged-on user,
+    // and a parent that refuses it has counted a failed logon.
+    let parent = parent_with(Options {
+        negotiate_exchange: Some(NegotiateExchange {
+            first: FIRST.to_vec(),
+            challenge: CHALLENGE.to_vec(),
+            second: b"what the parent would accept".to_vec(),
+        }),
+        ..exchange()
+    })
+    .await;
+    let proxy = proxy_with(&parent, TwoRounds::default()).await;
+
+    let response = ask(&proxy, get("origin.example.com", "/", ""), false).await;
+    assert_eq!(response.status, 502);
+    let text = response.body_text();
+    assert!(
+        text.contains("did not accept the credentials of the logged-on user for HTTP@127.0.0.1"),
+        "{text}"
+    );
+    let tried = parent.requests().len();
+    assert_eq!(tried, 2);
+
+    let response = ask(&proxy, get("origin.example.com", "/", ""), false).await;
+    assert_eq!(response.status, 503);
+    assert_eq!(
+        parent.requests().len(),
+        tried,
+        "nothing more goes to the parent"
+    );
+}

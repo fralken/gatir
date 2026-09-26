@@ -63,6 +63,11 @@ pub(super) enum Failure {
     TicketRejected {
         service: String,
     },
+    /// The parent answered the NTLM proof that the system made from the
+    /// password of the logged-on user with another `407`.
+    SessionRejected {
+        service: String,
+    },
     /// The PAC script could not say where to send the request.
     Pac(PacError),
     /// The PAC script chose only ways of reaching the destination that gatir
@@ -136,6 +141,13 @@ impl Failure {
                 "The parent proxy did not accept the Kerberos ticket for {service}. Check that \
                  the ticket is valid (klist), that the clock is right, and that this is the \
                  name the proxy is registered under (credentials.spn)."
+            )),
+            Self::SessionRejected { service } => bad_gateway(format!(
+                "The parent proxy did not accept the credentials of the logged-on user for \
+                 {service} (NTLM). If the password was changed recently, sign out and in \
+                 again. gatir will not try again for {} minutes, so that the account does not \
+                 get locked.",
+                COOLDOWN.as_secs() / 60
             )),
             Self::CoolingDown(remaining) => (
                 StatusCode::SERVICE_UNAVAILABLE,

@@ -1,7 +1,9 @@
 //! Negotiate through SSPI, the security interface of Windows: Kerberos with the
 //! identity of the logged-on user when Windows can use it, and NTLM inside
-//! Negotiate when it cannot (away from the domain, for instance). No password
-//! is asked for or kept: Windows holds the credentials of the session.
+//! Negotiate when it cannot (away from the domain, for instance). NTLM by
+//! itself, without SPNEGO around it, is there for a parent that offers NTLM and
+//! not Negotiate. No password is asked for or kept: Windows holds the
+//! credentials of the session.
 //!
 //! This is a C interface, so this module is the one place where `unsafe` is
 //! allowed. Every call says why it is sound, and every handle and buffer that
@@ -43,7 +45,12 @@ impl TokenSource for Sspi {
     }
 
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
-        Ok(Box::new(Context::new(service)?))
+        Ok(Box::new(Context::new(service, "Negotiate")?))
+    }
+
+    /// NTLM without SPNEGO around it, with the credentials of the logged-on user.
+    fn start_ntlm(&self, service: &str) -> Result<Option<Box<dyn SecurityContext>>, AuthError> {
+        Ok(Some(Box::new(Context::new(service, "NTLM")?)))
     }
 }
 
@@ -78,8 +85,10 @@ const EMPTY: SecHandle = SecHandle {
 };
 
 impl Context {
-    fn new(service: &str) -> Result<Self, AuthError> {
-        let package = wide("Negotiate");
+    /// A context of the security package named `package`, which is `Negotiate`
+    /// or `NTLM`.
+    fn new(service: &str, package: &str) -> Result<Self, AuthError> {
+        let package = wide(package);
         let mut credentials = EMPTY;
         let mut expiry = 0i64;
         // SAFETY: `package` is a null-terminated string that lives through the

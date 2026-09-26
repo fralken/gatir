@@ -84,6 +84,9 @@ pub struct Options {
     pub stall_on_negotiate: bool,
     /// Send `Connection: close` with the `407` that carries the challenge.
     pub close_after_challenge: bool,
+    /// Send `Connection: close` with every other `407`, and close the
+    /// connection after it.
+    pub close_after_refusal: bool,
     /// Forget a connection's authentication once it has served this many
     /// requests, so the next one is answered with a `407`.
     pub forget_after: Option<usize>,
@@ -120,6 +123,7 @@ impl Default for Options {
             close_on_negotiate: false,
             stall_on_negotiate: false,
             close_after_challenge: false,
+            close_after_refusal: false,
             forget_after: None,
             timestamp: None,
             negotiate_token: None,
@@ -282,7 +286,7 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
                 None
             } else {
                 state = State::Anonymous;
-                Some((shared.refusal(), false))
+                Some(shared.refusal())
             }
         } else if let Some(proof) = &negotiate {
             if shared.options.negotiate_token.as_ref() == Some(proof) {
@@ -290,13 +294,13 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
                 None
             } else {
                 state = State::Anonymous;
-                Some((shared.refusal(), false))
+                Some(shared.refusal())
             }
         } else if !shared.options.ntlm {
             if state == State::Authenticated {
                 None
             } else {
-                Some((shared.refusal(), false))
+                Some(shared.refusal())
             }
         } else {
             match (message, &token) {
@@ -323,11 +327,11 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
                     }
                     _ => {
                         state = State::Anonymous;
-                        Some((shared.refusal(), false))
+                        Some(shared.refusal())
                     }
                 },
                 _ if state == State::Authenticated => None,
-                _ => Some((shared.refusal(), false)),
+                _ => Some(shared.refusal()),
             }
         };
 
@@ -425,8 +429,10 @@ fn utf16(text: &str) -> Vec<u8> {
 }
 
 impl Shared {
-    fn refusal(&self) -> Vec<u8> {
-        reply_407(&self.options.offers, false)
+    /// A `407` that is not a challenge, and whether to close after it.
+    fn refusal(&self) -> (Vec<u8>, bool) {
+        let close = self.options.close_after_refusal;
+        (reply_407(&self.options.offers, close), close)
     }
 
     fn challenge_reply(&self, challenge: [u8; 8]) -> Vec<u8> {

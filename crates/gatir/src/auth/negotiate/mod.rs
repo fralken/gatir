@@ -67,6 +67,15 @@ pub trait TokenSource: Send + Sync + fmt::Debug {
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         Ok(Box::new(OneRound(Some(self.token(service)?))))
     }
+
+    /// Starts an exchange with `service` in NTLM alone, with the identity of
+    /// the logged-on user: for a parent that offers NTLM and not Negotiate.
+    /// The tokens are NTLM messages, which go with the `NTLM` scheme. `None` if
+    /// the system cannot do that without a password: Windows can, the GSS-API
+    /// of Unix cannot.
+    fn start_ntlm(&self, _service: &str) -> Result<Option<Box<dyn SecurityContext>>, AuthError> {
+        Ok(None)
+    }
 }
 
 /// The exchange of a source that has one token and no more.

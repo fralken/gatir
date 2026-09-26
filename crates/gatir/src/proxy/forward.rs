@@ -264,27 +264,25 @@ async fn authenticate<'a>(
                 .headers_mut()
                 .insert(PROXY_AUTHORIZATION, proof.header);
             lease.needs_auth = false;
-            return Ok(Authenticated::Proof(admission.made_for(proof.service)));
+            return Ok(Authenticated::Proof(admission.made_from(Some(proof.made))));
         }
         Begun::Challenge(pending) => pending,
     };
-    let carrier = head
-        .filter(|head| lapsed || head.method != Method::HEAD)
-        .map(Head::request);
-    let is_real = carrier.is_some();
-    let first = carrier.unwrap_or_else(|| probe(target, &context.request_headers));
+    let real = head.filter(|head| lapsed || head.method != Method::HEAD);
+    let is_real = real.is_some();
+    let carrier = || match real {
+        Some(head) => head.request(),
+        None => probe(target, &context.request_headers),
+    };
 
     lease.needs_auth = false;
     match auth
-        .negotiate(&mut lease.sender, first, pending, limit)
+        .negotiate(&mut lease.sender, carrier, pending, limit)
         .await?
     {
-        Outcome::Proof { header, service } => {
+        Outcome::Proof { header, made } => {
             request.headers_mut().insert(PROXY_AUTHORIZATION, header);
-            Ok(Authenticated::Proof(match service {
-                Some(service) => admission.made_for(service),
-                None => admission,
-            }))
+            Ok(Authenticated::Proof(admission.made_from(made)))
         }
         Outcome::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
         Outcome::Answered(response) => {

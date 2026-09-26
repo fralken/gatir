@@ -7,7 +7,7 @@ mod hash;
 mod message;
 mod response;
 
-pub use authenticator::Authenticator;
+pub use authenticator::{Authenticator, challenge, header};
 pub use hash::{HASH_LEN, NtHash, Ntlmv2Hash};
 pub use message::{
     Challenge, Dialect, Entropy, Identity, Key, MessageError, authenticate, filetime, flags,

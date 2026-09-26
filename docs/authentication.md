@@ -26,6 +26,22 @@ the domain, or for a name that no service is registered under). The exchange
 takes a second round when the system falls back to NTLM: the parent answers the
 first token with a `407` and a token of its own, and gatir answers that.
 
+What the system answers an NTLM challenge with is made from the password of the
+logged-on user, so it is guarded like a configured password: one attempt at a
+time until it has worked once, and five minutes away from a parent that refuses
+it. A password changed on another computer is the usual cause of a refusal, and
+signing out and in again gives the session the new one.
+
+A parent that offers NTLM and not Negotiate answers the first token with a `407`
+that names only NTLM. Where the system can do NTLM by itself (Windows can, with
+the NTLM package of SSPI), gatir starts that exchange on the same connection,
+with the identity of the logged-on user: no password is configured, and the
+messages go with the `NTLM` scheme instead of `Negotiate`. It costs one more
+round trip on each new connection to that parent, as the Negotiate token is
+tried first. Linux and macOS have no NTLM without a password, so there the error
+says what the parent offers, and `method = "ntlmv2"` with a password or a hash is
+the way.
+
 The service is `HTTP@` and the host name of the parent, or what
 `credentials.spn` says: `HTTP/proxy.example.com`, or with a realm,
 `HTTP/proxy.example.com@EXAMPLE.COM`. Name the parent by the name its service is
@@ -39,7 +55,9 @@ registered under; an address, or another alias, may have none.
   corporate proxy that offers Negotiate and NTLM: Windows made a Kerberos token,
   the proxy accepted it, and `GET`, `HEAD`, `POST` and `CONNECT` worked. So did the fall
   back to NTLM inside Negotiate, forced by naming the proxy by its address, for which no
-  Kerberos service is registered.
+  Kerberos service is registered. The NTLM of SSPI for a parent that offers only NTLM
+  is written and tested against a mock parent, and has not yet been tried against a
+  real one.
 
 ## Finding out why it does not work
 
