@@ -1,4 +1,5 @@
 /target
+/dist
 
 # Never commit real credentials, hashes or internal PAC files.
 # Example configs must use the .example.toml suffix and synthetic values.

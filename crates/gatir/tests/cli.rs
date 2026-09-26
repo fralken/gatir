@@ -451,3 +451,63 @@ fn a_configuration_file_that_others_can_read_or_change_is_reported() {
         "{writable}"
     );
 }
+
+// ---- the example configuration ----
+
+const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../gatir.example.toml");
+
+#[test]
+fn the_example_configuration_is_valid_as_it_stands() {
+    gatir()
+        .args(["config", "check", "--config", EXAMPLE])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("proxy.example.com:8080")
+                .and(predicate::str::contains("change-me").not()),
+        );
+}
+
+#[test]
+fn every_alternative_in_the_example_is_valid_when_turned_on() {
+    // A line that looks like a setting or a table header, behind "# ", is an
+    // alternative; prose never looks like either.
+    let is_setting = |text: &str| {
+        let text = text.trim();
+        let table = text.starts_with('[') && text.ends_with(']');
+        let assignment = text.split_once(" = ").is_some_and(|(key, _)| {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        table || assignment
+    };
+    let turned_on: Vec<String> = std::fs::read_to_string(EXAMPLE)
+        .unwrap()
+        .lines()
+        .map(|line| match line.strip_prefix("# ") {
+            Some(rest) if is_setting(rest) => rest.to_owned(),
+            _ => line.to_owned(),
+        })
+        // What excludes another setting: the parents and the PAC script are two
+        // ways of finding the proxy, a file and an address two places for the
+        // script, a password and a hash two forms of the secret.
+        .filter(|line| {
+            !["parents = ", "url = ", "nt_hash = "]
+                .iter()
+                .any(|excluded| line.starts_with(excluded))
+        })
+        .collect();
+    let file = config_file(&turned_on.join("\n"));
+    gatir()
+        .args(["config", "check", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("chosen by the PAC script")
+                .and(predicate::str::contains(
+                    "127.0.0.1:2222 -> git.example.com:22",
+                ))
+                .and(predicate::str::contains("socks5:      127.0.0.1:1080"))
+                .and(predicate::str::contains("default deny")),
+        );
+}

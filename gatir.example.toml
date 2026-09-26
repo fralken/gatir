@@ -1,0 +1,64 @@
+# An example configuration for gatir. Copy it to ~/.config/gatir/gatir.toml (or
+# name the copy with --config) and edit it. Every name and value here is made up.
+#
+# Lines that start with "# " and hold a setting are alternatives and extras:
+# remove the "# " to turn one on. See the files in docs/ for each part.
+
+# Where gatir listens for programs that use an HTTP proxy. Keep it on the
+# loopback: whoever connects is served with your identity.
+listen = ["127.0.0.1:3128"]
+
+# The corporate proxy, or several, tried in order. A PAC script (below) is the
+# other way of finding the proxy: use one of the two.
+parents = ["proxy.example.com:8080"]
+
+# Destinations reached directly instead of through the parent: names (with *
+# and ?), addresses and ranges.
+no_proxy = ["localhost", "127.0.0.1", "*.internal.example.com", "10.0.0.0/8"]
+
+[credentials]
+# ntlmv2 (the default), ntlm2sr, nt, or negotiate: Kerberos with the ticket of
+# the logged-in user, which needs no password here.
+method = "ntlmv2"
+username = "alice"
+domain = "EXAMPLE"
+# Give the password, or a hash of it that `gatir hash` prints, so that the
+# password itself is not kept in the file. Keep the file readable by you only.
+password = "change-me"
+# nt_hash = "0123456789abcdef0123456789abcdef"
+
+# [pac]
+# file = "proxy.pac"
+# url = "https://pac.example.com/proxy.pac"
+# refresh_secs = 3600
+
+# Who may use gatir, by their address. The first rule that matches decides.
+# [access]
+# default = "deny"
+# rules = [{ allow = "127.0.0.1" }, { allow = "192.168.0.0/16" }]
+
+# Header fields set on every request sent to the parent. The values are secrets.
+# [headers]
+# X-Example = "value"
+
+# A local port carried to a fixed destination, as ssh -L does.
+# [[tunnels]]
+# listen = "127.0.0.1:2222"
+# target = "git.example.com:22"
+
+# A SOCKS5 server, with a user name and password if you set both.
+# [socks5]
+# listen = ["127.0.0.1:1080"]
+# username = "bob"
+# password = "change-me-too"
+
+# How long to wait, in seconds.
+# [timeouts]
+# connect_secs = 10
+# client_idle_secs = 60
+# response_secs = 120
+# tunnel_idle_secs = 600
+# shutdown_grace_secs = 10
+
+# [log]
+# level = "info"

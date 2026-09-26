@@ -14,3 +14,10 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# What is shipped: small and fast, with a panic still ending only the task it
+# happens in (so no `panic = "abort"`).
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
