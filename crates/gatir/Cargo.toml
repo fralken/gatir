@@ -41,12 +41,14 @@ hyper-util = { version = "0.1.20", features = ["tokio", "server-graceful"] }
 ipnet = "2.12.2"
 md-5 = "0.11.0"
 md4 = "0.11.0"
+native-tls = "0.2.18"
 rpassword = "7.5.4"
 rquickjs = "0.14"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
+tokio-native-tls = "0.3.1"
 tokio-util = { version = "0.7.19", features = ["rt"] }
 toml = "1.1.6"
 tracing = "0.1.44"

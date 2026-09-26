@@ -16,4 +16,8 @@ des = "0.9.0"
 hmac = "0.13.0"
 md-5 = "0.11.0"
 md4 = "0.11.0"
+rcgen = "0.14.10"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+time = "0.3.55"
 tokio = { version = "1.53.1", features = ["rt", "macros", "net", "time", "io-util", "sync"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }

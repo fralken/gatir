@@ -20,6 +20,7 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio_native_tls::{TlsConnector, native_tls};
 
 use super::MAX_SCRIPT_BYTES;
 
@@ -49,12 +50,56 @@ pub enum FetchError {
     Unexpected(StatusCode),
     #[error("invalid answer from the server: {0}")]
     Protocol(String),
-    #[error("https addresses are not supported by this build yet")]
-    HttpsUnavailable,
+    #[error("refusing a redirect from https to http: \"{0}\"")]
+    Downgrade(String),
+    #[error(
+        "TLS with {host} failed: {reason} (its certificate must be valid for that name and \
+         issued by an authority this system trusts)"
+    )]
+    Tls { host: String, reason: String },
 }
 
 fn protocol(error: hyper::Error) -> FetchError {
     FetchError::Protocol(error.to_string())
+}
+
+/// Which certificate authorities are trusted for an `https://` address: the
+/// ones the operating system trusts, so that a corporate authority installed
+/// there works without further configuration.
+#[derive(Debug, Clone, Default)]
+pub struct Trust {
+    extra_root: Option<Vec<u8>>,
+}
+
+impl Trust {
+    pub fn system() -> Self {
+        Self::default()
+    }
+
+    /// The system's authorities and one more, given as PEM. For tests, which
+    /// run an authority of their own.
+    pub fn system_and(root_pem: &[u8]) -> Self {
+        Self {
+            extra_root: Some(root_pem.to_vec()),
+        }
+    }
+
+    fn connector(&self, host: &str) -> Result<TlsConnector, FetchError> {
+        let failed = |reason: String| FetchError::Tls {
+            host: host.to_owned(),
+            reason,
+        };
+        let mut builder = native_tls::TlsConnector::builder();
+        if let Some(pem) = &self.extra_root {
+            let root =
+                native_tls::Certificate::from_pem(pem).map_err(|err| failed(err.to_string()))?;
+            builder.add_root_certificate(root);
+        }
+        builder
+            .build()
+            .map(TlsConnector::from)
+            .map_err(|err| failed(err.to_string()))
+    }
 }
 
 /// What the server said identifies the version of the script it sent.
@@ -100,17 +145,18 @@ pub async fn fetch(
     address: &str,
     limit: Duration,
     known: &Validators,
+    trust: &Trust,
 ) -> Result<Fetched, FetchError> {
     let follow = async {
         let mut uri = check(address.parse().map_err(|_| bad_redirect(address))?, address)?;
         for _ in 0..=MAX_REDIRECTS {
-            match get(&uri, known).await? {
+            match get(&uri, known, trust).await? {
                 Step::Done(fetched) => return Ok(fetched),
                 Step::Redirect(location) => {
                     let next = resolve(&uri, &location)?;
                     // Nothing that was fetched securely may be sent on in the clear.
                     if uri.scheme_str() == Some("https") && next.scheme_str() != Some("https") {
-                        return Err(bad_redirect(&location));
+                        return Err(FetchError::Downgrade(bad_redirect_text(&location)));
                     }
                     uri = next;
                 }
@@ -124,9 +170,16 @@ pub async fn fetch(
 }
 
 fn bad_redirect(location: &str) -> FetchError {
-    // A query may hold a token, and the log is not a place for it.
-    let shown = location.split(['?', '#']).next().unwrap_or_default();
-    FetchError::BadRedirect(shown.to_owned())
+    FetchError::BadRedirect(bad_redirect_text(location))
+}
+
+/// A query may hold a token, and the log is not a place for it.
+fn bad_redirect_text(location: &str) -> String {
+    location
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// An address gatir may connect to: http or https, a host, no credentials.
@@ -142,11 +195,8 @@ fn check(uri: Uri, original: &str) -> Result<Uri, FetchError> {
     }
 }
 
-async fn get(uri: &Uri, known: &Validators) -> Result<Step, FetchError> {
+async fn get(uri: &Uri, known: &Validators, trust: &Trust) -> Result<Step, FetchError> {
     let https = uri.scheme_str() == Some("https");
-    if https {
-        return Err(FetchError::HttpsUnavailable);
-    }
     let host = uri.host().unwrap_or_default().trim_matches(['[', ']']);
     let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
     let address = format!("{host}:{port}");
@@ -156,7 +206,21 @@ async fn get(uri: &Uri, known: &Validators) -> Result<Step, FetchError> {
     if let Err(err) = stream.set_nodelay(true) {
         tracing::debug!(%err, "cannot set TCP_NODELAY on the PAC connection");
     }
-    exchange(stream, request(uri, known)).await
+    if https {
+        // The name is what the certificate is checked against, and what the
+        // server is told it is talking to (for an address, no name is sent).
+        let secured = trust
+            .connector(host)?
+            .connect(host, stream)
+            .await
+            .map_err(|err| FetchError::Tls {
+                host: host.to_owned(),
+                reason: err.to_string(),
+            })?;
+        exchange(secured, request(uri, known)).await
+    } else {
+        exchange(stream, request(uri, known)).await
+    }
 }
 
 fn request(uri: &Uri, known: &Validators) -> Request<Empty<Bytes>> {

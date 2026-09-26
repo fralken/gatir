@@ -22,9 +22,9 @@ jobs:
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Install what the Kerberos bindings need to build
+      - name: Install what the Kerberos and TLS bindings need to build
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev clang
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev clang libssl-dev pkg-config
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy

@@ -47,21 +47,32 @@ impl Drop for TestProxy {
 /// Starts a proxy on a free loopback port. `extra` is appended to the
 /// configuration and may contain further top-level keys and tables.
 pub async fn start_proxy(extra: &str) -> TestProxy {
-    run(bind(extra, None).await)
+    run(bind(extra, None, None).await)
+}
+
+/// Like [`start_proxy`], with `trust` for the certificates of `https://` PAC
+/// addresses.
+pub async fn start_proxy_trusting(extra: &str, trust: gatir::pac::Trust) -> TestProxy {
+    run(bind(extra, None, Some(trust)).await)
 }
 
 /// Like [`start_proxy`], with Negotiate tokens from `tokens` in place of the
 /// system's Kerberos tickets.
 pub async fn start_proxy_with_tokens(extra: &str, tokens: Arc<dyn TokenSource>) -> TestProxy {
-    run(bind(extra, Some(tokens)).await)
+    run(bind(extra, Some(tokens), None).await)
 }
 
-async fn bind(extra: &str, tokens: Option<Arc<dyn TokenSource>>) -> Server {
+async fn bind(
+    extra: &str,
+    tokens: Option<Arc<dyn TokenSource>>,
+    trust: Option<gatir::pac::Trust>,
+) -> Server {
     let toml = format!("listen = [\"127.0.0.1:0\"]\n{extra}");
     let config = Config::from_toml_str(&toml, Overrides::default()).expect("test configuration");
-    match tokens {
-        Some(tokens) => Server::bind_with_tokens(&config, tokens).await,
-        None => Server::bind(&config).await,
+    match (tokens, trust) {
+        (Some(tokens), _) => Server::bind_with_tokens(&config, tokens).await,
+        (None, Some(trust)) => Server::bind_with_trust(&config, trust).await,
+        (None, None) => Server::bind(&config).await,
     }
     .expect("bind the proxy")
 }

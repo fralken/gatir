@@ -24,7 +24,7 @@ use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::auth::TokenSource;
 use crate::config::{Config, HeaderRule, Timeouts};
-use crate::pac::PacSource;
+use crate::pac::{PacSource, Trust};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
 ///
@@ -70,7 +70,7 @@ pub struct Server {
 impl Server {
     /// Binds every `listen` address of the configuration.
     pub async fn bind(config: &Config) -> io::Result<Self> {
-        Self::bind_with(config, None).await
+        Self::bind_with(config, None, Trust::system()).await
     }
 
     /// Like [`Server::bind`], taking the Negotiate tokens from `tokens`
@@ -79,13 +79,24 @@ impl Server {
         config: &Config,
         tokens: Arc<dyn TokenSource>,
     ) -> io::Result<Self> {
-        Self::bind_with(config, Some(tokens)).await
+        Self::bind_with(config, Some(tokens), Trust::system()).await
     }
 
-    async fn bind_with(config: &Config, tokens: Option<Arc<dyn TokenSource>>) -> io::Result<Self> {
+    /// Like [`Server::bind`], with `trust` deciding which certificate
+    /// authorities an `https://` PAC address may chain to. For tests, which
+    /// run an authority of their own.
+    pub async fn bind_with_trust(config: &Config, trust: Trust) -> io::Result<Self> {
+        Self::bind_with(config, None, trust).await
+    }
+
+    async fn bind_with(
+        config: &Config,
+        tokens: Option<Arc<dyn TokenSource>>,
+        trust: Trust,
+    ) -> io::Result<Self> {
         // A PAC file that is missing or wrong is found here, not on the first request.
         let pac = match &config.pac {
-            Some(settings) => Some(PacSource::start(settings).await?),
+            Some(settings) => Some(PacSource::start_with(settings, trust).await?),
             None => None,
         };
         // Credentials only matter when there is a parent proxy to give them to.

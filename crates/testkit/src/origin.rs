@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::task::{AbortHandle, JoinHandle};
+use tokio_rustls::TlsAcceptor;
 
 use crate::http::{Request, read_request};
+use crate::tls::Identity;
 
 /// What the origin sends back for a request: raw bytes, so tests can craft
 /// chunked, truncated or malformed responses.
@@ -62,6 +64,11 @@ impl Reply {
 struct State {
     requests: Mutex<Vec<Request>>,
     connections: AtomicUsize,
+    /// The server name each TLS client asked for, in handshake order.
+    server_names: Mutex<Vec<Option<String>>>,
+    /// Handshakes that did not complete: the client refused the certificate,
+    /// or was not speaking TLS.
+    failed_handshakes: AtomicUsize,
     /// One per accepted connection, so dropping the origin closes them all.
     tasks: Mutex<Vec<AbortHandle>>,
 }
@@ -79,11 +86,29 @@ impl MockOrigin {
     where
         F: Fn(&Request) -> Reply + Send + Sync + 'static,
     {
+        Self::listen(None, handler).await
+    }
+
+    /// Like [`MockOrigin::start`], but every connection speaks TLS first,
+    /// presenting `identity`.
+    pub async fn start_tls<F>(identity: &Identity, handler: F) -> Self
+    where
+        F: Fn(&Request) -> Reply + Send + Sync + 'static,
+    {
+        Self::listen(Some(identity.acceptor()), handler).await
+    }
+
+    async fn listen<F>(tls: Option<TlsAcceptor>, handler: F) -> Self
+    where
+        F: Fn(&Request) -> Reply + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
         let addr = listener.local_addr().expect("origin address");
         let state = Arc::new(State {
             requests: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
+            server_names: Mutex::new(Vec::new()),
+            failed_handshakes: AtomicUsize::new(0),
             tasks: Mutex::new(Vec::new()),
         });
         let handler = Arc::new(handler);
@@ -93,7 +118,22 @@ impl MockOrigin {
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     state.connections.fetch_add(1, Ordering::SeqCst);
-                    let connection = tokio::spawn(serve(stream, handler.clone(), state.clone()));
+                    let (handler, shared, tls) = (handler.clone(), state.clone(), tls.clone());
+                    let connection = tokio::spawn(async move {
+                        match tls {
+                            None => serve(stream, handler, shared).await,
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(stream) => {
+                                    let name = stream.get_ref().1.server_name().map(str::to_owned);
+                                    shared.server_names.lock().expect("names lock").push(name);
+                                    serve(stream, handler, shared).await;
+                                }
+                                Err(_) => {
+                                    shared.failed_handshakes.fetch_add(1, Ordering::SeqCst);
+                                }
+                            },
+                        }
+                    });
                     state
                         .tasks
                         .lock()
@@ -123,6 +163,17 @@ impl MockOrigin {
     pub fn connection_count(&self) -> usize {
         self.state.connections.load(Ordering::SeqCst)
     }
+
+    /// The server name each client that completed a TLS handshake asked for
+    /// (`None` when it sent none, as for an IP address).
+    pub fn server_names(&self) -> Vec<Option<String>> {
+        self.state.server_names.lock().expect("names lock").clone()
+    }
+
+    /// TLS handshakes that did not complete.
+    pub fn failed_handshakes(&self) -> usize {
+        self.state.failed_handshakes.load(Ordering::SeqCst)
+    }
 }
 
 /// Dropping the origin makes it disappear: it stops listening and closes
@@ -136,8 +187,9 @@ impl Drop for MockOrigin {
     }
 }
 
-async fn serve<F>(stream: TcpStream, handler: Arc<F>, state: Arc<State>)
+async fn serve<S, F>(stream: S, handler: Arc<F>, state: Arc<State>)
 where
+    S: AsyncRead + AsyncWrite + Unpin,
     F: Fn(&Request) -> Reply + Send + Sync + 'static,
 {
     let mut reader = BufReader::new(stream);
@@ -167,7 +219,7 @@ where
 }
 
 /// Sends back what the peer sends until it closes.
-async fn echo(reader: &mut BufReader<TcpStream>) {
+async fn echo<S: AsyncRead + AsyncWrite + Unpin>(reader: &mut BufReader<S>) {
     let mut buffer = [0u8; 4096];
     loop {
         let count = match reader.read(&mut buffer).await {

@@ -50,6 +50,14 @@ there needs libclang (bindgen), which the macOS command line tools include, and
 on Linux also `libkrb5-dev`. At run time Linux needs the system Kerberos
 library (`libgssapi_krb5`). Windows is not supported for Negotiate yet.
 
+TLS (a PAC script fetched over https) goes through the operating system, with
+the `native-tls` crate: Security.framework on macOS, Schannel on Windows and
+OpenSSL on Linux, so building on Linux needs `libssl-dev` and `pkg-config`, and
+running needs `libssl`. The authorities trusted are the system's. gatir ships no
+TLS implementation of its own. The test server (`crates/testkit`, `tls.rs`) is
+rustls with `ring` and makes its certificates with `rcgen`: dev-dependencies
+only, and a different implementation from the code under test on purpose.
+
 The PAC engine is QuickJS, through the `rquickjs` crate: C code compiled at
 build time, so a C compiler is needed (the macOS command line tools, gcc or
 clang on Linux, MSVC on Windows). It is the one place where C is accepted, for

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::fetch::{Fetched, Validators, fetch};
+use super::fetch::{Fetched, Trust, Validators, fetch};
 use super::{MAX_SCRIPT_BYTES, Pac, PacEnv, PacError, PacLimits, SystemResolver};
 use crate::config::{PacConfig, PacLocation};
 
@@ -39,6 +39,7 @@ pub struct PacSource {
     settings: PacConfig,
     limits: PacLimits,
     env: PacEnv,
+    trust: Trust,
     state: Mutex<State>,
 }
 
@@ -50,6 +51,12 @@ impl PacSource {
     /// network may simply not be there yet, and gatir keeps trying while
     /// requests are told why nothing is chosen.
     pub async fn start(settings: &PacConfig) -> io::Result<Arc<Self>> {
+        Self::start_with(settings, Trust::system()).await
+    }
+
+    /// Like [`PacSource::start`], with `trust` deciding which certificate
+    /// authorities an `https://` address may chain to.
+    pub async fn start_with(settings: &PacConfig, trust: Trust) -> io::Result<Arc<Self>> {
         let resolver = Arc::new(SystemResolver::new(settings.dns_timeout, settings.dns_ttl));
         let source = Arc::new(Self {
             limits: PacLimits {
@@ -59,6 +66,7 @@ impl PacSource {
                 ..PacLimits::default()
             },
             env: PacEnv::system(resolver),
+            trust,
             settings: settings.clone(),
             state: Mutex::new(State::default()),
         });
@@ -174,7 +182,7 @@ impl PacSource {
         let (bytes, validators) = match &self.settings.location {
             PacLocation::File(path) => (read_file(path).await?, Validators::default()),
             PacLocation::Url(address) => {
-                match fetch(address, self.settings.fetch_timeout, &known)
+                match fetch(address, self.settings.fetch_timeout, &known, &self.trust)
                     .await
                     .map_err(|err| err.to_string())?
                 {

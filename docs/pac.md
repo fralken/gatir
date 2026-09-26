@@ -45,13 +45,18 @@ gatir sends back the `ETag` and `Last-Modified` it was given. A query string in
 the address, which may hold a token, is left out of the log and of error
 messages.
 
+An `https://` address is checked by the operating system: the server's
+certificate must be valid for the name in the address (or the IP address, if
+that is what the address has), unexpired, and issued by an authority the system
+trusts. A corporate authority installed in the system's store therefore works
+with no configuration; on Linux, `SSL_CERT_FILE` or `SSL_CERT_DIR` point OpenSSL
+at another set of authorities. A server whose certificate is refused is sent
+nothing, and the error says what to check.
+
 If the script cannot be fetched when gatir starts, gatir starts anyway, since
 the network may not be up yet: every request is answered with a 502 that says
 why nothing could choose a proxy, until a fetch succeeds. A file that cannot be
 read at start-up stops gatir, as it did before.
-
-An `https://` address is accepted in the configuration, but gatir cannot fetch
-it yet.
 
 ## What the script is asked
 

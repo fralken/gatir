@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
-use gatir::pac::{FetchError, Fetched, Validators, fetch};
+use gatir::pac::{FetchError, Fetched, Trust, Validators, fetch};
 use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
 
@@ -349,6 +349,7 @@ async fn fetched(origin: &MockOrigin, path: &str) -> Result<Fetched, FetchError>
         &format!("http://{}{path}", origin.authority()),
         LIMIT,
         &Validators::default(),
+        &Trust::system(),
     )
     .await
 }
@@ -443,9 +444,14 @@ async fn what_the_server_gets_wrong_is_reported_not_guessed() {
 #[tokio::test]
 async fn an_address_nobody_listens_on_and_one_that_never_answers_are_errors() {
     let closed = gatir_testkit::closed_port().await;
-    let error = fetch(&format!("http://{closed}/p"), LIMIT, &Validators::default())
-        .await
-        .unwrap_err();
+    let error = fetch(
+        &format!("http://{closed}/p"),
+        LIMIT,
+        &Validators::default(),
+        &Trust::system(),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(error, FetchError::Connect { .. }), "{error}");
 
     let silent = MockOrigin::start(|_| Reply::ok("late").after(Duration::from_secs(10))).await;
@@ -453,6 +459,7 @@ async fn an_address_nobody_listens_on_and_one_that_never_answers_are_errors() {
         &format!("http://{}/p", silent.authority()),
         Duration::from_millis(300),
         &Validators::default(),
+        &Trust::system(),
     )
     .await
     .unwrap_err();

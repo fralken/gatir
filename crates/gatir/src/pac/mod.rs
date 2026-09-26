@@ -16,7 +16,7 @@ mod route;
 mod source;
 
 pub use engine::{Pac, PacEnv, PacError, PacLimits};
-pub use fetch::{FetchError, Fetched, Validators, fetch};
+pub use fetch::{FetchError, Fetched, Trust, Validators, fetch};
 pub use resolver::{Resolver, SystemResolver, system_local_addresses};
 pub use route::{Parsed, ProxyAddr, Route, parse};
 pub use source::PacSource;

@@ -9,6 +9,7 @@ pub mod http;
 pub mod ntlm_parent;
 pub mod origin;
 pub mod tcp;
+pub mod tls;
 
 /// A loopback address where nothing is listening: connecting is refused.
 pub async fn closed_port() -> SocketAddr {
