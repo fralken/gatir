@@ -37,7 +37,8 @@ service, and gatir looks again after 5 seconds, then 10, 20 and so on, up to
 begin after it.
 
 An address is fetched with a plain `GET` on a connection of its own, straight
-to the server, not through a parent proxy. Up to 5 redirects are followed (a
+to the server, and never through a parent proxy: the parents are what the
+script is for, so they are not known until it has been read. Up to 5 redirects are followed (a
 redirect from `https` to `http` is refused, and so is one to an address with a
 user name in it), the script may weigh 16 MB at most, and the server is asked
 to send it uncompressed. The server may answer `304` when nothing changed:
