@@ -54,7 +54,11 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     apply_rules(&mut parts.headers, &context.request_headers);
     parts.headers.insert(HOST, target.host_header.clone());
 
-    let mut lease = acquire(context, context.upstreams.hops(&target.host), &target).await?;
+    let hops = context
+        .upstreams
+        .hops(&target.pac_url(), &target.host)
+        .await?;
+    let mut lease = acquire(context, hops, &target).await?;
     // A proxy is addressed with the full URL, so it knows the destination.
     let uri = match lease.hop {
         Hop::Direct => target.origin_form.clone(),
@@ -386,6 +390,21 @@ struct Target {
 }
 
 impl Target {
+    /// The URL as a PAC script gets it: the host in lower case, and no user
+    /// information.
+    fn pac_url(&self) -> String {
+        let authority = self
+            .absolute
+            .authority()
+            .map_or("", |authority| authority.as_str())
+            .to_ascii_lowercase();
+        let path_and_query = self
+            .absolute
+            .path_and_query()
+            .map_or("/", |path_and_query| path_and_query.as_str());
+        format!("http://{authority}{path_and_query}")
+    }
+
     fn from_uri(uri: &Uri) -> Result<Self, Failure> {
         match uri.scheme_str() {
             Some("http") => {}

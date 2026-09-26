@@ -36,7 +36,11 @@ pub struct OverrideArgs {
     #[arg(long, global = true, value_name = "ADDR")]
     pub listen: Vec<SocketAddr>,
 
-    /// Parent proxy as HOST:PORT; repeat for several (replaces `parents` from the file)
+    /// PAC file that chooses the proxy for each request (replaces `parents` from the file)
+    #[arg(long, global = true, value_name = "FILE")]
+    pub pac: Option<std::path::PathBuf>,
+
+    /// Parent proxy as HOST:PORT; repeat for several (replaces `parents` or `[pac]` from the file)
     #[arg(long = "parent", global = true, value_name = "HOST:PORT")]
     pub parents: Vec<ParentAddr>,
 
@@ -92,6 +96,7 @@ impl OverrideArgs {
         Overrides {
             listen: self.listen,
             parents: self.parents,
+            pac: self.pac,
             username: self.username,
             domain: self.domain,
             method: self.method,
@@ -106,7 +111,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Hash(args) => hash_password(&args),
         Command::Run => {
             let config = load_config(cli.config.as_deref(), cli.overrides)?;
-            if config.parents.is_empty() && config.credentials.is_some() {
+            if config.parents.is_empty() && config.pac.is_none() && config.credentials.is_some() {
                 tracing::warn!(
                     "credentials are configured, but there is no parent proxy to authenticate to"
                 );

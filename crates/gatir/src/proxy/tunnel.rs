@@ -64,7 +64,13 @@ async fn open(
     let limit = context.timeouts.connect;
 
     let client_upgrade = hyper::upgrade::on(&mut request);
-    let hops = context.upstreams.hops(&host);
+    // What a PAC script sees of a tunnel is the address it leads to.
+    let pac_url = if port == 443 {
+        format!("https://{}/", host.to_ascii_lowercase())
+    } else {
+        format!("https://{}:{port}/", host.to_ascii_lowercase())
+    };
+    let hops = context.upstreams.hops(&pac_url, &host).await?;
     let (hop, stream) = context
         .upstreams
         .connect(hops, &address, limit, context.auth.as_ref())

@@ -109,8 +109,12 @@ impl Default for Timeouts {
 #[derive(Debug)]
 pub struct Config {
     pub listen: Vec<SocketAddr>,
-    /// Parent proxies in order of preference. Empty means direct connections.
+    /// Parent proxies in order of preference. Empty means direct connections,
+    /// unless a PAC file chooses.
     pub parents: Vec<ParentAddr>,
+    /// A PAC file that decides, for each request, which proxy to use. Not
+    /// together with `parents`.
+    pub pac: Option<PacConfig>,
     pub credentials: Option<Credentials>,
     /// Which client addresses may use the proxy.
     pub access: Acl,
@@ -128,6 +132,9 @@ pub struct Config {
 pub struct Overrides {
     pub listen: Vec<SocketAddr>,
     pub parents: Vec<ParentAddr>,
+    /// A PAC file. Like `parents`, it is a way of finding the proxy, so it
+    /// replaces the other one in the file.
+    pub pac: Option<PathBuf>,
     pub username: Option<String>,
     pub domain: Option<String>,
     pub method: Option<AuthMethod>,
@@ -142,12 +149,102 @@ pub struct Overrides {
 struct RawConfig {
     listen: Option<Vec<SocketAddr>>,
     parents: Option<Vec<ParentAddr>>,
+    pac: Option<RawPac>,
     credentials: Option<RawCredentials>,
     access: Option<RawAccess>,
     no_proxy: Option<Vec<String>>,
     headers: Option<BTreeMap<String, SecretValue>>,
     timeouts: Option<RawTimeouts>,
     log: Option<RawLog>,
+}
+
+/// The limits on a PAC script, and its name lookups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PacConfig {
+    pub file: PathBuf,
+    /// How long one evaluation may take.
+    pub time_limit: Duration,
+    /// Memory one script engine may use, in bytes.
+    pub memory_limit: usize,
+    /// Script engines, so that this many evaluations can run at once.
+    pub workers: usize,
+    /// How long a script waits for a name lookup.
+    pub dns_timeout: Duration,
+    /// How long an answer to a name lookup is remembered.
+    pub dns_ttl: Duration,
+}
+
+impl PacConfig {
+    fn with_defaults(file: PathBuf) -> Self {
+        Self {
+            file,
+            time_limit: Duration::from_secs(5),
+            memory_limit: 64 * 1024 * 1024,
+            workers: 4,
+            dns_timeout: Duration::from_secs(2),
+            dns_ttl: Duration::from_secs(60),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPac {
+    file: Option<PathBuf>,
+    time_limit_ms: Option<u64>,
+    memory_limit_mb: Option<u64>,
+    workers: Option<u64>,
+    dns_timeout_ms: Option<u64>,
+    dns_ttl_secs: Option<u64>,
+}
+
+fn within(name: &str, value: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::invalid(format!(
+            "pac.{name} must be between {min} and {max}"
+        )))
+    }
+}
+
+impl RawPac {
+    /// `file` is the path given on the command line, if any, which replaces the
+    /// one in the file. A path in the file is relative to the file that holds it.
+    fn resolve(self, file: Option<PathBuf>, base: Option<&Path>) -> Result<PacConfig, ConfigError> {
+        let file = match (file, self.file) {
+            (Some(from_command_line), _) => from_command_line,
+            (None, Some(from_file)) => match base {
+                Some(base) if from_file.is_relative() => base.join(from_file),
+                _ => from_file,
+            },
+            (None, None) => {
+                return Err(ConfigError::invalid(
+                    "pac.file is required in the [pac] table",
+                ));
+            }
+        };
+        if file.as_os_str().is_empty() {
+            return Err(ConfigError::invalid("pac.file must not be empty"));
+        }
+        let mut pac = PacConfig::with_defaults(file);
+        if let Some(ms) = self.time_limit_ms {
+            pac.time_limit = Duration::from_millis(within("time_limit_ms", ms, 10, 60_000)?);
+        }
+        if let Some(mb) = self.memory_limit_mb {
+            pac.memory_limit = within("memory_limit_mb", mb, 4, 1024)? as usize * 1024 * 1024;
+        }
+        if let Some(workers) = self.workers {
+            pac.workers = within("workers", workers, 1, 32)? as usize;
+        }
+        if let Some(ms) = self.dns_timeout_ms {
+            pac.dns_timeout = Duration::from_millis(within("dns_timeout_ms", ms, 10, 30_000)?);
+        }
+        if let Some(secs) = self.dns_ttl_secs {
+            pac.dns_ttl = Duration::from_secs(within("dns_ttl_secs", secs, 1, 86_400)?);
+        }
+        Ok(pac)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -224,21 +321,21 @@ impl Config {
             }
             None => RawConfig::default(),
         };
-        raw.resolve(overrides)
+        raw.resolve(overrides, path.and_then(Path::parent))
     }
 
     /// Like [`Config::load`], reading the TOML from a string.
     pub fn from_toml_str(source: &str, overrides: Overrides) -> Result<Self, ConfigError> {
-        RawConfig::parse(source, "<string>")?.resolve(overrides)
+        RawConfig::parse(source, "<string>")?.resolve(overrides, None)
     }
 
     /// A multi-line description that never includes secret values.
     pub fn summary(&self) -> String {
         let listen = join(self.listen.iter());
-        let parents = if self.parents.is_empty() {
-            "none (direct connections)".to_owned()
-        } else {
-            join(self.parents.iter())
+        let parents = match (&self.pac, self.parents.is_empty()) {
+            (Some(pac), _) => format!("chosen by the PAC file {}", pac.file.display()),
+            (None, true) => "none (direct connections)".to_owned(),
+            (None, false) => join(self.parents.iter()),
         };
         let credentials = match &self.credentials {
             None => "none".to_owned(),
@@ -326,7 +423,8 @@ impl RawConfig {
         })
     }
 
-    fn resolve(self, overrides: Overrides) -> Result<Config, ConfigError> {
+    /// `base` is the directory of the configuration file, if it was read from one.
+    fn resolve(self, overrides: Overrides, base: Option<&Path>) -> Result<Config, ConfigError> {
         let listen = if overrides.listen.is_empty() {
             self.listen.unwrap_or_else(|| vec![DEFAULT_LISTEN])
         } else {
@@ -345,11 +443,33 @@ impl RawConfig {
             }
         }
 
-        let parents = if overrides.parents.is_empty() {
-            self.parents.unwrap_or_default()
-        } else {
-            overrides.parents
+        // Parents and a PAC file are two ways of finding the proxy. Whichever
+        // the command line names replaces the other one in the file.
+        let (parents, pac) = match (overrides.parents.is_empty(), overrides.pac) {
+            (false, Some(_)) => {
+                return Err(ConfigError::invalid(
+                    "--parent and --pac cannot be used together: the PAC file chooses the proxy",
+                ));
+            }
+            (false, None) => (overrides.parents, None),
+            (true, from_command_line @ Some(_)) => (
+                Vec::new(),
+                Some(
+                    self.pac
+                        .unwrap_or_default()
+                        .resolve(from_command_line, base)?,
+                ),
+            ),
+            (true, None) => (
+                self.parents.unwrap_or_default(),
+                self.pac.map(|raw| raw.resolve(None, base)).transpose()?,
+            ),
         };
+        if pac.is_some() && !parents.is_empty() {
+            return Err(ConfigError::invalid(
+                "parents and [pac] cannot both be set: the PAC file chooses the proxy",
+            ));
+        }
 
         let mut credentials = self.credentials;
         if overrides.username.is_some()
@@ -408,6 +528,7 @@ impl RawConfig {
         Ok(Config {
             listen,
             parents,
+            pac,
             credentials,
             access,
             no_proxy,
@@ -649,6 +770,7 @@ mod tests {
         let overrides = Overrides {
             listen: vec!["0.0.0.0:9999".parse().unwrap()],
             parents: vec!["other.example.com:3128".parse().unwrap()],
+            pac: None,
             username: Some("bob".into()),
             domain: Some("OTHER".into()),
             method: Some(AuthMethod::Nt),
@@ -916,6 +1038,163 @@ mod tests {
             assert!(load(toml).is_err(), "should reject {toml:?}");
         }
         assert!(error_text("[timeouts]\nconnect_secs = 0").contains("timeouts.connect_secs"));
+    }
+
+    #[test]
+    fn a_pac_table_needs_only_a_file() {
+        let config = load("[pac]\nfile = \"proxy.pac\"").unwrap();
+        let pac = config.pac.unwrap();
+        assert_eq!(pac, PacConfig::with_defaults(PathBuf::from("proxy.pac")));
+        assert!(config.parents.is_empty());
+        assert!(load("").unwrap().pac.is_none());
+    }
+
+    #[test]
+    fn the_limits_of_a_pac_script_can_be_set() {
+        let config = load(
+            "[pac]\nfile = \"p.pac\"\ntime_limit_ms = 750\nmemory_limit_mb = 16\nworkers = 2\n\
+             dns_timeout_ms = 300\ndns_ttl_secs = 5",
+        )
+        .unwrap();
+        let pac = config.pac.unwrap();
+        assert_eq!(pac.time_limit, Duration::from_millis(750));
+        assert_eq!(pac.memory_limit, 16 * 1024 * 1024);
+        assert_eq!(pac.workers, 2);
+        assert_eq!(pac.dns_timeout, Duration::from_millis(300));
+        assert_eq!(pac.dns_ttl, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rejects_a_pac_table_that_makes_no_sense() {
+        for (toml, expected) in [
+            ("[pac]", "pac.file is required"),
+            ("[pac]\nfile = \"\"", "pac.file must not be empty"),
+            (
+                "[pac]\nfile = \"p\"\ntime_limit_ms = 1",
+                "pac.time_limit_ms must be between",
+            ),
+            (
+                "[pac]\nfile = \"p\"\nmemory_limit_mb = 0",
+                "pac.memory_limit_mb must be between",
+            ),
+            (
+                "[pac]\nfile = \"p\"\nworkers = 0",
+                "pac.workers must be between",
+            ),
+            (
+                "[pac]\nfile = \"p\"\nworkers = 999",
+                "pac.workers must be between",
+            ),
+            (
+                "[pac]\nfile = \"p\"\ndns_ttl_secs = 0",
+                "pac.dns_ttl_secs must be between",
+            ),
+            ("[pac]\nfile = \"p\"\nspeed = 1", "unknown field"),
+            (
+                "parents = [\"a.example.com:1\"]\n[pac]\nfile = \"p\"",
+                "parents and [pac] cannot both be set",
+            ),
+        ] {
+            let text = error_text(toml);
+            assert!(text.contains(expected), "{toml:?} -> {text}");
+        }
+    }
+
+    #[test]
+    fn the_command_line_chooses_between_parents_and_a_pac_file() {
+        let with_pac = "[pac]\nfile = \"file.pac\"";
+        let with_parents = "parents = [\"file.example.com:1\"]";
+
+        // Naming a parent drops the script of the file...
+        let config = Config::from_toml_str(
+            with_pac,
+            Overrides {
+                parents: vec!["cli.example.com:2".parse().unwrap()],
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert!(config.pac.is_none());
+        assert_eq!(config.parents.len(), 1);
+
+        // ...and naming a script drops the parents of the file.
+        let config = Config::from_toml_str(
+            with_parents,
+            Overrides {
+                pac: Some(PathBuf::from("cli.pac")),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert!(config.parents.is_empty());
+        assert_eq!(config.pac.unwrap().file, PathBuf::from("cli.pac"));
+
+        // A script named on the command line keeps the limits set in the file.
+        let config = Config::from_toml_str(
+            "[pac]\nfile = \"file.pac\"\nworkers = 2",
+            Overrides {
+                pac: Some(PathBuf::from("cli.pac")),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let pac = config.pac.unwrap();
+        assert_eq!((pac.file, pac.workers), (PathBuf::from("cli.pac"), 2));
+
+        // Both on the command line is a mistake.
+        let error = Config::from_toml_str(
+            "",
+            Overrides {
+                parents: vec!["cli.example.com:2".parse().unwrap()],
+                pac: Some(PathBuf::from("cli.pac")),
+                ..Overrides::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("--parent and --pac cannot be used together"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_pac_path_in_the_file_is_relative_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gatir.toml");
+        std::fs::write(&file, "[pac]\nfile = \"rules/proxy.pac\"").unwrap();
+
+        let config = Config::load(Some(&file), Overrides::default()).unwrap();
+        assert_eq!(config.pac.unwrap().file, dir.path().join("rules/proxy.pac"));
+
+        // An absolute path is left as it is, and so is one from the command line.
+        let absolute = dir.path().join("elsewhere.pac");
+        std::fs::write(
+            &file,
+            format!("[pac]\nfile = {:?}", absolute.display().to_string()),
+        )
+        .unwrap();
+        let config = Config::load(Some(&file), Overrides::default()).unwrap();
+        assert_eq!(config.pac.unwrap().file, absolute);
+
+        let config = Config::load(
+            Some(&file),
+            Overrides {
+                pac: Some(PathBuf::from("cli.pac")),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.pac.unwrap().file, PathBuf::from("cli.pac"));
+    }
+
+    #[test]
+    fn the_summary_says_that_a_pac_file_chooses() {
+        let summary = load("[pac]\nfile = \"proxy.pac\"").unwrap().summary();
+        assert!(
+            summary.contains("chosen by the PAC file proxy.pac"),
+            "{summary}"
+        );
     }
 
     #[test]

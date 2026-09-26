@@ -19,6 +19,7 @@ use super::parent_auth::ParentAuth;
 use super::pool::{Pool, PoolKey};
 use crate::config::ParentAddr;
 use crate::noproxy::NoProxy;
+use crate::pac::{Pac, Route};
 
 /// How long a parent that could not be reached is left for last.
 const BAD_FOR: Duration = Duration::from_secs(60);
@@ -69,31 +70,44 @@ pub(super) struct Upstreams {
     /// there, so a healthy parent is kept ("sticky") until it fails.
     current: AtomicUsize,
     no_proxy: NoProxy,
+    /// A PAC script that says where each request goes, in place of `parents`.
+    pac: Option<Pac>,
     /// Parents that could not be reached, and when.
     unreachable: Mutex<HashMap<String, Instant>>,
 }
 
 impl Upstreams {
-    pub(super) fn new(parents: Vec<ParentAddr>, no_proxy: NoProxy) -> Self {
+    pub(super) fn new(parents: Vec<ParentAddr>, no_proxy: NoProxy, pac: Option<Pac>) -> Self {
         Self {
             parents,
             current: AtomicUsize::new(0),
             no_proxy,
+            pac,
             unreachable: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Without parents everything is direct; with parents, only the
-    /// destinations listed in `no_proxy` are.
-    pub(super) fn hops(&self, host: &str) -> Vec<Hop> {
+    /// Where a request for `url`, whose host is `host`, may go, in order.
+    ///
+    /// Destinations listed in `no_proxy` are always direct. Otherwise a PAC
+    /// script decides, if there is one; else it is the configured parents, or
+    /// straight to the destination if there are none.
+    pub(super) async fn hops(&self, url: &str, host: &str) -> Result<Vec<Hop>, Failure> {
+        let host = host.to_ascii_lowercase();
+        if self.no_proxy.matches(&host) {
+            return Ok(vec![Hop::Direct]);
+        }
+        if let Some(pac) = &self.pac {
+            return hops_from_script(pac, url, &host).await;
+        }
         let count = self.parents.len();
-        if count == 0 || self.no_proxy.matches(host) {
-            return vec![Hop::Direct];
+        if count == 0 {
+            return Ok(vec![Hop::Direct]);
         }
         let start = self.current.load(Ordering::Relaxed) % count;
-        (0..count)
+        Ok((0..count)
             .map(|offset| Hop::Parent(self.parents[(start + offset) % count].clone()))
-            .collect()
+            .collect())
     }
 
     fn unreachable(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
@@ -232,6 +246,28 @@ impl Upstreams {
     }
 }
 
+/// The hops a PAC script chose, skipping the kinds gatir cannot use.
+async fn hops_from_script(pac: &Pac, url: &str, host: &str) -> Result<Vec<Hop>, Failure> {
+    let routes = pac.find(url, host).await.map_err(Failure::Pac)?;
+    let mut hops = Vec::new();
+    let mut skipped = Vec::new();
+    for route in routes {
+        match route {
+            Route::Direct => hops.push(Hop::Direct),
+            Route::Proxy(proxy) => hops.push(Hop::Parent(ParentAddr {
+                host: proxy.host,
+                port: proxy.port,
+            })),
+            other => skipped.push(other.to_string()),
+        }
+    }
+    tracing::debug!(%url, chosen = ?hops, ?skipped, "the PAC file chose");
+    if hops.is_empty() {
+        return Err(Failure::PacUnsupported(skipped.join("; ")));
+    }
+    Ok(hops)
+}
+
 fn hop_name(hop: &Hop) -> String {
     match hop {
         Hop::Direct => "DIRECT".to_owned(),
@@ -262,30 +298,38 @@ mod tests {
         Hop::Parent(parent(text))
     }
 
-    #[test]
-    fn without_parents_everything_is_direct() {
-        let upstreams = Upstreams::new(vec![], NoProxy::default());
-        assert_eq!(upstreams.hops("example.com"), [Hop::Direct]);
-    }
-
-    #[test]
-    fn with_parents_only_no_proxy_destinations_are_direct() {
-        let no_proxy = NoProxy::new(["localhost", "*.corp.example.com", "10.0.0.0/8"]).unwrap();
-        let upstreams = Upstreams::new(vec![parent("proxy.example.com:8080")], no_proxy);
-
+    #[tokio::test]
+    async fn without_parents_everything_is_direct() {
+        let upstreams = Upstreams::new(vec![], NoProxy::default(), None);
         assert_eq!(
-            upstreams.hops("example.com"),
-            [hop("proxy.example.com:8080")]
+            upstreams
+                .hops("http://example.com/", "example.com")
+                .await
+                .unwrap(),
+            [Hop::Direct]
         );
-        assert_eq!(upstreams.hops("localhost"), [Hop::Direct]);
-        assert_eq!(upstreams.hops("app.corp.example.com"), [Hop::Direct]);
-        assert_eq!(upstreams.hops("10.1.2.3"), [Hop::Direct]);
-        assert_eq!(upstreams.hops("11.1.2.3"), [hop("proxy.example.com:8080")]);
-        assert_eq!(upstreams.hops("[::1]"), [hop("proxy.example.com:8080")]);
     }
 
-    #[test]
-    fn the_parent_that_worked_last_comes_first() {
+    #[tokio::test]
+    async fn with_parents_only_no_proxy_destinations_are_direct() {
+        let no_proxy = NoProxy::new(["localhost", "*.corp.example.com", "10.0.0.0/8"]).unwrap();
+        let upstreams = Upstreams::new(vec![parent("proxy.example.com:8080")], no_proxy, None);
+        let hops = |host: &'static str| {
+            let upstreams = &upstreams;
+            async move { upstreams.hops("http://x/", host).await.unwrap() }
+        };
+
+        assert_eq!(hops("example.com").await, [hop("proxy.example.com:8080")]);
+        assert_eq!(hops("localhost").await, [Hop::Direct]);
+        assert_eq!(hops("LOCALHOST").await, [Hop::Direct]);
+        assert_eq!(hops("app.corp.example.com").await, [Hop::Direct]);
+        assert_eq!(hops("10.1.2.3").await, [Hop::Direct]);
+        assert_eq!(hops("11.1.2.3").await, [hop("proxy.example.com:8080")]);
+        assert_eq!(hops("[::1]").await, [hop("proxy.example.com:8080")]);
+    }
+
+    #[tokio::test]
+    async fn the_parent_that_worked_last_comes_first() {
         let upstreams = Upstreams::new(
             vec![
                 parent("a.example.com:1"),
@@ -293,9 +337,10 @@ mod tests {
                 parent("c.example.com:3"),
             ],
             NoProxy::default(),
+            None,
         );
         assert_eq!(
-            upstreams.hops("x"),
+            upstreams.hops("http://x/", "x").await.unwrap(),
             [
                 hop("a.example.com:1"),
                 hop("b.example.com:2"),
@@ -304,7 +349,7 @@ mod tests {
         );
         upstreams.worked(&hop("b.example.com:2"));
         assert_eq!(
-            upstreams.hops("x"),
+            upstreams.hops("http://x/", "x").await.unwrap(),
             [
                 hop("b.example.com:2"),
                 hop("c.example.com:3"),
@@ -315,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_parent_that_could_not_be_reached_goes_last_for_a_while() {
-        let upstreams = Upstreams::new(vec![], NoProxy::default());
+        let upstreams = Upstreams::new(vec![], NoProxy::default(), None);
         let hops = vec![
             hop("dead.example.com:1"),
             Hop::Direct,
@@ -339,7 +384,7 @@ mod tests {
 
     #[test]
     fn when_every_parent_failed_the_order_is_kept() {
-        let upstreams = Upstreams::new(vec![], NoProxy::default());
+        let upstreams = Upstreams::new(vec![], NoProxy::default(), None);
         let hops = vec![hop("a.example.com:1"), hop("b.example.com:2")];
         upstreams.failed(&hops[0]);
         upstreams.failed(&hops[1]);

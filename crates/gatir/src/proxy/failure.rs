@@ -12,8 +12,10 @@ use tokio::time::timeout;
 use super::body::{Body, error_response};
 use super::parent_auth::COOLDOWN;
 use crate::auth::AuthError;
+use crate::pac::PacError;
 
 /// Why opening a TCP connection failed.
+#[derive(Debug)]
 pub(super) enum ConnectError {
     Timeout,
     Io(io::Error),
@@ -29,11 +31,13 @@ impl fmt::Display for ConnectError {
 }
 
 /// One failed attempt to reach a parent proxy.
+#[derive(Debug)]
 pub(super) struct ParentAttempt {
     pub address: String,
     pub error: ConnectError,
 }
 
+#[derive(Debug)]
 pub(super) enum Failure {
     BadRequest(&'static str),
     ConnectTimeout(String),
@@ -59,6 +63,11 @@ pub(super) enum Failure {
     TicketRejected {
         service: String,
     },
+    /// The PAC script could not say where to send the request.
+    Pac(PacError),
+    /// The PAC script chose only ways of reaching the destination that gatir
+    /// cannot use, such as a SOCKS proxy.
+    PacUnsupported(String),
     /// A connection the parent had authenticated asked for authentication
     /// again, and the request cannot be sent twice.
     AuthenticationLapsed,
@@ -127,6 +136,19 @@ impl Failure {
                      domain and password. gatir will not try again for {} minutes, so that the \
                      account does not get locked.",
                     COOLDOWN.as_secs() / 60
+                ),
+                false,
+            ),
+            Self::Pac(err) => error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("The PAC file could not tell where to send this request: {err}"),
+                false,
+            ),
+            Self::PacUnsupported(chosen) => error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "The PAC file chose only ways of reaching the destination that gatir does not \
+                     support: {chosen}"
                 ),
                 false,
             ),
