@@ -42,6 +42,7 @@ ipnet = "2.12.2"
 md-5 = "0.11.0"
 md4 = "0.11.0"
 rpassword = "7.5.4"
+rquickjs = "0.14"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"

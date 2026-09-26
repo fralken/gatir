@@ -12,6 +12,8 @@ depends on a detail of it.
 | RFC 4559, SPNEGO-based Kerberos and NTLM HTTP Authentication in Microsoft Windows | June 2006 | The `Negotiate` scheme (4), which a proxy applies with `Proxy-Authenticate` and `Proxy-Authorization` | `auth/negotiate.rs` |
 | RFC 9112, HTTP/1.1 | June 2022 | Message framing, in particular a request with both `Content-Length` and `Transfer-Encoding` (6.3) | `tests/proxy.rs` |
 | RFC 6585, Additional HTTP Status Codes | April 2012 | `431 Request Header Fields Too Large` (5) | `proxy/server.rs` |
+| Proxy Auto-Configuration (PAC) file format, as described by MDN (the Netscape original is no longer hosted) | 2026 | The helper functions of a PAC script, the argument forms of `dateRange`, `timeRange` and `weekdayRange`, and the result format | `pac/` |
+| IPv6 extensions to the PAC format, Microsoft | 2026 | `dnsResolveEx`, `isResolvableEx`, `isInNetEx`, `myIpAddressEx`, `sortIpAddressList` and `FindProxyForURLEx` | `pac/` |
 
 ## Links
 
@@ -23,6 +25,10 @@ depends on a detail of it.
 - RFC 9112: <https://www.rfc-editor.org/rfc/rfc9112>
 - RFC 4559: <https://www.rfc-editor.org/rfc/rfc4559>
 - RFC 6585: <https://www.rfc-editor.org/rfc/rfc6585>
+- PAC file format (MDN):
+  <https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Proxy_servers_and_tunneling/Proxy_Auto-Configuration_PAC_file>
+- IPv6 extensions to the PAC format (Microsoft):
+  <https://learn.microsoft.com/en-us/windows/win32/winhttp/ipv6-extensions-to-navigator-auto-config-file-format>
 
 ## [MS-NLMP]: sections used
 

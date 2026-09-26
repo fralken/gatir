@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod logging;
 pub mod noproxy;
+pub mod pac;
 pub mod proxy;
 
 /// Crate version, as declared in `Cargo.toml`.
