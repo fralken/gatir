@@ -19,6 +19,15 @@ inspired by CNTLM, and is written in Rust.
 - Care with accounts: gatir does not hammer a parent with wrong credentials, since
   each failed attempt is a failed logon that can lock the account.
 
+## Install
+
+Take what fits your system from the releases page, and check it against `SHA256SUMS`:
+
+- **Debian, Ubuntu**: `sudo apt install ./gatir_<version>-1_<arch>.deb`
+- **Fedora**: `sudo dnf install ./gatir-<version>-1.<arch>.rpm`
+- **macOS**: the Homebrew formula in the release, or the archive
+- **any system**: the archive, which holds the program to put on your `PATH`
+
 ## Quick start
 
 ```sh
@@ -40,7 +49,7 @@ setting in the file.
 
 | System | Status |
 |---|---|
-| Linux | Supported. Needs OpenSSL 3 (`libssl3`) and the Kerberos library (`libgssapi-krb5-2`) installed: without them gatir does not start, even if you use NTLM only. |
+| Linux | Supported, on glibc 2.35 or later (Debian 12, Ubuntu 22.04, Fedora 36). Needs OpenSSL 3 (`libssl3`) and the Kerberos library (`libgssapi-krb5-2`): the packages install them, with the archive you do, and without them gatir does not start, even if you use NTLM only. |
 | macOS | Supported, on Apple silicon and Intel. Kerberos uses the system's. |
 | Windows | Builds, but has not been tried yet. Negotiate through SSPI is not written: use NTLM. |
 

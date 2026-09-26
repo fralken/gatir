@@ -60,12 +60,19 @@ jobs:
       - name: Pack
         shell: bash
         run: scripts/package.sh ${{ matrix.target }}
+      - name: Make the .deb and the .rpm
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y rpm
+          scripts/package-linux.sh ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: gatir-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
             dist/*.sha256
           if-no-files-found: error
 
@@ -77,6 +84,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           pattern: gatir-*
@@ -88,9 +96,12 @@ jobs:
           cat ./*.sha256 | sort -k 2 > SHA256SUMS
           sha256sum --check SHA256SUMS
           ls -l
+      - name: Write the Homebrew formula of this release
+        run: scripts/homebrew-formula.sh "${GITHUB_REPOSITORY}" "${GITHUB_REF_NAME}" dist/SHA256SUMS > dist/gatir.rb
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/SHA256SUMS dist/gatir.rb \
             --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag
