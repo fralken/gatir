@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Makes a .deb and an .rpm of a Linux build that scripts/package.sh has already
 # packed, into dist/, each next to a .sha256 file. What the package needs from the
-# system (OpenSSL 3, the Kerberos library, the C library) is worked out from the
-# program by the tools of each format, not written here: `dpkg-shlibdeps` for the
-# .deb and `rpmbuild` for the .rpm.
+# system (OpenSSL 3, the C library) is worked out from the program by the tools of
+# each format, not written here: `dpkg-shlibdeps` for the .deb and `rpmbuild` for
+# the .rpm. The Kerberos library is not among it: gatir loads it when Negotiate is
+# used, so the packages recommend it and do not require it.
 #
 #   scripts/package-linux.sh [TARGET]    TARGET is x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu;
 #                                        the default is this machine's.
@@ -109,6 +110,7 @@ Architecture: ${deb_arch}
 Maintainer: ${maintainer}
 Installed-Size: $(du -sk "$deb_root/usr" | cut -f1)
 Depends: ${depends}
+Recommends: libgssapi-krb5-2
 Section: net
 Priority: optional
 Description: ${summary}
@@ -138,6 +140,7 @@ Release:  1
 Summary:  ${summary}
 License:  MIT OR Apache-2.0
 Packager: ${maintainer}
+Recommends: krb5-libs
 
 %description
 gatir is a local proxy that logs in to the proxy of a company for programs that

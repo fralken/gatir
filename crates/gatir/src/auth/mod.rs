@@ -34,6 +34,8 @@ pub enum AuthError {
     Entropy(getrandom::Error),
     #[error("Negotiate is not available on this platform yet")]
     NegotiateUnavailable,
+    #[error("Negotiate needs the Kerberos library of the system, which cannot be loaded: {reason}")]
+    KerberosLibrary { reason: String },
     #[error("cannot get a Kerberos ticket for {service}: {reason}")]
     NoTicket { service: String, reason: String },
     #[error("the parent proxy does not offer Negotiate authentication{}", offered_list(.offered))]

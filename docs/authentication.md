@@ -49,7 +49,10 @@ registered under; an address, or another alias, may have none.
 
 - **Linux and macOS** use the GSS-API of the system, with the ticket cache of the
   user: there must be a ticket (`kinit`, or the login of a computer that is in the
-  domain) before gatir asks for one. Nothing needs to be typed at gatir.
+  domain) before gatir asks for one. Nothing needs to be typed at gatir. gatir opens
+  the library (`libgssapi_krb5.so.2` on Linux, the GSS framework on macOS) when
+  Negotiate is configured, and not before: on a computer that lacks it, NTLM works, and
+  Negotiate stops at the start with an error that names the library to install.
 - **Windows** uses SSPI (`secur32.dll`) with the credentials of the session the
   user is logged on with. It has been tried on a computer of the domain against a
   corporate proxy that offers Negotiate and NTLM: Windows made a Kerberos token,

@@ -49,16 +49,20 @@ no service, no file in `/etc`.
 
 The Linux builds are made on Ubuntu 22.04, so they need a system with at least its
 C library (glibc 2.35: Debian 12, Ubuntu 22.04, Fedora 36 and their successors; not
-RHEL and its rebuilds 9, whose glibc is older), OpenSSL 3 (`libssl3`) and, since
-Kerberos goes through the system's library, `libgssapi_krb5` (`libgssapi-krb5-2`). Both
-libraries are linked when the program starts: without them it does not start at all,
-even to use NTLM only (tried on a clean Debian 12).
+RHEL and its rebuilds 9, whose glibc is older) and OpenSSL 3 (`libssl3`), which are
+linked when the program starts.
+
+Kerberos goes through the system's library, `libgssapi_krb5` (`libgssapi-krb5-2`), which
+gatir does not link: it opens the library when Negotiate is configured, so a computer
+without it can run gatir with NTLM, and Negotiate says which library is missing (checked
+in a container with the library removed). The packages recommend it.
 
 The packages say so, and their tools install what is missing: `sudo apt install
-./gatir_<version>-1_<arch>.deb` fetches `libssl3` and the Kerberos libraries, and `dnf
-install` does the same for the .rpm. What each package requires is worked out from the
-program itself, by `dpkg-shlibdeps` and by `rpmbuild`, not written by hand. For the
-archives it is for the user to install them.
+./gatir_<version>-1_<arch>.deb` fetches `libssl3`, and the Kerberos library as well
+unless recommended packages are turned off; `dnf install` does the same for the .rpm.
+What each package requires is worked out from the program itself, by `dpkg-shlibdeps`
+and by `rpmbuild`, not written by hand. For the archives it is for the user to install
+them.
 
 The maintainer written in the packages is `The gatir contributors
 <gatir@example.invalid>` until `GATIR_MAINTAINER` says otherwise, in the form `Name

@@ -511,3 +511,18 @@ fn every_alternative_in_the_example_is_valid_when_turned_on() {
                 .and(predicate::str::contains("default deny")),
         );
 }
+
+#[cfg(unix)]
+#[test]
+fn negotiate_says_why_there_is_no_token_without_a_ticket() {
+    // A ticket cache that does not exist: the system has nothing to make a
+    // token from, which is what a computer that never signed in looks like.
+    gatir()
+        .env("KRB5CCNAME", "FILE:/nonexistent/gatir-test-cache")
+        .args(["negotiate", "--service", "HTTP@proxy.example.com"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "the Negotiate exchange with HTTP@proxy.example.com went wrong",
+        ));
+}

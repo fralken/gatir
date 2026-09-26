@@ -173,7 +173,7 @@ pub fn challenge<'a>(fields: impl IntoIterator<Item = &'a HeaderValue>) -> Optio
 /// through the GSS-API of the operating system.
 #[cfg(unix)]
 pub fn system_tokens() -> Result<Arc<dyn TokenSource>, AuthError> {
-    Ok(gss::tokens())
+    gss::tokens()
 }
 
 /// The tokens of the system: on Windows SSPI, the logged-on user, with Kerberos

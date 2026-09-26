@@ -1,22 +1,22 @@
 //! Negotiate through the GSS-API of the operating system: Kerberos through
 //! SPNEGO, with the default credentials, which are the ticket cache of the
-//! logged-in user.
+//! logged-in user. The library is loaded when the tokens are asked for (see
+//! [`api`]), so its absence costs only Negotiate.
+
+mod api;
 
 use std::sync::Arc;
 
-// `is_complete` comes from the library's trait of the same name as ours.
-use libgssapi::context::{ClientCtx, CtxFlags, SecurityContext as _};
-use libgssapi::name::Name;
-use libgssapi::oid::{GSS_MECH_SPNEGO, GSS_NT_HOSTBASED_SERVICE, GSS_NT_KRB5_PRINCIPAL};
-
 use crate::auth::{AuthError, SecurityContext, Step, TokenSource};
 
-pub(super) fn tokens() -> Arc<dyn TokenSource> {
-    Arc::new(Gss)
+/// The tokens of the system, or why its library cannot be loaded.
+pub(super) fn tokens() -> Result<Arc<dyn TokenSource>, AuthError> {
+    let gss = api::load().map_err(|reason| AuthError::KerberosLibrary { reason })?;
+    Ok(Arc::new(Gss(gss)))
 }
 
 #[derive(Debug)]
-struct Gss;
+struct Gss(&'static api::Gss);
 
 impl TokenSource for Gss {
     fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
@@ -30,26 +30,21 @@ impl TokenSource for Gss {
     }
 
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
-        let fail = |reason: String| AuthError::NoTicket {
-            service: service.to_owned(),
-            reason,
-        };
-        let kind = if service.contains('/') {
-            GSS_NT_KRB5_PRINCIPAL
-        } else {
-            GSS_NT_HOSTBASED_SERVICE
-        };
-        let name =
-            Name::new(service.as_bytes(), Some(kind)).map_err(|err| fail(err.to_string()))?;
+        let name = api::Name::import(self.0, service, service.contains('/')).map_err(|reason| {
+            AuthError::NoTicket {
+                service: service.to_owned(),
+                reason,
+            }
+        })?;
         Ok(Box::new(GssContext {
-            context: ClientCtx::new(None, name, CtxFlags::empty(), Some(GSS_MECH_SPNEGO)),
+            context: api::Context::new(name),
             service: service.to_owned(),
         }))
     }
 }
 
 struct GssContext {
-    context: ClientCtx,
+    context: api::Context,
     service: String,
 }
 
@@ -65,13 +60,13 @@ impl SecurityContext for GssContext {
     fn step(&mut self, from_parent: Option<&[u8]>) -> Result<Step, AuthError> {
         let token = self
             .context
-            .step(from_parent, None)
-            .map_err(|err| AuthError::Exchange {
+            .step(from_parent)
+            .map_err(|reason| AuthError::Exchange {
                 service: self.service.clone(),
-                reason: err.to_string(),
+                reason,
             })?;
         Ok(Step {
-            token: token.map(|token| token.to_vec()),
+            token,
             complete: self.context.is_complete(),
         })
     }

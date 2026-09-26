@@ -47,11 +47,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Kerberos (Negotiate) goes through the system GSS-API on Unix, so building
-there needs libclang (bindgen), which the macOS command line tools include, and
-on Linux also `libkrb5-dev`. At run time Linux needs the system Kerberos
-library (`libgssapi_krb5`). On Windows, Negotiate goes through SSPI (`windows-sys`), in
-`auth/negotiate/sspi/api.rs`, the one place `unsafe` is allowed for it.
+Kerberos (Negotiate) goes through the system GSS-API on Unix, which gatir loads
+at run time (`libloading`, in `auth/negotiate/gss/api.rs`) instead of linking it:
+nothing about it is needed to build, and a computer without the library
+(`libgssapi_krb5` on Linux) can still run gatir with NTLM. The tests do load it, so
+Linux needs `libgssapi-krb5-2` to run them. On Windows, Negotiate goes through SSPI
+(`windows-sys`), in `auth/negotiate/sspi/api.rs`. Those two files are the places
+where `unsafe` is allowed.
 
 TLS (a PAC script fetched over https) goes through the operating system, with
 the `native-tls` crate: Security.framework on macOS, Schannel on Windows and
