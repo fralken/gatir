@@ -4,11 +4,11 @@
 //! Host names are compared without regard to case, since that is how they
 //! work. `shExpMatch` is a shell pattern and is case sensitive.
 
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::IpNet;
 
-use super::resolver::Resolver;
+use super::resolver::{NO_ROUTE, Resolver};
 
 pub fn dns_domain_is(host: &str, domain: &str) -> bool {
     let (host, domain) = (host.as_bytes(), domain.as_bytes());
@@ -126,34 +126,22 @@ pub fn is_resolvable_ex(resolver: &dyn Resolver, host: &str) -> bool {
     !resolver.resolve(host).is_empty()
 }
 
-/// The address this machine would use to reach the network. Connecting a UDP
-/// socket sends nothing: it only makes the system pick the outgoing interface.
-fn local_address(remote: &str, bind: &str) -> Option<IpAddr> {
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(remote).ok()?;
-    socket.local_addr().ok().map(|address| address.ip())
-}
-
 /// `myIpAddress()`: the IPv4 address of this machine on its way out, or the
 /// loopback address if it has no route.
-pub fn my_ip_address() -> String {
-    // 192.0.2.1 is reserved for documentation: nothing is sent to it.
-    local_address("192.0.2.1:9", "0.0.0.0:0")
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+pub fn my_ip_address(resolver: &dyn Resolver) -> String {
+    resolver
+        .local_addresses()
+        .into_iter()
+        .find(IpAddr::is_ipv4)
+        .unwrap_or(NO_ROUTE)
         .to_string()
 }
 
 /// `myIpAddressEx()`: the IPv4 and IPv6 addresses, separated by semicolons.
-pub fn my_ip_address_ex() -> String {
-    let addresses: Vec<IpAddr> = [
-        local_address("192.0.2.1:9", "0.0.0.0:0"),
-        local_address("[2001:db8::1]:9", "[::]:0"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+pub fn my_ip_address_ex(resolver: &dyn Resolver) -> String {
+    let addresses = resolver.local_addresses();
     if addresses.is_empty() {
-        IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()
+        NO_ROUTE.to_string()
     } else {
         join(&addresses)
     }
@@ -374,11 +362,46 @@ mod tests {
         assert_eq!(sort_ip_address_list(""), "");
     }
 
+    #[derive(Debug)]
+    struct At(Vec<IpAddr>);
+
+    impl Resolver for At {
+        fn resolve(&self, _: &str) -> Vec<IpAddr> {
+            Vec::new()
+        }
+
+        fn local_addresses(&self) -> Vec<IpAddr> {
+            self.0.clone()
+        }
+    }
+
     #[test]
-    fn my_ip_address_is_an_address() {
-        assert!(my_ip_address().parse::<Ipv4Addr>().is_ok());
-        let ex = my_ip_address_ex();
-        assert!(!ex.is_empty());
+    fn my_ip_address_is_the_first_ipv4_address_of_the_machine() {
+        let both = At(vec![
+            "2001:db8::9".parse().unwrap(),
+            "10.9.8.7".parse().unwrap(),
+        ]);
+        assert_eq!(my_ip_address(&both), "10.9.8.7");
+        assert_eq!(my_ip_address_ex(&both), "2001:db8::9;10.9.8.7");
+    }
+
+    #[test]
+    fn without_a_route_the_machine_says_loopback() {
+        let none = At(vec![]);
+        assert_eq!(my_ip_address(&none), "127.0.0.1");
+        assert_eq!(my_ip_address_ex(&none), "127.0.0.1");
+        // An IPv6-only machine has no IPv4 address to give.
+        let v6 = At(vec!["2001:db8::9".parse().unwrap()]);
+        assert_eq!(my_ip_address(&v6), "127.0.0.1");
+    }
+
+    #[test]
+    fn the_system_gives_addresses_or_loopback() {
+        let system =
+            crate::pac::SystemResolver::new(Duration::from_secs(1), Duration::from_secs(1));
+        let ip = my_ip_address(&system);
+        assert!(ip.parse::<Ipv4Addr>().is_ok(), "{ip}");
+        let ex = my_ip_address_ex(&system);
         assert!(
             ex.split(';').all(|part| part.parse::<IpAddr>().is_ok()),
             "{ex}"

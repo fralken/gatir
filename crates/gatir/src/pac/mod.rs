@@ -11,7 +11,7 @@ mod resolver;
 mod route;
 
 pub use engine::{Pac, PacEnv, PacError, PacLimits};
-pub use resolver::{Resolver, SystemResolver};
+pub use resolver::{Resolver, SystemResolver, system_local_addresses};
 pub use route::{Parsed, ProxyAddr, Route, parse};
 
 use std::fs;

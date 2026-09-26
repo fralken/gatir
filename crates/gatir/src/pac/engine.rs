@@ -360,16 +360,18 @@ fn install<'js>(ctx: &Ctx<'js>, env: &PacEnv) -> rquickjs::Result<()> {
             arg(&args, 0).is_some_and(|h| helpers::is_resolvable_ex(&*resolver, &h))
         })?,
     )?;
+    let resolver = env.resolver.clone();
     global.set(
         "myIpAddress",
-        Function::new(ctx.clone(), |_args: Rest<Value<'js>>| {
-            helpers::my_ip_address()
+        Function::new(ctx.clone(), move |_args: Rest<Value<'js>>| {
+            helpers::my_ip_address(&*resolver)
         })?,
     )?;
+    let resolver = env.resolver.clone();
     global.set(
         "myIpAddressEx",
-        Function::new(ctx.clone(), |_args: Rest<Value<'js>>| {
-            helpers::my_ip_address_ex()
+        Function::new(ctx.clone(), move |_args: Rest<Value<'js>>| {
+            helpers::my_ip_address_ex(&*resolver)
         })?,
     )?;
     global.set(

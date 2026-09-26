@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,12 +21,42 @@ const MAX_CACHED: usize = 4096;
 /// How long a failed lookup is remembered, at most.
 const NEGATIVE_TTL: Duration = Duration::from_secs(10);
 
-/// Turns names into addresses.
+/// What a PAC script asks of the network: the addresses of names, and of this
+/// machine.
 pub trait Resolver: Send + Sync + fmt::Debug {
     /// The addresses of `host`, IPv4 ones first. Empty if the name does not
     /// resolve, or the lookup takes too long.
     fn resolve(&self, host: &str) -> Vec<IpAddr>;
+
+    /// The addresses this machine would use to reach the network, IPv4 first.
+    /// Empty if it has no route at all.
+    fn local_addresses(&self) -> Vec<IpAddr> {
+        system_local_addresses()
+    }
 }
+
+/// The address a socket would leave from. Connecting a UDP socket sends
+/// nothing: it only makes the system pick the outgoing interface.
+fn local_address(remote: &str, bind: &str) -> Option<IpAddr> {
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(remote).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
+}
+
+/// The addresses of this machine on its way out. The remote addresses are
+/// reserved for documentation, so nothing is ever sent to them.
+pub fn system_local_addresses() -> Vec<IpAddr> {
+    [
+        local_address("192.0.2.1:9", "0.0.0.0:0"),
+        local_address("[2001:db8::1]:9", "[::]:0"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The address `myIpAddress()` gives when there is no route.
+pub(super) const NO_ROUTE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 type Lookup = dyn Fn(&str) -> Vec<IpAddr> + Send + Sync;
 
