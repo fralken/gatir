@@ -21,12 +21,10 @@ use windows_sys::Win32::Security::Authentication::Identity::{
 };
 use windows_sys::Win32::Security::Credentials::SecHandle;
 
-use super::AuthError;
-use super::negotiate::{
-    SecurityContext, Step, TokenSource, describe_windows_status, windows_service_name,
-};
+use super::{describe_status, service_name};
+use crate::auth::{AuthError, SecurityContext, Step, TokenSource};
 
-pub(super) fn tokens() -> Arc<dyn TokenSource> {
+pub fn tokens() -> Arc<dyn TokenSource> {
     Arc::new(Sspi)
 }
 
@@ -104,14 +102,14 @@ impl Context {
         if status != SEC_E_OK {
             return Err(AuthError::NoTicket {
                 service: service.to_owned(),
-                reason: describe_windows_status(status as u32),
+                reason: describe_status(status as u32),
             });
         }
         Ok(Self {
             credentials,
             context: EMPTY,
             started: false,
-            target: wide(&windows_service_name(service)),
+            target: wide(&service_name(service)),
             service: service.to_owned(),
         })
     }
@@ -213,7 +211,7 @@ impl SecurityContext for Context {
             }
             error if error < 0 => Err(AuthError::NoTicket {
                 service: self.service.clone(),
-                reason: describe_windows_status(error as u32),
+                reason: describe_status(error as u32),
             }),
             other => Err(AuthError::Exchange {
                 service: self.service.clone(),

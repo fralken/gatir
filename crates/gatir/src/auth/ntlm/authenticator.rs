@@ -3,7 +3,7 @@
 //! NTLM authenticates a connection, not a request. The client opens with a
 //! NEGOTIATE message in `Proxy-Authorization`, the proxy answers `407` with a
 //! CHALLENGE in `Proxy-Authenticate`, and the client repeats the request with
-//! an AUTHENTICATE message. [`NtlmAuthenticator`] builds the two header values and
+//! an AUTHENTICATE message. [`Authenticator`] builds the two header values and
 //! reads the challenge; sending the requests is up to the caller.
 
 use base64::Engine;
@@ -12,10 +12,10 @@ use hyper::header::HeaderValue;
 use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
-use super::ntlm::{
+use super::{
     Challenge, Dialect, Entropy, Identity, Key, NtHash, Ntlmv2Hash, authenticate, negotiate,
 };
-use super::{AuthError, offers};
+use crate::auth::{AuthError, offers};
 use crate::config::{Credentials, Secret};
 
 const SCHEME: &str = "NTLM";
@@ -25,7 +25,7 @@ const WORKSTATION_MAX: usize = 15;
 /// Produces the `Proxy-Authorization` values of an NTLM exchange. One
 /// instance serves every connection: it holds no per-connection state.
 #[derive(Debug)]
-pub struct NtlmAuthenticator {
+pub struct Authenticator {
     dialect: Dialect,
     user: String,
     domain: String,
@@ -40,7 +40,7 @@ enum Hash {
     Ntlmv2(Ntlmv2Hash),
 }
 
-impl NtlmAuthenticator {
+impl Authenticator {
     pub fn new(credentials: &Credentials) -> Result<Self, AuthError> {
         let dialect = Dialect::from_method(credentials.method).ok_or(AuthError::NotNtlm)?;
         let mut domain = credentials.domain.clone();
@@ -179,8 +179,8 @@ mod tests {
         }
     }
 
-    fn authenticator() -> NtlmAuthenticator {
-        NtlmAuthenticator::new(&credentials(AuthMethod::Ntlmv2)).unwrap()
+    fn authenticator() -> Authenticator {
+        Authenticator::new(&credentials(AuthMethod::Ntlmv2)).unwrap()
     }
 
     fn fields(values: &[&str]) -> Vec<HeaderValue> {
@@ -333,7 +333,7 @@ mod tests {
         let mut creds = credentials(AuthMethod::Negotiate);
         creds.secret = None;
         assert!(matches!(
-            NtlmAuthenticator::new(&creds),
+            Authenticator::new(&creds),
             Err(AuthError::NotNtlm)
         ));
     }
@@ -352,7 +352,7 @@ mod tests {
         };
         let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
         let from_password = authenticator().respond_with(&challenge, &entropy).unwrap();
-        let from_hash = NtlmAuthenticator::new(&with_hash)
+        let from_hash = Authenticator::new(&with_hash)
             .unwrap()
             .respond_with(&challenge, &entropy)
             .unwrap();
@@ -382,13 +382,13 @@ mod tests {
 
         let mut from_password = alice_with_hash("CORP");
         from_password.secret = Some(Secret::Password(SecretString::from("s3cret")));
-        let expected = NtlmAuthenticator::new(&from_password)
+        let expected = Authenticator::new(&from_password)
             .unwrap()
             .respond_with(&challenge, &entropy)
             .unwrap();
 
         for domain in ["CORP", "corp", "Corp"] {
-            let auth = NtlmAuthenticator::new(&alice_with_hash(domain)).unwrap();
+            let auth = Authenticator::new(&alice_with_hash(domain)).unwrap();
             let got = auth.respond_with(&challenge, &entropy).unwrap();
             assert_eq!(decoded(&got), decoded(&expected), "domain {domain:?}");
         }
@@ -399,7 +399,7 @@ mod tests {
         for method in [AuthMethod::Nt, AuthMethod::Ntlm2sr] {
             let mut creds = alice_with_hash("CORP");
             creds.method = method;
-            let auth = NtlmAuthenticator::new(&creds).unwrap();
+            let auth = Authenticator::new(&creds).unwrap();
             let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
             let error = auth.respond(&challenge).unwrap_err();
             assert!(matches!(error, AuthError::Message(_)), "{error}");

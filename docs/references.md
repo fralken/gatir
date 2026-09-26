@@ -8,9 +8,9 @@ depends on a detail of it.
 | Document | Revision used | Used for | Where |
 |---|---|---|---|
 | [MS-NLMP] NT LAN Manager (NTLM) Authentication Protocol | 37.0 (v20260330) | The NTLM messages, password hashes and challenge responses, and the test vectors | `crates/gatir/src/auth/ntlm/` |
-| RFC 9110, HTTP Semantics | June 2022 | Connection-specific header fields (7.6.1), idempotent methods (9.2.2), authentication to proxies (11.7), conditional requests with `ETag` and `Last-Modified` (13.1), and redirection (15.4) | `proxy/headers.rs`, `proxy/forward.rs`, `auth/negotiate.rs`, `pac/fetch.rs` |
+| RFC 9110, HTTP Semantics | June 2022 | Connection-specific header fields (7.6.1), idempotent methods (9.2.2), authentication to proxies (11.7), conditional requests with `ETag` and `Last-Modified` (13.1), and redirection (15.4) | `proxy/headers.rs`, `proxy/forward.rs`, `auth/negotiate/`, `pac/fetch.rs` |
 | RFC 3986, URI: Generic Syntax | January 2005 | Resolving a `Location` against the address it came from (5.2), including removal of dot segments (5.2.4) | `pac/fetch.rs` |
-| RFC 4559, SPNEGO-based Kerberos and NTLM HTTP Authentication in Microsoft Windows | June 2006 | The `Negotiate` scheme (4), which a proxy applies with `Proxy-Authenticate` and `Proxy-Authorization` | `auth/negotiate.rs` |
+| RFC 4559, SPNEGO-based Kerberos and NTLM HTTP Authentication in Microsoft Windows | June 2006 | The `Negotiate` scheme (4), which a proxy applies with `Proxy-Authenticate` and `Proxy-Authorization` | `auth/negotiate/` |
 | RFC 9112, HTTP/1.1 | June 2022 | Message framing, in particular a request with both `Content-Length` and `Transfer-Encoding` (6.3) | `tests/proxy.rs` |
 | RFC 6585, Additional HTTP Status Codes | April 2012 | `431 Request Header Fields Too Large` (5) | `proxy/server.rs` |
 | RFC 1928, SOCKS Protocol Version 5 | March 1996 | The messages of the server: method selection (3), the request (4) and the reply (6), with the CONNECT command only | `proxy/socks5.rs` |

@@ -2,20 +2,16 @@
 //!
 //! Together with `config`, this is where secrets are handled.
 
-mod negotiate;
+pub mod negotiate;
 pub mod ntlm;
-mod ntlm_authenticator;
 mod offers;
-#[cfg(windows)]
-mod sspi;
 
 use std::sync::Arc;
 
 pub use negotiate::{
-    Diagnosis, NegotiateAuthenticator, Refusal, SecurityContext, Step, TokenSource, challenge,
-    diagnose, header as negotiate_header, refusal, system_tokens,
+    Diagnosis, Refusal, SecurityContext, Step, TokenSource, challenge, diagnose,
+    header as negotiate_header, refusal, system_tokens,
 };
-pub use ntlm_authenticator::NtlmAuthenticator;
 
 use crate::config::{AuthMethod, Credentials};
 use ntlm::MessageError;
@@ -58,16 +54,16 @@ fn offered_list(offered: &[String]) -> String {
 #[derive(Debug)]
 pub enum Authenticator {
     /// A password-derived response to a challenge from the proxy.
-    Ntlm(NtlmAuthenticator),
+    Ntlm(ntlm::Authenticator),
     /// The Kerberos ticket of the logged-in user.
-    Negotiate(NegotiateAuthenticator),
+    Negotiate(negotiate::Authenticator),
 }
 
 impl Authenticator {
     pub fn new(credentials: &Credentials) -> Result<Self, AuthError> {
         match credentials.method {
             AuthMethod::Negotiate => Self::with_tokens(credentials, negotiate::system_tokens()?),
-            _ => Ok(Self::Ntlm(NtlmAuthenticator::new(credentials)?)),
+            _ => Ok(Self::Ntlm(ntlm::Authenticator::new(credentials)?)),
         }
     }
 
@@ -78,11 +74,11 @@ impl Authenticator {
         tokens: Arc<dyn TokenSource>,
     ) -> Result<Self, AuthError> {
         match credentials.method {
-            AuthMethod::Negotiate => Ok(Self::Negotiate(NegotiateAuthenticator::new(
+            AuthMethod::Negotiate => Ok(Self::Negotiate(negotiate::Authenticator::new(
                 credentials,
                 tokens,
             ))),
-            _ => Ok(Self::Ntlm(NtlmAuthenticator::new(credentials)?)),
+            _ => Ok(Self::Ntlm(ntlm::Authenticator::new(credentials)?)),
         }
     }
 }

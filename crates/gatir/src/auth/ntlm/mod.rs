@@ -1,10 +1,13 @@
 //! NTLM, as specified in MS-NLMP: the password hashes, the messages exchanged
-//! with the proxy, and the challenge responses.
+//! with the proxy, and the challenge responses, and the [`Authenticator`] that
+//! puts them in the header fields of the exchange.
 
+mod authenticator;
 mod hash;
 mod message;
 mod response;
 
+pub use authenticator::Authenticator;
 pub use hash::{HASH_LEN, NtHash, Ntlmv2Hash};
 pub use message::{
     Challenge, Dialect, Entropy, Identity, Key, MessageError, authenticate, filetime, flags,
