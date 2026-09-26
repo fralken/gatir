@@ -52,7 +52,7 @@ pub struct OverrideArgs {
     #[arg(short, long, global = true, value_enum)]
     pub method: Option<AuthMethod>,
 
-    /// Ask for the password on the terminal (replaces any password or NT hash from the file)
+    /// Ask for the password on the terminal (replaces any password or hash from the file)
     #[arg(long, global = true)]
     pub password_prompt: bool,
 

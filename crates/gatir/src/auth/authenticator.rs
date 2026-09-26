@@ -13,7 +13,8 @@ use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
 use super::ntlm::{
-    Challenge, Dialect, Entropy, Identity, MessageError, NtHash, authenticate, negotiate,
+    Challenge, Dialect, Entropy, Identity, Key, MessageError, NtHash, Ntlmv2Hash, authenticate,
+    negotiate,
 };
 use crate::config::{Credentials, Secret};
 
@@ -55,32 +56,52 @@ pub struct Authenticator {
     user: String,
     domain: String,
     workstation: String,
-    nt_hash: NtHash,
+    secret: Hash,
+}
+
+/// The hash the responses are computed from.
+#[derive(Debug)]
+enum Hash {
+    Nt(NtHash),
+    Ntlmv2(Ntlmv2Hash),
 }
 
 impl Authenticator {
     pub fn new(credentials: &Credentials) -> Result<Self, AuthError> {
         let dialect = Dialect::from_method(credentials.method).ok_or(AuthError::Unsupported)?;
-        // The plain password is not kept: the NT hash is all NTLM needs.
-        let nt_hash = match &credentials.secret {
-            Some(Secret::Password(password)) => NtHash::from_password(password.expose_secret()),
+        let mut domain = credentials.domain.clone();
+        // The plain password is not kept: the hash is all NTLM needs.
+        let secret = match &credentials.secret {
+            Some(Secret::Password(password)) => {
+                Hash::Nt(NtHash::from_password(password.expose_secret()))
+            }
             Some(Secret::NtHash(hash)) => {
                 let mut bytes = *hash.expose_secret();
                 let nt_hash = NtHash::from_bytes(bytes);
                 bytes.zeroize();
-                nt_hash
+                Hash::Nt(nt_hash)
+            }
+            Some(Secret::Ntlmv2Hash(hash)) => {
+                let mut bytes = *hash.expose_secret();
+                let v2_hash = Ntlmv2Hash::from_bytes(bytes);
+                bytes.zeroize();
+                // Such a hash is made from the upper-cased user and domain,
+                // and the server derives the same key from the domain it is
+                // sent, so the domain must go out in upper case too.
+                domain.make_ascii_uppercase();
+                Hash::Ntlmv2(v2_hash)
             }
             None => return Err(AuthError::NoSecret),
         };
         Ok(Self {
             dialect,
             user: credentials.username.clone(),
-            domain: credentials.domain.clone(),
+            domain,
             workstation: credentials
                 .workstation
                 .clone()
                 .unwrap_or_else(default_workstation),
-            nt_hash,
+            secret,
         })
     }
 
@@ -123,13 +144,11 @@ impl Authenticator {
             .map_err(|err| AuthError::BadChallenge(err.to_string()))?;
         let challenge =
             Challenge::parse(&bytes).map_err(|err| AuthError::BadChallenge(err.to_string()))?;
-        let message = authenticate(
-            self.dialect,
-            &self.identity(),
-            &self.nt_hash,
-            &challenge,
-            entropy,
-        )?;
+        let key = match &self.secret {
+            Hash::Nt(hash) => Key::Nt(hash),
+            Hash::Ntlmv2(hash) => Key::Ntlmv2(hash),
+        };
+        let message = authenticate(self.dialect, &self.identity(), key, &challenge, entropy)?;
         Ok(header(&message))
     }
 }
@@ -411,6 +430,53 @@ mod tests {
             .respond_with(&challenge, &entropy)
             .unwrap();
         assert_eq!(decoded(&from_password), decoded(&from_hash));
+    }
+
+    /// The NTLMv2 hash of alice / s3cret in the domain CORP, as another NTLM
+    /// implementation prints it for "corp": it upper-cases the domain.
+    const ALICE_HASH: &str = "dd4ee4752f859325fa0813cbfb374400";
+
+    fn alice_with_hash(domain: &str) -> Credentials {
+        let mut creds = credentials(AuthMethod::Ntlmv2);
+        creds.username = "alice".to_owned();
+        creds.domain = domain.to_owned();
+        let bytes: [u8; 16] = hex::decode(ALICE_HASH).unwrap().try_into().unwrap();
+        creds.secret = Some(Secret::Ntlmv2Hash(secrecy::SecretBox::new(Box::new(bytes))));
+        creds
+    }
+
+    #[test]
+    fn an_ntlmv2_hash_gives_the_response_the_password_gives() {
+        let entropy = Entropy {
+            client_nonce: [7; 8],
+            time: 0,
+        };
+        let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
+
+        let mut from_password = alice_with_hash("CORP");
+        from_password.secret = Some(Secret::Password(SecretString::from("s3cret")));
+        let expected = Authenticator::new(&from_password)
+            .unwrap()
+            .respond_with(&challenge, &entropy)
+            .unwrap();
+
+        for domain in ["CORP", "corp", "Corp"] {
+            let auth = Authenticator::new(&alice_with_hash(domain)).unwrap();
+            let got = auth.respond_with(&challenge, &entropy).unwrap();
+            assert_eq!(decoded(&got), decoded(&expected), "domain {domain:?}");
+        }
+    }
+
+    #[test]
+    fn an_ntlmv2_hash_cannot_answer_the_older_dialects() {
+        for method in [AuthMethod::Nt, AuthMethod::Ntlm2sr] {
+            let mut creds = alice_with_hash("CORP");
+            creds.method = method;
+            let auth = Authenticator::new(&creds).unwrap();
+            let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
+            let error = auth.respond(&challenge).unwrap_err();
+            assert!(matches!(error, AuthError::Message(_)), "{error}");
+        }
     }
 
     #[test]

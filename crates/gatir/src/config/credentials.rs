@@ -49,6 +49,10 @@ pub enum Secret {
     /// NT hash. Together with the username and domain it is enough to derive
     /// every NTLM response, so the plain password need not be stored.
     NtHash(SecretBox<[u8; NT_HASH_LEN]>),
+    /// NTLMv2 hash of one user and domain: HMAC-MD5, keyed with the NT hash,
+    /// of the upper-cased user name and domain. It is all NTLMv2 needs, but it
+    /// cannot be used for the older methods.
+    Ntlmv2Hash(SecretBox<[u8; NT_HASH_LEN]>),
 }
 
 impl Secret {
@@ -57,6 +61,7 @@ impl Secret {
         match self {
             Self::Password(_) => "password",
             Self::NtHash(_) => "nt_hash",
+            Self::Ntlmv2Hash(_) => "ntlmv2_hash",
         }
     }
 }
@@ -83,6 +88,8 @@ pub(super) struct RawCredentials {
     pub password: Option<SecretString>,
     #[serde(default, deserialize_with = "secret_string")]
     pub nt_hash: Option<SecretString>,
+    #[serde(default, deserialize_with = "secret_string")]
+    pub ntlmv2_hash: Option<SecretString>,
 }
 
 impl RawCredentials {
@@ -91,13 +98,9 @@ impl RawCredentials {
         let username = self.username.unwrap_or_default();
         let domain = self.domain.unwrap_or_default();
 
-        let secret = match (self.password, self.nt_hash) {
-            (Some(_), Some(_)) => {
-                return Err(ConfigError::invalid(
-                    "credentials.password and credentials.nt_hash are mutually exclusive",
-                ));
-            }
-            (Some(password), None) => {
+        let secret = match (self.password, self.nt_hash, self.ntlmv2_hash) {
+            (None, None, None) => None,
+            (Some(password), None, None) => {
                 if password.expose_secret().is_empty() {
                     return Err(ConfigError::invalid(
                         "credentials.password must not be empty",
@@ -105,15 +108,22 @@ impl RawCredentials {
                 }
                 Some(Secret::Password(password))
             }
-            (None, Some(hash)) => Some(Secret::NtHash(parse_nt_hash(&hash)?)),
-            (None, None) => None,
+            (None, Some(hash), None) => Some(Secret::NtHash(parse_hash("nt_hash", &hash)?)),
+            (None, None, Some(hash)) => Some(Secret::Ntlmv2Hash(parse_hash("ntlmv2_hash", &hash)?)),
+            _ => {
+                return Err(ConfigError::invalid(
+                    "credentials.password, credentials.nt_hash and credentials.ntlmv2_hash \
+                     are mutually exclusive",
+                ));
+            }
         };
 
         if method == AuthMethod::Negotiate {
             if secret.is_some() {
                 return Err(ConfigError::invalid(
                     "credentials.method = \"negotiate\" uses the logged-in identity; \
-                     remove credentials.password / credentials.nt_hash",
+                     remove credentials.password, credentials.nt_hash and \
+                     credentials.ntlmv2_hash",
                 ));
             }
         } else {
@@ -124,8 +134,20 @@ impl RawCredentials {
                 )));
             }
             if secret.is_none() {
+                let choices = if method == AuthMethod::Ntlmv2 {
+                    "credentials.password, credentials.nt_hash or credentials.ntlmv2_hash"
+                } else {
+                    "credentials.password or credentials.nt_hash"
+                };
                 return Err(ConfigError::invalid(format!(
-                    "credentials.password or credentials.nt_hash is required for method \"{}\"",
+                    "{choices} is required for method \"{}\"",
+                    method.as_str()
+                )));
+            }
+            if matches!(secret, Some(Secret::Ntlmv2Hash(_))) && method != AuthMethod::Ntlmv2 {
+                return Err(ConfigError::invalid(format!(
+                    "credentials.ntlmv2_hash can only be used with method \"ntlmv2\", \
+                     not \"{}\"; use credentials.password or credentials.nt_hash",
                     method.as_str()
                 )));
             }
@@ -141,14 +163,19 @@ impl RawCredentials {
     }
 }
 
-fn parse_nt_hash(hex_hash: &SecretString) -> Result<SecretBox<[u8; NT_HASH_LEN]>, ConfigError> {
+/// Reads a 16-byte hash written as 32 hexadecimal characters. `name` is the
+/// key it came from, for the error message.
+fn parse_hash(
+    name: &str,
+    hex_hash: &SecretString,
+) -> Result<SecretBox<[u8; NT_HASH_LEN]>, ConfigError> {
     let mut bytes = [0u8; NT_HASH_LEN];
     let decoded = hex::decode_to_slice(hex_hash.expose_secret(), &mut bytes);
     let result = match decoded {
         Ok(()) => Ok(SecretBox::new(Box::new(bytes))),
-        Err(_) => Err(ConfigError::invalid(
-            "credentials.nt_hash must be exactly 32 hexadecimal characters",
-        )),
+        Err(_) => Err(ConfigError::invalid(format!(
+            "credentials.{name} must be exactly 32 hexadecimal characters"
+        ))),
     };
     bytes.zeroize();
     result

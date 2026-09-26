@@ -126,7 +126,7 @@ pub struct Overrides {
     pub username: Option<String>,
     pub domain: Option<String>,
     pub method: Option<AuthMethod>,
-    /// A password supplied interactively. Replaces any password or NT hash
+    /// A password supplied interactively. Replaces any password or hash
     /// from the config file.
     pub password: Option<SecretString>,
     pub log_level: Option<LogLevel>,
@@ -362,6 +362,7 @@ impl RawConfig {
             if let Some(password) = overrides.password {
                 raw.password = Some(password);
                 raw.nt_hash = None;
+                raw.ntlmv2_hash = None;
             }
         }
         let credentials = credentials.map(RawCredentials::validate).transpose()?;
@@ -500,6 +501,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_an_ntlmv2_hash() {
+        let hash = "dd4ee4752f859325fa0813cbfb374400";
+        let config = load(&format!(
+            "[credentials]\nusername = \"a\"\nntlmv2_hash = \"{hash}\""
+        ))
+        .unwrap();
+        let creds = config.credentials.unwrap();
+        assert_eq!(creds.method, AuthMethod::Ntlmv2);
+        match creds.secret {
+            Some(Secret::Ntlmv2Hash(bytes)) => {
+                assert_eq!(hex::encode(bytes.expose_secret()), hash);
+            }
+            other => panic!("unexpected secret: {other:?}"),
+        }
+    }
+
+    #[test]
     fn negotiate_needs_no_secret() {
         let config = load("[credentials]\nmethod = \"negotiate\"").unwrap();
         let creds = config.credentials.unwrap();
@@ -540,7 +558,23 @@ mod tests {
             ("[credentials]\npassword = \"p\"", "username is required"),
             (
                 "[credentials]\nusername = \"a\"",
-                "password or credentials.nt_hash is required",
+                "credentials.password, credentials.nt_hash or credentials.ntlmv2_hash is required",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nmethod = \"nt\"",
+                "credentials.password or credentials.nt_hash is required",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nnt_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"\nntlmv2_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"",
+                "mutually exclusive",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nntlmv2_hash = \"abcd\"",
+                "credentials.ntlmv2_hash must be exactly 32 hexadecimal",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nmethod = \"nt\"\nntlmv2_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"",
+                "can only be used with method \"ntlmv2\"",
             ),
             (
                 "[credentials]\nusername = \"a\"\npassword = \"p\"\nnt_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"",
@@ -604,17 +638,20 @@ mod tests {
 
     #[test]
     fn a_prompted_password_replaces_a_file_hash() {
-        let toml =
-            "[credentials]\nusername = \"a\"\nnt_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"";
-        let overrides = Overrides {
-            password: Some(SecretString::from("prompted".to_owned())),
-            ..Overrides::default()
-        };
-        let creds = Config::from_toml_str(toml, overrides)
-            .unwrap()
-            .credentials
-            .unwrap();
-        assert_eq!(creds.secret.unwrap().kind(), "password");
+        for key in ["nt_hash", "ntlmv2_hash"] {
+            let toml = format!(
+                "[credentials]\nusername = \"a\"\n{key} = \"8846f7eaee8fb117ad06bdd830b7586c\""
+            );
+            let overrides = Overrides {
+                password: Some(SecretString::from("prompted".to_owned())),
+                ..Overrides::default()
+            };
+            let creds = Config::from_toml_str(&toml, overrides)
+                .unwrap()
+                .credentials
+                .unwrap();
+            assert_eq!(creds.secret.unwrap().kind(), "password", "{key}");
+        }
     }
 
     #[test]
@@ -638,6 +675,7 @@ mod tests {
         for toml in [
             FULL.to_owned(),
             format!("[credentials]\nusername = \"a\"\nnt_hash = \"{hash}\""),
+            format!("[credentials]\nusername = \"a\"\nntlmv2_hash = \"{hash}\""),
         ] {
             let config = load(&toml).unwrap();
             for text in [format!("{config:?}"), config.summary()] {
@@ -656,6 +694,7 @@ mod tests {
             "[credentials]\nusername = \"a\"\npassword = true",
             // invalid hash value
             "[credentials]\nusername = \"a\"\nnt_hash = \"not-a-hash-topsecret\"",
+            "[credentials]\nusername = \"a\"\nntlmv2_hash = \"not-a-hash-topsecret\"",
             // syntax error on the very line that holds the secret
             "[credentials]\nusername = \"a\"\npassword = \"topsecret\" garbage",
         ];

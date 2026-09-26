@@ -62,6 +62,8 @@ pub enum MessageError {
     BadField,
     #[error("an NTLM message field is too large")]
     TooLarge,
+    #[error("only NTLMv2 can be answered with an NTLMv2 hash: the other dialects need the NT hash")]
+    NtHashRequired,
 }
 
 /// A CHALLENGE message (type 2), as sent by the server.
@@ -219,25 +221,54 @@ pub fn negotiate(dialect: Dialect, identity: &Identity<'_>) -> Result<Vec<u8>, M
     Ok(message)
 }
 
+/// What a response is computed from.
+#[derive(Debug, Clone, Copy)]
+pub enum Key<'a> {
+    /// The NT hash of the password, enough for every dialect.
+    Nt(&'a NtHash),
+    /// The NTLMv2 hash of a user and domain, enough for NTLMv2 only. The
+    /// domain sent in the message must be the one the hash was made with.
+    Ntlmv2(&'a Ntlmv2Hash),
+}
+
+impl<'a> From<&'a NtHash> for Key<'a> {
+    fn from(hash: &'a NtHash) -> Self {
+        Self::Nt(hash)
+    }
+}
+
+impl<'a> From<&'a Ntlmv2Hash> for Key<'a> {
+    fn from(hash: &'a Ntlmv2Hash) -> Self {
+        Self::Ntlmv2(hash)
+    }
+}
+
 /// Builds the AUTHENTICATE message (type 3) answering `challenge`.
-pub fn authenticate(
+pub fn authenticate<'a>(
     dialect: Dialect,
     identity: &Identity<'_>,
-    nt_hash: &NtHash,
+    key: impl Into<Key<'a>>,
     challenge: &Challenge,
     entropy: &Entropy,
 ) -> Result<Vec<u8>, MessageError> {
     let mut negotiated = challenge.flags & flags::AGREED;
     let server_challenge = &challenge.server_challenge;
 
-    let (lm, nt): (Vec<u8>, Vec<u8>) = match dialect {
-        Dialect::V2 => {
-            let key = Ntlmv2Hash::new(nt_hash, identity.user, identity.domain);
+    let (lm, nt): (Vec<u8>, Vec<u8>) = match (dialect, key.into()) {
+        (Dialect::V2, key) => {
+            let derived;
+            let v2_hash = match key {
+                Key::Ntlmv2(hash) => hash,
+                Key::Nt(nt_hash) => {
+                    derived = Ntlmv2Hash::new(nt_hash, identity.user, identity.domain);
+                    &derived
+                }
+            };
             // Use the server's clock when it gave one, so a skewed local
             // clock cannot make the response look stale.
             let time = challenge.timestamp().unwrap_or(entropy.time);
             let responses = ntlmv2_responses(
-                &key,
+                v2_hash,
                 server_challenge,
                 &entropy.client_nonce,
                 &challenge.target_info,
@@ -245,12 +276,15 @@ pub fn authenticate(
             );
             (responses.lm.to_vec(), responses.nt)
         }
-        Dialect::V1Extended if negotiated & flags::EXTENDED_SESSION_SECURITY != 0 => {
+        (_, Key::Ntlmv2(_)) => return Err(MessageError::NtHashRequired),
+        (Dialect::V1Extended, Key::Nt(nt_hash))
+            if negotiated & flags::EXTENDED_SESSION_SECURITY != 0 =>
+        {
             let responses =
                 ntlm2_session_responses(nt_hash, server_challenge, &entropy.client_nonce);
             (responses.lm.to_vec(), responses.nt.to_vec())
         }
-        Dialect::V1Extended | Dialect::V1 => {
+        (Dialect::V1Extended | Dialect::V1, Key::Nt(nt_hash)) => {
             // The flag tells the server how to read the response, so it must
             // not claim extended session security for a plain NTLMv1 one.
             negotiated &= !flags::EXTENDED_SESSION_SECURITY;

@@ -96,6 +96,12 @@ impl Ntlmv2Hash {
         hash
     }
 
+    /// A hash computed elsewhere: the value some NTLM proxies print as
+    /// `PassNTLMv2`. It is tied to one user and one domain.
+    pub fn from_bytes(bytes: [u8; HASH_LEN]) -> Self {
+        Self(Hash::new(bytes))
+    }
+
     pub fn expose(&self) -> &[u8; HASH_LEN] {
         self.0.expose()
     }
@@ -143,6 +149,17 @@ mod tests {
         let nt = NtHash::from_password("Password");
         let v2 = Ntlmv2Hash::new(&nt, "User", "Domain");
         assert_eq!(hex_of(v2.expose()), "0c868a403bfd7a93a3001ef22ef02e3f");
+    }
+
+    #[test]
+    fn hashes_match_those_printed_by_another_implementation() {
+        // The synthetic account alice / s3cret in the domain CORP. The other
+        // implementation upper-cases the domain before hashing, so its output
+        // for "corp" is the same as this one for "CORP".
+        let nt = NtHash::from_password("s3cret");
+        assert_eq!(nt.to_hex(), "d4c619cb16d4632b275658316a7e657e");
+        let v2 = Ntlmv2Hash::new(&nt, "alice", "CORP");
+        assert_eq!(hex_of(v2.expose()), "dd4ee4752f859325fa0813cbfb374400");
     }
 
     #[test]

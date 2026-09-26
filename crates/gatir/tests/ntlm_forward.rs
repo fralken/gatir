@@ -484,3 +484,22 @@ async fn destinations_reached_directly_get_no_credentials() {
     assert!(!origin.requests()[0].headers.contains("proxy-authorization"));
     assert!(parent.requests().is_empty());
 }
+
+#[tokio::test]
+async fn an_ntlmv2_hash_from_another_implementation_authenticates() {
+    // The hash of alice / s3cret in the domain "corp", as printed by another
+    // NTLM implementation, which upper-cases the domain before hashing. The
+    // domain must therefore go out as CORP, which is what the mock expects.
+    let parent = parent_with(Options::default()).await;
+    let proxy = start_proxy(&format!(
+        "parents = [\"{}\"]\n\
+         [credentials]\nusername = \"alice\"\ndomain = \"corp\"\n\
+         ntlmv2_hash = \"dd4ee4752f859325fa0813cbfb374400\"\n",
+        parent.addr()
+    ))
+    .await;
+
+    let response = ask(&proxy, get("origin.example.com", "/", "")).await;
+    assert_eq!(response.status, 200, "{}", response.body_text());
+    assert_eq!(parent.messages(3), 1);
+}
