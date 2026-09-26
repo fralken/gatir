@@ -6,6 +6,7 @@
 mod addr;
 mod credentials;
 mod headers;
+mod location;
 mod socks5;
 mod tunnel;
 
@@ -26,6 +27,7 @@ pub use addr::{HostPort, HostPortError};
 pub use credentials::{AuthMethod, Credentials, NT_HASH_LEN, Secret};
 use credentials::{RawCredentials, SecretValue};
 pub use headers::HeaderRule;
+pub use location::{default_path, exposure};
 pub use socks5::{Socks5, Socks5Credentials};
 pub use tunnel::{Tunnel, TunnelError};
 
@@ -447,6 +449,19 @@ impl Config {
     }
 
     /// A multi-line description that never includes secret values.
+    /// Whether the configuration holds something a stranger must not read: a
+    /// password or hash, the password of the SOCKS5 server, or a header value.
+    pub fn holds_secrets(&self) -> bool {
+        self.credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.secret.is_some())
+            || self
+                .socks5
+                .as_ref()
+                .is_some_and(|socks5| socks5.credentials.is_some())
+            || !self.request_headers.is_empty()
+    }
+
     pub fn summary(&self) -> String {
         let listen = join(self.listen.iter());
         let parents = match (&self.pac, self.parents.is_empty()) {

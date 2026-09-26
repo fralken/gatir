@@ -4,8 +4,14 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::NamedTempFile;
 
+/// A gatir that finds no configuration file of the machine it runs on.
 fn gatir() -> Command {
-    Command::cargo_bin("gatir").unwrap()
+    let mut command = Command::cargo_bin("gatir").unwrap();
+    command
+        .env("HOME", "/nonexistent/gatir-test-home")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("NO_COLOR");
+    command
 }
 
 fn config_file(contents: &str) -> NamedTempFile {
@@ -337,4 +343,111 @@ fn config_check_reports_the_socks5_server_without_its_password() {
             predicate::str::contains("127.0.0.1:2080")
                 .and(predicate::str::contains("127.0.0.1:1080").not()),
         );
+}
+
+#[test]
+fn the_configuration_file_is_looked_for_where_a_user_keeps_it() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("gatir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(
+        dir.join("gatir.toml"),
+        "parents = [\"found.example.com:3128\"]\n",
+    )
+    .unwrap();
+
+    gatir()
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("found.example.com:3128")
+                .and(predicate::str::contains("gatir.toml")),
+        );
+
+    // Under the home directory, when there is no XDG setting.
+    let config_dir = home.path().join(".config");
+    std::fs::create_dir(&config_dir).unwrap();
+    std::fs::rename(&dir, config_dir.join("gatir")).unwrap();
+    gatir()
+        .env("HOME", home.path())
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("found.example.com:3128"));
+
+    // A file named on the command line wins over the one that would be found.
+    let named = config_file("parents = [\"named.example.com:3128\"]\n");
+    gatir()
+        .env("HOME", home.path())
+        .args(["config", "check", "--config"])
+        .arg(named.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("named.example.com:3128")
+                .and(predicate::str::contains("found.example.com").not()),
+        );
+
+    // With nothing anywhere, the defaults, and it is said so.
+    gatir()
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("none (built-in defaults)"));
+}
+
+#[test]
+fn a_log_that_is_not_a_terminal_has_no_colors() {
+    let file = config_file(VALID);
+    let output = gatir()
+        .args(["config", "check", "--log-level", "trace", "--config"])
+        .arg(file.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("configuration file"), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_configuration_file_that_others_can_read_or_change_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let with_mode = |contents: &str, mode: u32| {
+        let file = config_file(contents);
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        file
+    };
+    let stderr_of = |file: &NamedTempFile| {
+        let output = gatir()
+            .args(["config", "check", "--config"])
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let secret = "[credentials]\nusername = \"alice\"\npassword = \"hush-config-pw\"\n";
+
+    let readable = stderr_of(&with_mode(secret, 0o644));
+    assert!(
+        readable.contains("holds secrets and can be read by other users"),
+        "{readable}"
+    );
+    assert!(readable.contains("chmod 600"), "{readable}");
+    assert!(!readable.contains("hush-config-pw"), "{readable}");
+
+    assert!(!stderr_of(&with_mode(secret, 0o600)).contains("other users"));
+    // Nothing secret: only a file others can change is a problem.
+    assert!(
+        !stderr_of(&with_mode("parents = [\"p.example.com:1\"]\n", 0o644)).contains("other users")
+    );
+    let writable = stderr_of(&with_mode("parents = [\"p.example.com:1\"]\n", 0o666));
+    assert!(
+        writable.contains("can be changed by other users"),
+        "{writable}"
+    );
 }

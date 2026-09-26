@@ -121,7 +121,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Hash(args) => hash_password(&args),
         Command::Run => {
-            let config = load_config(cli.config.as_deref(), cli.overrides)?;
+            let (config, _file) = load_config(cli.config.as_deref(), cli.overrides)?;
             if config.parents.is_empty() && config.pac.is_none() && config.credentials.is_some() {
                 tracing::warn!(
                     "credentials are configured, but there is no parent proxy to authenticate to"
@@ -135,26 +135,48 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Config(ConfigCommand::Check) => {
-            let config = load_config(cli.config.as_deref(), cli.overrides)?;
+            let (config, file) = load_config(cli.config.as_deref(), cli.overrides)?;
             println!("configuration OK");
+            match &file {
+                Some(file) => println!("file:        {}", file.display()),
+                None => println!("file:        none (built-in defaults)"),
+            }
             println!("{}", config.summary());
             Ok(())
         }
     }
 }
 
-/// Reads the configuration, applies the command-line overrides and starts logging.
-fn load_config(path: Option<&std::path::Path>, overrides: OverrideArgs) -> anyhow::Result<Config> {
+/// Reads the configuration, applies the command-line overrides and starts
+/// logging. The file is the one named, or else the first that is found in the
+/// usual places; `None` if there is none, and the defaults apply.
+fn load_config(
+    path: Option<&std::path::Path>,
+    overrides: OverrideArgs,
+) -> anyhow::Result<(Config, Option<PathBuf>)> {
     let password = if overrides.password_prompt {
         Some(prompt_password()?)
     } else {
         None
     };
-    let config = Config::load(path, overrides.into_overrides(password))?;
+    let file = path.map(PathBuf::from).or_else(crate::config::default_path);
+    let config = Config::load(file.as_deref(), overrides.into_overrides(password))?;
 
     logging::init(config.log_level);
+    match &file {
+        Some(file) => {
+            tracing::info!(file = %file.display(), "configuration file");
+            if let Some(problem) = crate::config::exposure(file, config.holds_secrets()) {
+                tracing::warn!(
+                    file = %file.display(),
+                    "the configuration file {problem}: restrict it to its owner (chmod 600)"
+                );
+            }
+        }
+        None => tracing::info!("no configuration file: using the built-in defaults"),
+    }
     tracing::debug!(?config, "configuration loaded");
-    Ok(config)
+    Ok((config, file))
 }
 
 /// Prints the `nt_hash` line to paste into the configuration. Only that line
