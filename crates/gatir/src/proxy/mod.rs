@@ -4,7 +4,7 @@ mod body;
 mod failure;
 mod forward;
 mod headers;
-mod parent_auth;
+mod parent;
 mod pool;
 mod portfwd;
 mod server;

@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 
 use super::body::Body;
 use super::failure::{ConnectError, Failure, ParentAttempt, connect_failure, try_connect};
-use super::parent_auth::ParentAuth;
+use super::parent::ParentAuth;
 use super::pool::{Pool, PoolKey};
 use crate::config::HostPort;
 use crate::noproxy::NoProxy;

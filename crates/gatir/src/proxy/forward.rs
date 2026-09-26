@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent_auth::{Admission, Begun, Outcome, ParentAuth, reusable};
+use super::parent::{Admission, Begun, Outcome, ParentAuth, reusable};
 use super::pool::{Lease, Pool};
 use super::server::{Context, Live};
 use super::upstream::{Hop, Opened};

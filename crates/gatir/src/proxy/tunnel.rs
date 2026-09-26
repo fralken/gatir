@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::body::{Body, answer_within, full};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent_auth::{Begun, Outcome};
+use super::parent::{Begun, Outcome};
 use super::server::{Context, Live};
 use super::upstream::Hop;
 

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::body::error_response;
-use super::parent_auth::ParentAuth;
+use super::parent::ParentAuth;
 use super::pool::Pool;
 use super::portfwd;
 use super::socks5;

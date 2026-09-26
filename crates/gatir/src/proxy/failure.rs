@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::body::{Body, error_response};
-use super::parent_auth::COOLDOWN;
+use super::parent::COOLDOWN;
 use crate::auth::AuthError;
 use crate::pac::PacError;
 
