@@ -51,11 +51,12 @@ setting in the file.
 |---|---|
 | Linux | Supported, on glibc 2.35 or later (Debian 12, Ubuntu 22.04, Fedora 36). Needs OpenSSL 3 (`libssl3`) and the Kerberos library (`libgssapi-krb5-2`): the packages install them, with the archive you do, and without them gatir does not start, even if you use NTLM only. |
 | macOS | Supported, on Apple silicon and Intel. Kerberos uses the system's. |
-| Windows | Builds, but has not been tried yet. Negotiate through SSPI is not written: use NTLM. |
+| Windows | Builds. NTLM with a password or a hash works in the same way; Negotiate through SSPI (single sign-on with the logged-on user) is written and has not yet been run on a Windows computer. |
 
 ## Documentation
 
 - [Configuration](docs/configuration.md): where the file is, who may read it, reloading.
+- [Authentication](docs/authentication.md): NTLM, Negotiate (Kerberos, and SSPI on Windows), and how to find out why one fails.
 - [PAC scripts](docs/pac.md), [ports forwarded through the proxy](docs/tunnels.md),
   [the SOCKS5 server](docs/socks5.md).
 - [Making a release](docs/release.md), and [the specifications gatir follows](docs/references.md).
