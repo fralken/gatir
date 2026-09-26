@@ -177,15 +177,13 @@ pub(super) async fn try_connect(address: &str, limit: Duration) -> Result<TcpStr
     Ok(stream)
 }
 
-/// Like [`try_connect`], reporting a failure as an error page for the client.
-pub(super) async fn connect_tcp(address: &str, limit: Duration) -> Result<TcpStream, Failure> {
-    try_connect(address, limit)
-        .await
-        .map_err(|error| match error {
-            ConnectError::Timeout => Failure::ConnectTimeout(address.to_owned()),
-            ConnectError::Io(source) => Failure::Connect {
-                address: address.to_owned(),
-                source,
-            },
-        })
+/// A failure to connect to `address`, as something to tell the client.
+pub(super) fn connect_failure(address: &str, error: ConnectError) -> Failure {
+    match error {
+        ConnectError::Timeout => Failure::ConnectTimeout(address.to_owned()),
+        ConnectError::Io(source) => Failure::Connect {
+            address: address.to_owned(),
+            source,
+        },
+    }
 }

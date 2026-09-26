@@ -13,12 +13,12 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 use super::body::{Body, Sent, full, response_within, watch};
-use super::failure::{Failure, connect_tcp};
+use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent_auth::{Admission, Outcome, ParentAuth, reusable};
-use super::pool::{Lease, PoolKey};
+use super::pool::Lease;
 use super::server::Context;
-use super::upstream::Route;
+use super::upstream::{Hop, Opened};
 use crate::config::HeaderRule;
 
 pub(super) async fn handle(
@@ -54,11 +54,11 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     apply_rules(&mut parts.headers, &context.request_headers);
     parts.headers.insert(HOST, target.host_header.clone());
 
-    let route = context.upstreams.route(&target.host);
+    let mut lease = acquire(context, context.upstreams.hops(&target.host), &target).await?;
     // A proxy is addressed with the full URL, so it knows the destination.
-    let uri = match route {
-        Route::Direct => target.origin_form.clone(),
-        Route::Parent => target.absolute.clone(),
+    let uri = match lease.hop {
+        Hop::Direct => target.origin_form.clone(),
+        Hop::Parent(_) => target.absolute.clone(),
     };
 
     // A request that never had a body can be built again: to send it after a
@@ -76,10 +76,6 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     // The wait for a response is timed from the moment the request is sent.
     let (body, mut sent) = watch(body.boxed_unsync());
     let limit = context.timeouts.response;
-    let who = match route {
-        Route::Direct => "the upstream server",
-        Route::Parent => "the parent proxy",
-    };
 
     let mut request = Request::new(body);
     *request.method_mut() = parts.method.clone();
@@ -90,7 +86,6 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     // and client builders), which some proxies and firewalls are picky about.
     *request.extensions_mut() = parts.extensions;
 
-    let mut lease = acquire(context, route, &target).await?;
     // Set once a proof has been sent on `lease`, until the parent has said
     // whether it accepts it.
     let mut admission: Option<Admission<'_>> = None;
@@ -123,8 +118,8 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
 
         let attempt = response_within(limit, &mut sent, lease.sender.try_send_request(request));
         let mut failed = match attempt.await {
-            None => return Err(Failure::ResponseTimeout(who)),
-            Some(Ok(response)) if demands_authentication(&response, route, context) => {
+            None => return Err(Failure::ResponseTimeout(lease.hop.who())),
+            Some(Ok(response)) if demands_authentication(&response, &lease.hop, context) => {
                 if let Some(proof) = admission.take() {
                     return Err(proof.refused(response.headers()));
                 }
@@ -137,7 +132,8 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 lapsed = true;
                 request = head.request();
                 sent = Sent::already();
-                lease = connect(context, route, &target).await?;
+                let hop = lease.hop.clone();
+                lease = connect(context, &hop, &target).await?;
                 continue;
             }
             Some(Ok(response)) => {
@@ -165,10 +161,11 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             }
             (None, None) => return Err(Failure::Upstream(error)),
         };
-        lease = connect(context, route, &target).await?;
+        let hop = lease.hop.clone();
+        lease = connect(context, &hop, &target).await?;
     };
 
-    if route == Route::Parent
+    if lease.hop.is_parent()
         && context.auth.is_none()
         && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
     {
@@ -188,8 +185,8 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
 
 /// Whether the parent is asking for authentication, and has been given the
 /// means to provide it.
-fn demands_authentication(response: &Response<Incoming>, route: Route, context: &Context) -> bool {
-    route == Route::Parent
+fn demands_authentication(response: &Response<Incoming>, hop: &Hop, context: &Context) -> bool {
+    hop.is_parent()
         && context.auth.is_some()
         && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
 }
@@ -224,14 +221,12 @@ async fn authenticate<'a>(
     let limit = context.timeouts.response;
     if auth.is_direct() {
         // No challenge to wait for: the request carries the proof itself.
-        let PoolKey::Parent(parent) = lease.key else {
+        let Hop::Parent(parent) = &lease.hop else {
             return Err(Failure::Parent(
                 "a connection to an origin server was asked to authenticate as a parent",
             ));
         };
-        let proof = auth
-            .direct_proof(context.upstreams.parent_host(parent), limit)
-            .await?;
+        let proof = auth.direct_proof(&parent.host, limit).await?;
         request
             .headers_mut()
             .insert(PROXY_AUTHORIZATION, proof.header);
@@ -256,7 +251,8 @@ async fn authenticate<'a>(
             // cannot be read to the end, the connection is of no further use.
             let (_, body) = response.into_parts();
             if !reusable(body, &mut lease.sender, limit).await {
-                *lease = connect(context, Route::Parent, target).await?;
+                let hop = lease.hop.clone();
+                *lease = connect(context, &hop, target).await?;
                 lease.needs_auth = false;
             }
             Ok(Authenticated::Ready)
@@ -276,45 +272,56 @@ fn probe(target: &Target, rules: &[HeaderRule]) -> Request<Body> {
     request
 }
 
-/// A pooled connection if there is one for the destination, else a new one.
-async fn acquire(context: &Context, route: Route, target: &Target) -> Result<Lease, Failure> {
-    let key = match route {
-        Route::Direct => PoolKey::Origin(target.address.clone()),
-        Route::Parent => PoolKey::Parent(context.upstreams.current_parent()),
-    };
-    match context.pool.take(&key).await {
-        Some(sender) => Ok(Lease {
+/// Opens a connection through the first of `hops` that answers: a pooled one if
+/// there is one for a hop, else a new one.
+async fn acquire(context: &Context, hops: Vec<Hop>, target: &Target) -> Result<Lease, Failure> {
+    let opened = context
+        .upstreams
+        .open(
+            hops,
+            &target.address,
+            context.timeouts.connect,
+            context.auth.as_ref(),
+            Some(&context.pool),
+        )
+        .await?;
+    match opened {
+        Opened::Reused(hop, sender) => Ok(Lease {
             sender,
-            key,
+            key: hop.pool_key(&target.address),
+            hop,
             reused: true,
             needs_auth: false,
         }),
-        None => connect(context, route, target).await,
+        Opened::New(hop, stream) => new_lease(context, hop, stream, target).await,
     }
 }
 
-/// Opens a new connection to the destination, or to a parent proxy.
-async fn connect(context: &Context, route: Route, target: &Target) -> Result<Lease, Failure> {
-    let limit = context.timeouts.connect;
-    let (stream, key) = match route {
-        Route::Direct => (
-            connect_tcp(&target.address, limit).await?,
-            PoolKey::Origin(target.address.clone()),
-        ),
-        Route::Parent => {
-            // No point opening a connection that could not be authenticated.
-            if let Some(auth) = &context.auth {
-                auth.check()?;
-            }
-            let (index, stream) = context.upstreams.connect_parent(limit).await?;
-            (stream, PoolKey::Parent(index))
-        }
-    };
+/// Opens a new connection through `hop`.
+async fn connect(context: &Context, hop: &Hop, target: &Target) -> Result<Lease, Failure> {
+    // No point opening a connection that could not be authenticated.
+    if let (Hop::Parent(_), Some(auth)) = (hop, &context.auth) {
+        auth.check()?;
+    }
+    let stream = context
+        .upstreams
+        .connect_hop(hop, &target.address, context.timeouts.connect)
+        .await?;
+    new_lease(context, hop.clone(), stream, target).await
+}
+
+async fn new_lease(
+    context: &Context,
+    hop: Hop,
+    stream: TcpStream,
+    target: &Target,
+) -> Result<Lease, Failure> {
     Ok(Lease {
         sender: handshake(stream).await?,
-        key,
+        key: hop.pool_key(&target.address),
+        needs_auth: hop.is_parent() && context.auth.is_some(),
+        hop,
         reused: false,
-        needs_auth: route == Route::Parent && context.auth.is_some(),
     })
 }
 

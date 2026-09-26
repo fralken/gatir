@@ -20,11 +20,11 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use super::body::{Body, answer_within, full};
-use super::failure::{Failure, connect_tcp};
+use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent_auth::Outcome;
 use super::server::Context;
-use super::upstream::Route;
+use super::upstream::Hop;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -64,18 +64,17 @@ async fn open(
     let limit = context.timeouts.connect;
 
     let client_upgrade = hyper::upgrade::on(&mut request);
-    match context.upstreams.route(&host) {
-        Route::Direct => {
-            let upstream = connect_tcp(&address, limit).await?;
-            spawn_tunnel(context, client_upgrade, upstream);
-        }
-        Route::Parent => {
-            // No point opening a connection that could not be authenticated.
-            if let Some(auth) = &context.auth {
-                auth.check()?;
-            }
-            let (parent, stream) = context.upstreams.connect_parent(limit).await?;
-            match connect_through_parent(stream, parent, &address, &mut request, context).await? {
+    let hops = context.upstreams.hops(&host);
+    let (hop, stream) = context
+        .upstreams
+        .connect(hops, &address, limit, context.auth.as_ref())
+        .await?;
+    match hop {
+        Hop::Direct => spawn_tunnel(context, client_upgrade, stream),
+        Hop::Parent(parent) => {
+            match connect_through_parent(stream, &parent.host, &address, &mut request, context)
+                .await?
+            {
                 ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
                 ParentAnswer::Refused(response) => return Ok(response),
             }
@@ -116,7 +115,7 @@ enum ParentAnswer {
 /// The connection then becomes the tunnel, so it is never reused.
 async fn connect_through_parent(
     stream: TcpStream,
-    parent: usize,
+    parent_host: &str,
     address: &str,
     client_request: &mut Request<Incoming>,
     context: &Context,
@@ -169,8 +168,7 @@ async fn connect_through_parent(
             .map_err(Failure::Upstream)?,
         Some(auth) if auth.is_direct() => {
             let admitted = auth.admit().await?;
-            let host = context.upstreams.parent_host(parent);
-            let proof = auth.direct_proof(host, limit).await?;
+            let proof = auth.direct_proof(parent_host, limit).await?;
             admission = Some(admitted.made_for(proof.service));
             answer_within(limit, sender.send_request(connect(Some(proof.header))))
                 .await

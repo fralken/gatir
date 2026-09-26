@@ -1,21 +1,66 @@
-//! Choosing where a request goes: straight to the origin server, or through a
-//! parent proxy.
+//! Choosing where a request goes, and connecting there: straight to the origin
+//! server, or through a parent proxy.
+//!
+//! A request has an ordered list of [`Hop`]s to try. With a fixed list of
+//! parents that is the list of parents, starting from the one that worked last;
+//! either way, the first that answers is used.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
+use hyper::client::conn::http1::SendRequest;
 use tokio::net::TcpStream;
 
-use super::failure::{Failure, ParentAttempt, try_connect};
+use super::body::Body;
+use super::failure::{ConnectError, Failure, ParentAttempt, connect_failure, try_connect};
+use super::parent_auth::ParentAuth;
+use super::pool::{Pool, PoolKey};
 use crate::config::ParentAddr;
 use crate::noproxy::NoProxy;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Route {
+/// How long a parent that could not be reached is left for last.
+const BAD_FOR: Duration = Duration::from_secs(60);
+
+/// One way to reach a destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Hop {
     /// Connect to the destination itself.
     Direct,
     /// Send the request to a parent proxy.
-    Parent,
+    Parent(ParentAddr),
+}
+
+impl Hop {
+    pub(super) fn is_parent(&self) -> bool {
+        matches!(self, Self::Parent(_))
+    }
+
+    /// What connections made through this hop are kept under: `origin` is the
+    /// destination's `host:port`, which only a direct connection is tied to.
+    pub(super) fn pool_key(&self, origin: &str) -> PoolKey {
+        match self {
+            Self::Direct => PoolKey::Origin(origin.to_owned()),
+            Self::Parent(parent) => PoolKey::Parent(parent.to_string()),
+        }
+    }
+
+    /// Who a message about this hop should blame.
+    pub(super) fn who(&self) -> &'static str {
+        match self {
+            Self::Direct => "the upstream server",
+            Self::Parent(_) => "the parent proxy",
+        }
+    }
+}
+
+/// What opening a connection came to.
+pub(super) enum Opened {
+    /// The pool had a connection for this hop.
+    Reused(Hop, SendRequest<Body>),
+    /// A new TCP connection.
+    New(Hop, TcpStream),
 }
 
 pub(super) struct Upstreams {
@@ -24,6 +69,8 @@ pub(super) struct Upstreams {
     /// there, so a healthy parent is kept ("sticky") until it fails.
     current: AtomicUsize,
     no_proxy: NoProxy,
+    /// Parents that could not be reached, and when.
+    unreachable: Mutex<HashMap<String, Instant>>,
 }
 
 impl Upstreams {
@@ -32,58 +79,174 @@ impl Upstreams {
             parents,
             current: AtomicUsize::new(0),
             no_proxy,
+            unreachable: Mutex::new(HashMap::new()),
         }
     }
 
     /// Without parents everything is direct; with parents, only the
     /// destinations listed in `no_proxy` are.
-    pub(super) fn route(&self, host: &str) -> Route {
-        if self.parents.is_empty() || self.no_proxy.matches(host) {
-            Route::Direct
-        } else {
-            Route::Parent
+    pub(super) fn hops(&self, host: &str) -> Vec<Hop> {
+        let count = self.parents.len();
+        if count == 0 || self.no_proxy.matches(host) {
+            return vec![Hop::Direct];
+        }
+        let start = self.current.load(Ordering::Relaxed) % count;
+        (0..count)
+            .map(|offset| Hop::Parent(self.parents[(start + offset) % count].clone()))
+            .collect()
+    }
+
+    fn unreachable(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
+        self.unreachable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The hops with the parents that could not be reached lately moved to the
+    /// end, so a dead proxy does not cost a connection timeout on every request.
+    /// If all of them failed lately, the order is left as it is.
+    fn order(&self, hops: Vec<Hop>) -> Vec<Hop> {
+        let mut unreachable = self.unreachable();
+        unreachable.retain(|_, since| since.elapsed() < BAD_FOR);
+        let (mut good, bad): (Vec<Hop>, Vec<Hop>) = hops.into_iter().partition(|hop| match hop {
+            Hop::Direct => true,
+            Hop::Parent(parent) => !unreachable.contains_key(&parent.to_string()),
+        });
+        good.extend(bad);
+        good
+    }
+
+    fn worked(&self, hop: &Hop) {
+        let Hop::Parent(parent) = hop else { return };
+        self.unreachable().remove(&parent.to_string());
+        if let Some(index) = self.parents.iter().position(|known| known == parent) {
+            self.current.store(index, Ordering::Relaxed);
         }
     }
 
-    /// The host of the parent at `index`, as configured.
-    pub(super) fn parent_host(&self, index: usize) -> &str {
-        &self.parents[index].host
+    fn failed(&self, hop: &Hop) {
+        if let Hop::Parent(parent) = hop {
+            self.unreachable()
+                .insert(parent.to_string(), Instant::now());
+        }
     }
 
-    /// Index of the parent that requests currently start with.
-    pub(super) fn current_parent(&self) -> usize {
-        self.current.load(Ordering::Relaxed) % self.parents.len().max(1)
-    }
-
-    /// Connects to a parent proxy, trying the others in order when it is
-    /// unreachable. The parent that answers becomes the current one; its index
-    /// is returned with the connection.
-    pub(super) async fn connect_parent(
+    /// Opens a TCP connection to the destination `origin` (`host:port`) through
+    /// `hop`.
+    pub(super) async fn connect_hop(
         &self,
+        hop: &Hop,
+        origin: &str,
         limit: Duration,
-    ) -> Result<(usize, TcpStream), Failure> {
-        let count = self.parents.len();
-        let start = self.current.load(Ordering::Relaxed) % count;
-        let mut attempts = Vec::new();
-
-        for offset in 0..count {
-            let index = (start + offset) % count;
-            let address = self.parents[index].to_string();
-            match try_connect(&address, limit).await {
-                Ok(stream) => {
-                    if offset > 0 {
-                        tracing::info!(parent = %address, "switched to another parent proxy");
-                    }
-                    self.current.store(index, Ordering::Relaxed);
-                    return Ok((index, stream));
-                }
-                Err(error) => {
-                    tracing::warn!(parent = %address, %error, "cannot connect to the parent proxy");
-                    attempts.push(ParentAttempt { address, error });
-                }
+    ) -> Result<TcpStream, Failure> {
+        let result = match hop {
+            Hop::Direct => try_connect(origin, limit).await,
+            Hop::Parent(parent) => try_connect(&parent.to_string(), limit).await,
+        };
+        match result {
+            Ok(stream) => {
+                self.worked(hop);
+                Ok(stream)
+            }
+            Err(error) => {
+                tracing::warn!(hop = %hop_name(hop), %error, "cannot connect");
+                self.failed(hop);
+                Err(hop_failure(hop, origin, error))
             }
         }
-        Err(Failure::ParentsUnavailable(attempts))
+    }
+
+    /// Like [`Upstreams::open`], for a connection that is never reused.
+    pub(super) async fn connect(
+        &self,
+        hops: Vec<Hop>,
+        origin: &str,
+        limit: Duration,
+        auth: Option<&ParentAuth>,
+    ) -> Result<(Hop, TcpStream), Failure> {
+        match self.open(hops, origin, limit, auth, None).await? {
+            Opened::New(hop, stream) => Ok((hop, stream)),
+            Opened::Reused(..) => Err(Failure::Parent("a connection was reused with no pool")),
+        }
+    }
+
+    /// Tries the hops in order and returns the first that answers.
+    ///
+    /// `pool` is asked for each hop before a new connection to it is opened.
+    /// `auth` is what the parents need: while it is holding off after
+    /// credentials were refused, a parent is not tried (a pooled connection is
+    /// another matter).
+    pub(super) async fn open(
+        &self,
+        hops: Vec<Hop>,
+        origin: &str,
+        limit: Duration,
+        auth: Option<&ParentAuth>,
+        pool: Option<&Pool>,
+    ) -> Result<Opened, Failure> {
+        let mut parents_tried = Vec::new();
+        let mut direct_failure = None;
+        let mut held_off = None;
+        let first = hops.first().cloned();
+
+        for hop in self.order(hops) {
+            if let Some(pool) = pool
+                && let Some(sender) = pool.take(&hop.pool_key(origin)).await
+            {
+                return Ok(Opened::Reused(hop, sender));
+            }
+            if let (Hop::Parent(_), Some(auth)) = (&hop, auth)
+                && let Err(failure) = auth.check()
+            {
+                held_off = Some(failure);
+                continue;
+            }
+            match self.connect_hop(&hop, origin, limit).await {
+                Ok(stream) => {
+                    if let (Some(first), Hop::Parent(parent)) = (&first, &hop)
+                        && *first != hop
+                    {
+                        tracing::info!(parent = %parent, "using another parent proxy");
+                    }
+                    return Ok(Opened::New(hop, stream));
+                }
+                Err(failure) => match hop {
+                    Hop::Parent(_) => {
+                        if let Failure::ParentsUnavailable(mut attempts) = failure {
+                            parents_tried.append(&mut attempts);
+                        }
+                    }
+                    Hop::Direct => direct_failure = Some(failure),
+                },
+            }
+        }
+        // Blame what was tried last and matters most: the destination itself if
+        // it was tried, else the parents.
+        if let Some(failure) = direct_failure {
+            return Err(failure);
+        }
+        if !parents_tried.is_empty() {
+            return Err(Failure::ParentsUnavailable(parents_tried));
+        }
+        Err(held_off.unwrap_or(Failure::Parent("there is nowhere to send the request")))
+    }
+}
+
+fn hop_name(hop: &Hop) -> String {
+    match hop {
+        Hop::Direct => "DIRECT".to_owned(),
+        Hop::Parent(parent) => parent.to_string(),
+    }
+}
+
+/// A failure to connect through `hop`, as something to tell the client.
+fn hop_failure(hop: &Hop, origin: &str, error: ConnectError) -> Failure {
+    match hop {
+        Hop::Direct => connect_failure(origin, error),
+        Hop::Parent(parent) => Failure::ParentsUnavailable(vec![ParentAttempt {
+            address: parent.to_string(),
+            error,
+        }]),
     }
 }
 
@@ -95,10 +258,14 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn hop(text: &str) -> Hop {
+        Hop::Parent(parent(text))
+    }
+
     #[test]
     fn without_parents_everything_is_direct() {
         let upstreams = Upstreams::new(vec![], NoProxy::default());
-        assert_eq!(upstreams.route("example.com"), Route::Direct);
+        assert_eq!(upstreams.hops("example.com"), [Hop::Direct]);
     }
 
     #[test]
@@ -106,11 +273,88 @@ mod tests {
         let no_proxy = NoProxy::new(["localhost", "*.corp.example.com", "10.0.0.0/8"]).unwrap();
         let upstreams = Upstreams::new(vec![parent("proxy.example.com:8080")], no_proxy);
 
-        assert_eq!(upstreams.route("example.com"), Route::Parent);
-        assert_eq!(upstreams.route("localhost"), Route::Direct);
-        assert_eq!(upstreams.route("app.corp.example.com"), Route::Direct);
-        assert_eq!(upstreams.route("10.1.2.3"), Route::Direct);
-        assert_eq!(upstreams.route("11.1.2.3"), Route::Parent);
-        assert_eq!(upstreams.route("[::1]"), Route::Parent);
+        assert_eq!(
+            upstreams.hops("example.com"),
+            [hop("proxy.example.com:8080")]
+        );
+        assert_eq!(upstreams.hops("localhost"), [Hop::Direct]);
+        assert_eq!(upstreams.hops("app.corp.example.com"), [Hop::Direct]);
+        assert_eq!(upstreams.hops("10.1.2.3"), [Hop::Direct]);
+        assert_eq!(upstreams.hops("11.1.2.3"), [hop("proxy.example.com:8080")]);
+        assert_eq!(upstreams.hops("[::1]"), [hop("proxy.example.com:8080")]);
+    }
+
+    #[test]
+    fn the_parent_that_worked_last_comes_first() {
+        let upstreams = Upstreams::new(
+            vec![
+                parent("a.example.com:1"),
+                parent("b.example.com:2"),
+                parent("c.example.com:3"),
+            ],
+            NoProxy::default(),
+        );
+        assert_eq!(
+            upstreams.hops("x"),
+            [
+                hop("a.example.com:1"),
+                hop("b.example.com:2"),
+                hop("c.example.com:3")
+            ]
+        );
+        upstreams.worked(&hop("b.example.com:2"));
+        assert_eq!(
+            upstreams.hops("x"),
+            [
+                hop("b.example.com:2"),
+                hop("c.example.com:3"),
+                hop("a.example.com:1")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parent_that_could_not_be_reached_goes_last_for_a_while() {
+        let upstreams = Upstreams::new(vec![], NoProxy::default());
+        let hops = vec![
+            hop("dead.example.com:1"),
+            Hop::Direct,
+            hop("live.example.com:2"),
+        ];
+
+        upstreams.failed(&hop("dead.example.com:1"));
+        assert_eq!(
+            upstreams.order(hops.clone()),
+            [
+                Hop::Direct,
+                hop("live.example.com:2"),
+                hop("dead.example.com:1")
+            ]
+        );
+
+        // Once it works again it takes its place back.
+        upstreams.worked(&hop("dead.example.com:1"));
+        assert_eq!(upstreams.order(hops.clone()), hops);
+    }
+
+    #[test]
+    fn when_every_parent_failed_the_order_is_kept() {
+        let upstreams = Upstreams::new(vec![], NoProxy::default());
+        let hops = vec![hop("a.example.com:1"), hop("b.example.com:2")];
+        upstreams.failed(&hops[0]);
+        upstreams.failed(&hops[1]);
+        assert_eq!(upstreams.order(hops.clone()), hops);
+    }
+
+    #[test]
+    fn a_direct_hop_is_tied_to_its_destination_and_a_parent_is_not() {
+        assert_eq!(
+            Hop::Direct.pool_key("origin.example.com:80"),
+            PoolKey::Origin("origin.example.com:80".to_owned())
+        );
+        assert_eq!(
+            hop("proxy.example.com:8080").pool_key("origin.example.com:80"),
+            PoolKey::Parent("proxy.example.com:8080".to_owned())
+        );
     }
 }

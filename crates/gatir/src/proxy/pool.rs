@@ -18,6 +18,7 @@ use hyper::client::conn::http1::SendRequest;
 use tokio::time::timeout;
 
 use super::body::Body;
+use super::upstream::Hop;
 
 /// How long an idle connection may wait to be reused. Servers commonly close
 /// idle connections after a few seconds to a minute; older ones would be
@@ -33,8 +34,8 @@ const READY_WAIT: Duration = Duration::from_millis(50);
 /// What a pooled connection leads to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum PoolKey {
-    /// The parent proxy at this index of the configured list.
-    Parent(usize),
+    /// A parent proxy, as `host:port`.
+    Parent(String),
     /// An origin server, as `host:port`.
     Origin(String),
 }
@@ -101,6 +102,8 @@ impl Pool {
 pub(super) struct Lease {
     pub sender: SendRequest<Body>,
     pub key: PoolKey,
+    /// The way it reaches the destination.
+    pub hop: Hop,
     /// True if it came from the pool, so it may have gone stale unnoticed.
     pub reused: bool,
     /// True for a new connection to a parent that wants authentication: the
