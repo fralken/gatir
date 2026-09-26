@@ -35,8 +35,10 @@ registered under; an address, or another alias, may have none.
   user: there must be a ticket (`kinit`, or the login of a computer that is in the
   domain) before gatir asks for one. Nothing needs to be typed at gatir.
 - **Windows** uses SSPI (`secur32.dll`) with the credentials of the session the
-  user is logged on with. This part has been compiled and checked against the
-  Windows interface, and has not yet been run on a Windows computer.
+  user is logged on with. It has been tried on a computer of the domain against a
+  corporate proxy that offers Negotiate and NTLM: Windows made a Kerberos token,
+  the proxy accepted it, and `GET`, `HEAD`, `POST` and `CONNECT` worked. The fall back to
+  NTLM inside Negotiate has been tried only against a stand-in for the proxy.
 
 ## Finding out why it does not work
 

@@ -51,7 +51,7 @@ setting in the file.
 |---|---|
 | Linux | Supported, on glibc 2.35 or later (Debian 12, Ubuntu 22.04, Fedora 36). Needs OpenSSL 3 (`libssl3`) and the Kerberos library (`libgssapi-krb5-2`): the packages install them, with the archive you do, and without them gatir does not start, even if you use NTLM only. |
 | macOS | Supported, on Apple silicon and Intel. Kerberos uses the system's. |
-| Windows | Builds. NTLM with a password or a hash works in the same way; Negotiate through SSPI (single sign-on with the logged-on user) is written and has not yet been run on a Windows computer. |
+| Windows | Builds. NTLM with a password or a hash works in the same way; Negotiate through SSPI (single sign-on with the logged-on user) has been tried on a domain computer against a corporate proxy, with Kerberos: plain requests, `HEAD`, `POST` and `CONNECT` work. The fall back to NTLM inside Negotiate has not been tried against a real proxy. |
 
 ## Documentation
 
