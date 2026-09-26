@@ -6,6 +6,8 @@ mod negotiate;
 pub mod ntlm;
 mod ntlm_authenticator;
 mod offers;
+#[cfg(windows)]
+mod sspi;
 
 use std::sync::Arc;
 
