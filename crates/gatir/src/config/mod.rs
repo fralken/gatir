@@ -137,6 +137,31 @@ pub struct Config {
     pub log_level: LogLevel,
 }
 
+/// The parts of a configuration that only a new start applies: where gatir
+/// listens, and how much it logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fixed {
+    listen: Vec<SocketAddr>,
+    tunnels: Vec<Tunnel>,
+    socks5: Vec<SocketAddr>,
+    log_level: LogLevel,
+}
+
+impl Fixed {
+    /// What is different in `later`, by the name of the setting.
+    pub fn differences(&self, later: &Self) -> Vec<&'static str> {
+        [
+            (self.listen != later.listen, "listen"),
+            (self.tunnels != later.tunnels, "tunnels"),
+            (self.socks5 != later.socks5, "socks5.listen"),
+            (self.log_level != later.log_level, "log.level"),
+        ]
+        .into_iter()
+        .filter_map(|(differs, name)| differs.then_some(name))
+        .collect()
+    }
+}
+
 /// Values that take precedence over the config file.
 #[derive(Debug, Default)]
 pub struct Overrides {
@@ -449,6 +474,20 @@ impl Config {
     }
 
     /// A multi-line description that never includes secret values.
+    /// What a running server cannot change without being started again.
+    pub fn fixed(&self) -> Fixed {
+        Fixed {
+            listen: self.listen.clone(),
+            tunnels: self.tunnels.clone(),
+            socks5: self
+                .socks5
+                .as_ref()
+                .map(|socks5| socks5.listen.clone())
+                .unwrap_or_default(),
+            log_level: self.log_level,
+        }
+    }
+
     /// Whether the configuration holds something a stranger must not read: a
     /// password or hash, the password of the SOCKS5 server, or a header value.
     pub fn holds_secrets(&self) -> bool {
@@ -1710,6 +1749,77 @@ mod tests {
         )
         .unwrap();
         assert!(config.socks5.unwrap().credentials.is_some());
+    }
+
+    #[test]
+    fn credentials_are_the_same_only_if_everything_about_them_is() {
+        let credentials = |toml: &str| load(toml).unwrap().credentials.unwrap();
+        let base = "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"";
+        assert!(credentials(base).same_as(&credentials(base)));
+        assert!(credentials(base).same_as(&credentials(base).clone()));
+
+        let hash = "8846f7eaee8fb117ad06bdd830b7586c";
+        for other in [
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-two\"".to_owned(),
+            "[credentials]\nusername = \"bob\"\ndomain = \"CORP\"\npassword = \"pw-one\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"OTHER\"\npassword = \"pw-one\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\nmethod = \"nt\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\nworkstation = \"PC\"".to_owned(),
+            format!("[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\nnt_hash = \"{hash}\""),
+        ] {
+            assert!(!credentials(base).same_as(&credentials(&other)), "{other}");
+        }
+        // The same hash, and the same hash as another kind, which is not the same secret.
+        let nt = format!("[credentials]\nusername = \"a\"\nnt_hash = \"{hash}\"");
+        let v2 = format!("[credentials]\nusername = \"a\"\nntlmv2_hash = \"{hash}\"");
+        assert!(credentials(&nt).same_as(&credentials(&nt)));
+        assert!(!credentials(&nt).same_as(&credentials(&v2)));
+        // Kerberos has no secret, and a service name that can differ.
+        let kerberos =
+            |spn: &str| format!("[credentials]\nmethod = \"negotiate\"\nspn = \"{spn}\"");
+        assert!(credentials(&kerberos("HTTP@a")).same_as(&credentials(&kerberos("HTTP@a"))));
+        assert!(!credentials(&kerberos("HTTP@a")).same_as(&credentials(&kerberos("HTTP@b"))));
+    }
+
+    #[test]
+    fn what_needs_a_restart_is_told_by_name() {
+        let fixed = |toml: &str| load(toml).unwrap().fixed();
+        let base = fixed("listen = [\"127.0.0.1:1\"]");
+        assert!(
+            base.differences(&fixed("listen = [\"127.0.0.1:1\"]"))
+                .is_empty()
+        );
+        // What a reload does change is no difference.
+        assert!(
+            base.differences(&fixed(
+                "listen = [\"127.0.0.1:1\"]\nparents = [\"p.example.com:1\"]\nno_proxy = [\"x\"]\n\
+                 [access]\ndefault = \"deny\"\n[socks5]\nlisten = [\"127.0.0.1:2\"]\nusername = \"a\"\npassword = \"b\""
+            ))
+            .contains(&"socks5.listen")
+        );
+        assert_eq!(
+            base.differences(&fixed("listen = [\"127.0.0.1:2\"]")),
+            ["listen"]
+        );
+        assert_eq!(
+            base.differences(&fixed(
+                "listen = [\"127.0.0.1:1\"]\n[log]\nlevel = \"debug\""
+            )),
+            ["log.level"]
+        );
+        assert_eq!(
+            base.differences(&fixed(
+                "listen = [\"127.0.0.1:1\"]\n[[tunnels]]\nlisten = \"127.0.0.1:3\"\ntarget = \"a:22\""
+            )),
+            ["tunnels"]
+        );
+        assert!(
+            base.differences(&fixed(
+                "listen = [\"127.0.0.1:1\"]\nparents = [\"p.example.com:1\"]\n[access]\ndefault = \"deny\"\n\
+                 [timeouts]\nconnect_secs = 3"
+            ))
+            .is_empty()
+        );
     }
 
     #[test]

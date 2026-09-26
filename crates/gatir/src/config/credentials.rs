@@ -55,7 +55,36 @@ pub enum Secret {
     Ntlmv2Hash(SecretBox<[u8; NT_HASH_LEN]>),
 }
 
+/// A copy is another `secrecy` box: the secret stays wrapped, and is wiped when
+/// it is dropped.
+impl Clone for Secret {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Password(password) => {
+                Self::Password(SecretString::from(password.expose_secret().to_owned()))
+            }
+            Self::NtHash(hash) => Self::NtHash(SecretBox::new(Box::new(*hash.expose_secret()))),
+            Self::Ntlmv2Hash(hash) => {
+                Self::Ntlmv2Hash(SecretBox::new(Box::new(*hash.expose_secret())))
+            }
+        }
+    }
+}
+
 impl Secret {
+    /// Whether both are the same secret of the same kind. For telling a
+    /// configuration that changed from one that was read again, not for
+    /// checking what a client sent.
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Password(a), Self::Password(b)) => a.expose_secret() == b.expose_secret(),
+            (Self::NtHash(a), Self::NtHash(b)) | (Self::Ntlmv2Hash(a), Self::Ntlmv2Hash(b)) => {
+                a.expose_secret() == b.expose_secret()
+            }
+            _ => false,
+        }
+    }
+
     /// Human-readable kind, safe to print.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -67,7 +96,7 @@ impl Secret {
 }
 
 /// Validated credentials.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Credentials {
     pub method: AuthMethod,
     pub username: String,
@@ -78,6 +107,25 @@ pub struct Credentials {
     /// Service name of the parent proxy, for [`AuthMethod::Negotiate`] only.
     /// `None` means `HTTP@` followed by the parent's host.
     pub spn: Option<String>,
+}
+
+impl Credentials {
+    /// Whether these are the same credentials as `other`, secret included: what
+    /// a configuration that is read again has to say for a parent to keep
+    /// the connections it authenticated, and the account its record.
+    pub fn same_as(&self, other: &Self) -> bool {
+        let same_secret = match (&self.secret, &other.secret) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_as(b),
+            _ => false,
+        };
+        self.method == other.method
+            && self.username == other.username
+            && self.domain == other.domain
+            && self.workstation == other.workstation
+            && self.spn == other.spn
+            && same_secret
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

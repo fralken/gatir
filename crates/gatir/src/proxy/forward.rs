@@ -1,6 +1,8 @@
 //! Forwarding plain HTTP requests, to the origin server or to a parent proxy.
 
 use std::net::SocketAddr;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -16,8 +18,8 @@ use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent_auth::{Admission, Outcome, ParentAuth, reusable};
-use super::pool::Lease;
-use super::server::Context;
+use super::pool::{Lease, Pool};
+use super::server::{Context, Live};
 use super::upstream::{Hop, Opened};
 use crate::config::HeaderRule;
 
@@ -46,7 +48,34 @@ pub(super) async fn handle(
     response
 }
 
+/// What one request works with: the settings as they were when it began, which
+/// a reload does not change under it, and the pool it borrows connections from.
+/// It reads as the settings do, so `scope.timeouts` is the timeouts.
+struct Scope<'a> {
+    live: &'a Live,
+    pool: &'a Arc<Pool>,
+    /// The generation of the pool the settings belong to.
+    epoch: u64,
+}
+
+impl Deref for Scope<'_> {
+    type Target = Live;
+
+    fn deref(&self) -> &Live {
+        self.live
+    }
+}
+
 async fn forward(request: Request<Incoming>, context: &Context) -> Result<Response<Body>, Failure> {
+    // In this order: a connection may be labeled with an older generation than
+    // its settings, and is then simply not kept, but never with a newer one.
+    let epoch = context.pool.epoch();
+    let live = context.live();
+    let context = &Scope {
+        live: &live,
+        pool: &context.pool,
+        epoch,
+    };
     let (mut parts, body) = request.into_parts();
     let target = Target::from_uri(&parts.uri)?;
 
@@ -183,13 +212,13 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     parts.version = Version::HTTP_11;
     Ok(Response::from_parts(
         parts,
-        lease.attach(&context.pool, body),
+        lease.attach(context.pool, body),
     ))
 }
 
 /// Whether the parent is asking for authentication, and has been given the
 /// means to provide it.
-fn demands_authentication(response: &Response<Incoming>, hop: &Hop, context: &Context) -> bool {
+fn demands_authentication(response: &Response<Incoming>, hop: &Hop, context: &Scope<'_>) -> bool {
     hop.is_parent()
         && context.auth.is_some()
         && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
@@ -214,7 +243,7 @@ enum Authenticated<'a> {
 /// there, unless a first attempt has already gone wrong.
 async fn authenticate<'a>(
     auth: &'a ParentAuth,
-    context: &Context,
+    context: &Scope<'_>,
     lease: &mut Lease,
     request: &mut Request<Body>,
     head: Option<&Head>,
@@ -278,15 +307,15 @@ fn probe(target: &Target, rules: &[HeaderRule]) -> Request<Body> {
 
 /// Opens a connection through the first of `hops` that answers: a pooled one if
 /// there is one for a hop, else a new one.
-async fn acquire(context: &Context, hops: Vec<Hop>, target: &Target) -> Result<Lease, Failure> {
+async fn acquire(context: &Scope<'_>, hops: Vec<Hop>, target: &Target) -> Result<Lease, Failure> {
     let opened = context
         .upstreams
         .open(
             hops,
             &target.address,
             context.timeouts.connect,
-            context.auth.as_ref(),
-            Some(&context.pool),
+            context.auth.as_deref(),
+            Some(context.pool),
         )
         .await?;
     match opened {
@@ -296,13 +325,14 @@ async fn acquire(context: &Context, hops: Vec<Hop>, target: &Target) -> Result<L
             hop,
             reused: true,
             needs_auth: false,
+            epoch: context.epoch,
         }),
         Opened::New(hop, stream) => new_lease(context, hop, stream, target).await,
     }
 }
 
 /// Opens a new connection through `hop`.
-async fn connect(context: &Context, hop: &Hop, target: &Target) -> Result<Lease, Failure> {
+async fn connect(context: &Scope<'_>, hop: &Hop, target: &Target) -> Result<Lease, Failure> {
     // No point opening a connection that could not be authenticated.
     if let (Hop::Parent(_), Some(auth)) = (hop, &context.auth) {
         auth.check()?;
@@ -315,7 +345,7 @@ async fn connect(context: &Context, hop: &Hop, target: &Target) -> Result<Lease,
 }
 
 async fn new_lease(
-    context: &Context,
+    context: &Scope<'_>,
     hop: Hop,
     stream: TcpStream,
     target: &Target,
@@ -326,6 +356,7 @@ async fn new_lease(
         needs_auth: hop.is_parent() && context.auth.is_some(),
         hop,
         reused: false,
+        epoch: context.epoch,
     })
 }
 

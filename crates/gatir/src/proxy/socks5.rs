@@ -256,12 +256,10 @@ fn reply_for_status(status: StatusCode) -> u8 {
 }
 
 /// Serves one SOCKS5 client until its tunnel is closed.
-pub(super) async fn serve(
-    mut client: TcpStream,
-    peer: SocketAddr,
-    context: Arc<Context>,
-    credentials: Option<Arc<Socks5Credentials>>,
-) {
+pub(super) async fn serve(mut client: TcpStream, peer: SocketAddr, context: Arc<Context>) {
+    // The settings as they are when the client arrives: a reload during its
+    // handshake does not change what it is asked for.
+    let live = context.live();
     if let Err(err) = client.set_nodelay(true) {
         tracing::debug!(%peer, %err, "cannot set TCP_NODELAY on the client connection");
     }
@@ -270,8 +268,8 @@ pub(super) async fn serve(
     // A client gets as long to say what it wants as an HTTP client gets to
     // send its request.
     let handshake = timeout(
-        context.timeouts.client_idle,
-        handshake(&mut client, credentials.as_deref()),
+        live.timeouts.client_idle,
+        handshake(&mut client, live.socks5_credentials.as_deref()),
     )
     .await;
     let destination = match handshake {

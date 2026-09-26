@@ -9,10 +9,8 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
-
-use tokio_util::sync::CancellationToken;
 
 use super::fetch::{Fetched, Trust, Validators, fetch};
 use super::{MAX_SCRIPT_BYTES, Pac, PacEnv, PacError, PacLimits, SystemResolver};
@@ -41,6 +39,8 @@ pub struct PacSource {
     env: PacEnv,
     trust: Trust,
     state: Mutex<State>,
+    /// Held while the script is looked at, so that two looks never overlap.
+    looking: tokio::sync::Mutex<()>,
 }
 
 impl PacSource {
@@ -69,6 +69,7 @@ impl PacSource {
             trust,
             settings: settings.clone(),
             state: Mutex::new(State::default()),
+            looking: tokio::sync::Mutex::new(()),
         });
         if let Err(reason) = source.refresh().await {
             match settings.location {
@@ -85,6 +86,8 @@ impl PacSource {
                 ),
             }
         }
+        // It looks again for as long as anything uses the script, and no longer.
+        tokio::spawn(Self::keep_fresh(Arc::downgrade(&source)));
         Ok(source)
     }
 
@@ -101,30 +104,40 @@ impl PacSource {
         })
     }
 
-    /// Reads the script again at the configured interval, until `stop` is
-    /// cancelled.
-    pub async fn keep_fresh(self: Arc<Self>, stop: CancellationToken) {
+    /// Reads the script again at the configured interval, until nothing holds
+    /// the source any more.
+    async fn keep_fresh(source: Weak<Self>) {
         loop {
-            let wait = self.next_wait();
-            tokio::select! {
-                () = stop.cancelled() => return,
-                () = tokio::time::sleep(wait) => {}
-            }
-            let result = tokio::select! {
-                () = stop.cancelled() => return,
-                result = self.refresh() => result,
+            let Some(wait) = source.upgrade().map(|source| source.next_wait()) else {
+                return;
             };
-            if let Err(reason) = result {
-                let kept = self.lock().pac.is_some();
-                tracing::warn!(
-                    pac = %self.settings.location,
-                    %reason,
-                    retry_in_secs = self.next_wait().as_secs(),
-                    "cannot refresh the PAC script{}",
-                    if kept { ", keeping the previous version" } else { "" }
-                );
-            }
+            tokio::time::sleep(wait).await;
+            let Some(source) = source.upgrade() else {
+                return;
+            };
+            source.refresh_and_report().await;
         }
+    }
+
+    /// Looks at the script now, and says in the log what came of it.
+    async fn refresh_and_report(&self) {
+        if let Err(reason) = self.refresh().await {
+            let kept = self.lock().pac.is_some();
+            tracing::warn!(
+                pac = %self.settings.location,
+                %reason,
+                retry_in_secs = self.next_wait().as_secs(),
+                "cannot refresh the PAC script{}",
+                if kept { ", keeping the previous version" } else { "" }
+            );
+        }
+    }
+
+    /// Looks at the script now instead of at the next time, in the
+    /// background. What it finds, or why it found nothing, goes to the log.
+    pub fn refresh_soon(self: &Arc<Self>) {
+        let source = self.clone();
+        tokio::spawn(async move { source.refresh_and_report().await });
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -145,6 +158,7 @@ impl PacSource {
     /// One look at the script. What it finds replaces what is in use only if
     /// it loads.
     async fn refresh(&self) -> Result<(), String> {
+        let _alone = self.looking.lock().await;
         let outcome = self.read_and_load().await;
         let mut state = self.lock();
         match outcome {

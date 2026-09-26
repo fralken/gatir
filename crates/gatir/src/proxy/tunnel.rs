@@ -25,7 +25,7 @@ use super::body::{Body, answer_within, full};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent_auth::Outcome;
-use super::server::Context;
+use super::server::{Context, Live};
 use super::upstream::Hop;
 
 pub(super) async fn handle(
@@ -158,21 +158,18 @@ pub(super) async fn reach(
     } else {
         format!("https://{}:{port}/", host.to_ascii_lowercase())
     };
-    let hops = context.upstreams.hops(&pac_url, host).await?;
-    let (hop, stream) = context
+    // The settings as they are now: what follows is done under them, even if a
+    // reload happens meanwhile.
+    let live = context.live();
+    let hops = live.upstreams.hops(&pac_url, host).await?;
+    let (hop, stream) = live
         .upstreams
-        .connect(
-            hops,
-            &address,
-            context.timeouts.connect,
-            context.auth.as_ref(),
-        )
+        .connect(hops, &address, live.timeouts.connect, live.auth.as_deref())
         .await?;
     match hop {
         Hop::Direct => Ok(Reached::Open(Upstream::Direct(stream))),
         Hop::Parent(parent) => {
-            connect_through_parent(stream, &parent.host, &address, headers, extensions, context)
-                .await
+            connect_through_parent(stream, &parent.host, &address, headers, extensions, &live).await
         }
     }
 }
@@ -187,7 +184,7 @@ where
     relay(
         client,
         upstream,
-        context.timeouts.tunnel_idle,
+        context.live().timeouts.tunnel_idle,
         context.force.clone(),
     )
     .await;
@@ -198,7 +195,7 @@ fn spawn_tunnel<U>(context: &Context, client: OnUpgrade, upstream: U)
 where
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let idle = context.timeouts.tunnel_idle;
+    let idle = context.live().timeouts.tunnel_idle;
     let force = context.force.clone();
     // Tracked, so a graceful shutdown waits for the tunnel.
     context.tracker.spawn(async move {
@@ -222,10 +219,10 @@ async fn connect_through_parent(
     address: &str,
     mut headers: HeaderMap,
     extensions: Extensions,
-    context: &Context,
+    live: &Live,
 ) -> Result<Reached, Failure> {
     strip_hop_by_hop(&mut headers);
-    apply_rules(&mut headers, &context.request_headers);
+    apply_rules(&mut headers, &live.request_headers);
     headers.insert(
         HOST,
         HeaderValue::from_str(address)
@@ -260,9 +257,9 @@ async fn connect_through_parent(
     // Set once a proof has been sent, until the parent has said whether it
     // accepts it.
     let mut admission = None;
-    let limit = context.timeouts.response;
+    let limit = live.timeouts.response;
     let timed_out = Failure::ResponseTimeout("the parent proxy");
-    let response = match &context.auth {
+    let response = match &live.auth {
         None => answer_within(limit, sender.send_request(connect(None)))
             .await
             .ok_or(timed_out)?

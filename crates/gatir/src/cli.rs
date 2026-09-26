@@ -7,7 +7,7 @@ use std::io::BufRead;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
 use crate::auth::ntlm::NtHash;
@@ -30,7 +30,7 @@ pub struct Cli {
 }
 
 /// Options that take precedence over the configuration file.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct OverrideArgs {
     /// Address to listen on; repeat for several (replaces `listen` from the file)
     #[arg(long, global = true, value_name = "ADDR")]
@@ -101,18 +101,23 @@ pub enum ConfigCommand {
 }
 
 impl OverrideArgs {
-    fn into_overrides(self, password: Option<SecretString>) -> Overrides {
+    /// The overrides for reading the configuration. `password` is copied: they
+    /// are made again at every reload.
+    fn to_overrides(&self, password: Option<&SecretString>) -> Overrides {
+        let password =
+            password.map(|password| SecretString::from(password.expose_secret().to_owned()));
+        let this = self.clone();
         Overrides {
-            listen: self.listen,
-            parents: self.parents,
-            pac: self.pac,
-            username: self.username,
-            domain: self.domain,
-            method: self.method,
+            listen: this.listen,
+            parents: this.parents,
+            pac: this.pac,
+            username: this.username,
+            domain: this.domain,
+            method: this.method,
             password,
-            tunnels: self.tunnels,
-            socks5: self.socks5,
-            log_level: self.log_level,
+            tunnels: this.tunnels,
+            socks5: this.socks5,
+            log_level: this.log_level,
         }
     }
 }
@@ -121,23 +126,27 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Hash(args) => hash_password(&args),
         Command::Run => {
-            let (config, _file) = load_config(cli.config.as_deref(), cli.overrides)?;
+            let source = Source::new(cli.config, cli.overrides)?;
+            let config = load_config(&source)?;
             if config.parents.is_empty() && config.pac.is_none() && config.credentials.is_some() {
                 tracing::warn!(
                     "credentials are configured, but there is no parent proxy to authenticate to"
                 );
             }
+            // The configuration is read the same way at every SIGHUP.
+            let load: crate::proxy::Loader = Box::new(move || source.read());
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("cannot start the async runtime")?
-                .block_on(crate::proxy::run(&config))?;
+                .block_on(crate::proxy::run(&config, load))?;
             Ok(())
         }
         Command::Config(ConfigCommand::Check) => {
-            let (config, file) = load_config(cli.config.as_deref(), cli.overrides)?;
+            let source = Source::new(cli.config, cli.overrides)?;
+            let config = load_config(&source)?;
             println!("configuration OK");
-            match &file {
+            match &source.file {
                 Some(file) => println!("file:        {}", file.display()),
                 None => println!("file:        none (built-in defaults)"),
             }
@@ -147,23 +156,45 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Reads the configuration, applies the command-line overrides and starts
-/// logging. The file is the one named, or else the first that is found in the
-/// usual places; `None` if there is none, and the defaults apply.
-fn load_config(
-    path: Option<&std::path::Path>,
+/// Where the configuration comes from, so that it can be read again: the file,
+/// and what the command line says on top of it.
+struct Source {
+    /// The file named, or else the first that is found in the usual places;
+    /// `None` if there is none, and the defaults apply.
+    file: Option<PathBuf>,
     overrides: OverrideArgs,
-) -> anyhow::Result<(Config, Option<PathBuf>)> {
-    let password = if overrides.password_prompt {
-        Some(prompt_password()?)
-    } else {
-        None
-    };
-    let file = path.map(PathBuf::from).or_else(crate::config::default_path);
-    let config = Config::load(file.as_deref(), overrides.into_overrides(password))?;
+    /// A password typed at the start, which the command line cannot carry.
+    password: Option<SecretString>,
+}
+
+impl Source {
+    fn new(path: Option<PathBuf>, overrides: OverrideArgs) -> anyhow::Result<Self> {
+        let password = if overrides.password_prompt {
+            Some(prompt_password()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            file: path.or_else(crate::config::default_path),
+            overrides,
+            password,
+        })
+    }
+
+    fn read(&self) -> Result<Config, crate::config::ConfigError> {
+        Config::load(
+            self.file.as_deref(),
+            self.overrides.to_overrides(self.password.as_ref()),
+        )
+    }
+}
+
+/// Reads the configuration for the first time, and starts logging.
+fn load_config(source: &Source) -> anyhow::Result<Config> {
+    let config = source.read()?;
 
     logging::init(config.log_level);
-    match &file {
+    match &source.file {
         Some(file) => {
             tracing::info!(file = %file.display(), "configuration file");
             if let Some(problem) = crate::config::exposure(file, config.holds_secrets()) {
@@ -176,7 +207,7 @@ fn load_config(
         None => tracing::info!("no configuration file: using the built-in defaults"),
     }
     tracing::debug!(?config, "configuration loaded");
-    Ok((config, file))
+    Ok(config)
 }
 
 /// Prints the `nt_hash` line to paste into the configuration. Only that line

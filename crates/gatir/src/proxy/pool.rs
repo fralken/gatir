@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
@@ -48,9 +49,26 @@ struct Idle {
 #[derive(Default)]
 pub(super) struct Pool {
     idle: Mutex<HashMap<PoolKey, Vec<Idle>>>,
+    /// Which generation of the settings the connections belong to. A reload
+    /// starts a new one: what was opened under an earlier one may have
+    /// authenticated as someone else, or lead somewhere else.
+    epoch: AtomicU64,
 }
 
 impl Pool {
+    /// The generation a connection opened now belongs to.
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Forgets the idle connections, and starts a generation that the ones in
+    /// use are not part of: they are closed when their response is done.
+    pub(super) fn clear(&self) {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        idle.clear();
+    }
+
     /// Takes the most recently used idle connection for `key` that is still
     /// usable, if any.
     pub(super) async fn take(&self, key: &PoolKey) -> Option<SendRequest<Body>> {
@@ -74,11 +92,14 @@ impl Pool {
         }
     }
 
-    fn put(&self, key: PoolKey, sender: SendRequest<Body>) {
+    fn put(&self, key: PoolKey, sender: SendRequest<Body>, epoch: u64) {
         if sender.is_closed() {
             return;
         }
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if epoch != self.epoch() {
+            return;
+        }
         idle.values_mut().for_each(|list| {
             list.retain(|entry| entry.since.elapsed() < IDLE_TTL && !entry.sender.is_closed());
         });
@@ -110,6 +131,8 @@ pub(super) struct Lease {
     /// exchange must run on it before it carries the request. Pooled
     /// connections have been through it already.
     pub needs_auth: bool,
+    /// The generation of the settings it was opened under, for the pool.
+    pub epoch: u64,
 }
 
 impl Lease {
@@ -120,6 +143,7 @@ impl Lease {
             pool: pool.clone(),
             key: self.key,
             sender: self.sender,
+            epoch: self.epoch,
         };
         if body.is_end_stream() {
             release.give_back();
@@ -137,11 +161,12 @@ struct Release {
     pool: Arc<Pool>,
     key: PoolKey,
     sender: SendRequest<Body>,
+    epoch: u64,
 }
 
 impl Release {
     fn give_back(self) {
-        self.pool.put(self.key, self.sender);
+        self.pool.put(self.key, self.sender, self.epoch);
     }
 }
 

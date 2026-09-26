@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use hyper::body::Incoming;
@@ -26,7 +26,9 @@ use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::auth::TokenSource;
-use crate::config::{Config, HeaderRule, HostPort, Socks5Credentials, Timeouts};
+use crate::config::{
+    Config, Credentials, Fixed, HeaderRule, HostPort, PacConfig, Socks5Credentials, Timeouts,
+};
 use crate::pac::{PacSource, Trust};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
@@ -37,16 +39,32 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Most header fields accepted in one request.
 const MAX_HEADERS: usize = 100;
 
-/// State shared by every connection of a running server.
-pub(super) struct Context {
+/// The settings a reload replaces: where requests go, who may make them, and
+/// how. Every request, tunnel and SOCKS5 client works on the one it found when
+/// it began, so a reload never changes what is under it.
+pub(super) struct Live {
     pub access: Acl,
     pub timeouts: Timeouts,
     pub upstreams: Upstreams,
     /// How connections to a parent proxy authenticate; `None` if no
     /// credentials are configured.
-    pub auth: Option<ParentAuth>,
+    pub auth: Option<Arc<ParentAuth>>,
     /// Fields set on every request sent upstream.
     pub request_headers: Vec<HeaderRule>,
+    /// Who may use the SOCKS5 server (anyone, if not set).
+    pub socks5_credentials: Option<Arc<Socks5Credentials>>,
+    /// What the next reload compares with, to keep what did not change: the
+    /// script (with the settings it was started with), and the credentials
+    /// (whose record with the parent goes with `auth`).
+    pac: Option<(PacConfig, Arc<PacSource>)>,
+    credentials: Option<Credentials>,
+}
+
+type LiveCell = Arc<RwLock<Arc<Live>>>;
+
+/// State shared by every connection of a running server.
+pub(super) struct Context {
+    live: LiveCell,
     /// Idle connections to origin servers and parents, shared by all clients.
     pub pool: Arc<Pool>,
     /// Every task serving a client, so shutdown can wait for them.
@@ -58,21 +76,143 @@ pub(super) struct Context {
     pub force: CancellationToken,
 }
 
+impl Context {
+    /// The settings as they are now.
+    pub(super) fn live(&self) -> Arc<Live> {
+        self.live
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Builds the settings of `config`. `previous` are those in use, from which
+/// the PAC script is kept if its settings did not change (it holds the last
+/// version that worked), and so are the credentials' record with the parent
+/// (an account refused recently is not tried again for it to be refused).
+///
+/// The second value is the script that was kept, if any.
+async fn build_live(
+    config: &Config,
+    previous: Option<&Live>,
+    tokens: &Option<Arc<dyn TokenSource>>,
+    trust: &Trust,
+) -> io::Result<(Live, Option<Arc<PacSource>>)> {
+    // A PAC file that is missing or wrong is found here, not on the first request.
+    let (pac, kept_script) = match (&config.pac, previous.and_then(|live| live.pac.as_ref())) {
+        (Some(settings), Some((used, source))) if used == settings => (
+            Some((settings.clone(), source.clone())),
+            Some(source.clone()),
+        ),
+        (Some(settings), _) => (
+            Some((
+                settings.clone(),
+                PacSource::start_with(settings, trust.clone()).await?,
+            )),
+            None,
+        ),
+        (None, _) => (None, None),
+    };
+    // Credentials only matter when there is a parent proxy to give them to.
+    let auth = match &config.credentials {
+        Some(credentials) if !config.parents.is_empty() || pac.is_some() => {
+            let kept = previous.and_then(|live| {
+                let unchanged = live
+                    .credentials
+                    .as_ref()
+                    .is_some_and(|used| used.same_as(credentials));
+                live.auth.clone().filter(|_| unchanged)
+            });
+            match kept {
+                Some(auth) => Some(auth),
+                None => Some(Arc::new(
+                    ParentAuth::new(credentials, tokens.clone()).map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+                    })?,
+                )),
+            }
+        }
+        _ => None,
+    };
+    let upstreams = Upstreams::new(
+        config.parents.clone(),
+        config.no_proxy.clone(),
+        pac.as_ref().map(|(_, source)| source.clone()),
+    );
+    let live = Live {
+        access: config.access.clone(),
+        timeouts: config.timeouts.clone(),
+        upstreams,
+        auth,
+        request_headers: config.request_headers.clone(),
+        socks5_credentials: config
+            .socks5
+            .as_ref()
+            .and_then(|socks5| socks5.credentials.clone())
+            .map(Arc::new),
+        pac,
+        credentials: config.credentials.clone(),
+    };
+    Ok((live, kept_script))
+}
+
+/// Replaces the settings of a running server with those of a configuration
+/// read again.
+#[derive(Clone)]
+pub struct Reloader {
+    live: LiveCell,
+    pool: Arc<Pool>,
+    tokens: Option<Arc<dyn TokenSource>>,
+    trust: Trust,
+    /// What the server was started with, and no reload can change.
+    fixed: Fixed,
+    /// A reload at a time.
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Reloader {
+    /// Applies `config`, or changes nothing and says why not: a PAC file that
+    /// cannot be used, or credentials that cannot be turned into a way of
+    /// authenticating, leave the server as it was.
+    ///
+    /// Returns the settings of `config` that still need a new start, by name
+    /// (where gatir listens, and the log level); the server goes on with the
+    /// values it had for those.
+    pub async fn apply(&self, config: &Config) -> io::Result<Vec<&'static str>> {
+        let _turn = self.turn.lock().await;
+        let previous = self
+            .live
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let (live, kept_script) =
+            build_live(config, Some(&previous), &self.tokens, &self.trust).await?;
+
+        // First the settings, then the pool: a request reads them the other way
+        // round, so a connection is never taken for newer than it is.
+        *self.live.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(live);
+        // Connections opened under the old settings may have authenticated as
+        // someone else, or lead to another parent: none is reused.
+        self.pool.clear();
+        // A script that stayed is looked at now: reloading is also how a person
+        // says that it changed.
+        if let Some(script) = kept_script {
+            script.refresh_soon();
+        }
+        Ok(self.fixed.differences(&config.fixed()))
+    }
+}
+
 /// Bound listeners, ready to accept clients.
 pub struct Server {
     listeners: Vec<TcpListener>,
     /// Ports forwarded to a fixed destination, each with its destination.
     tunnels: Vec<(TcpListener, HostPort)>,
-    /// SOCKS5 listeners, and who may use them (anyone, if not set).
+    /// SOCKS5 listeners.
     socks5: Vec<TcpListener>,
-    socks5_credentials: Option<Arc<Socks5Credentials>>,
-    access: Acl,
-    timeouts: Timeouts,
-    upstreams: Upstreams,
-    /// The PAC script, which is read again from time to time while running.
-    pac: Option<Arc<PacSource>>,
-    auth: Option<ParentAuth>,
-    request_headers: Vec<HeaderRule>,
+    live: LiveCell,
+    pool: Arc<Pool>,
+    reloader: Reloader,
 }
 
 impl Server {
@@ -102,19 +242,7 @@ impl Server {
         tokens: Option<Arc<dyn TokenSource>>,
         trust: Trust,
     ) -> io::Result<Self> {
-        // A PAC file that is missing or wrong is found here, not on the first request.
-        let pac = match &config.pac {
-            Some(settings) => Some(PacSource::start_with(settings, trust).await?),
-            None => None,
-        };
-        // Credentials only matter when there is a parent proxy to give them to.
-        let auth = match &config.credentials {
-            Some(credentials) if !config.parents.is_empty() || pac.is_some() => Some(
-                ParentAuth::new(credentials, tokens)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?,
-            ),
-            _ => None,
-        };
+        let (live, _) = build_live(config, None, &tokens, &trust).await?;
         let mut listeners = Vec::with_capacity(config.listen.len());
         for addr in &config.listen {
             let listener = TcpListener::bind(addr).await.map_err(|err| {
@@ -133,7 +261,6 @@ impl Server {
             tunnels.push((listener, tunnel.target.clone()));
         }
         let mut socks5 = Vec::new();
-        let mut socks5_credentials = None;
         if let Some(config) = &config.socks5 {
             for addr in &config.listen {
                 let listener = TcpListener::bind(addr).await.map_err(|err| {
@@ -144,20 +271,29 @@ impl Server {
                 })?;
                 socks5.push(listener);
             }
-            socks5_credentials = config.credentials.clone().map(Arc::new);
         }
+        let live: LiveCell = Arc::new(RwLock::new(Arc::new(live)));
+        let pool = Arc::new(Pool::default());
         Ok(Self {
             listeners,
             tunnels,
             socks5,
-            socks5_credentials,
-            access: config.access.clone(),
-            timeouts: config.timeouts.clone(),
-            upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone(), pac.clone()),
-            pac,
-            auth,
-            request_headers: config.request_headers.clone(),
+            reloader: Reloader {
+                live: live.clone(),
+                pool: pool.clone(),
+                tokens,
+                trust,
+                fixed: config.fixed(),
+                turn: Arc::new(tokio::sync::Mutex::new(())),
+            },
+            live,
+            pool,
         })
+    }
+
+    /// A handle that replaces the settings of this server while it runs.
+    pub fn reloader(&self) -> Reloader {
+        self.reloader.clone()
     }
 
     /// The bound addresses (useful when the configuration asked for port 0).
@@ -193,12 +329,8 @@ impl Server {
     /// connection is gone.
     pub async fn run(self, shutdown: CancellationToken, force: CancellationToken) {
         let context = Arc::new(Context {
-            access: self.access,
-            timeouts: self.timeouts,
-            upstreams: self.upstreams,
-            auth: self.auth,
-            request_headers: self.request_headers,
-            pool: Arc::new(Pool::default()),
+            live: self.live,
+            pool: self.pool,
             tracker: TaskTracker::new(),
             shutdown: shutdown.clone(),
             force: force.clone(),
@@ -209,13 +341,10 @@ impl Server {
                 .spawn(accept(listener, context.clone(), serve_connection, deny));
         }
         for listener in self.socks5 {
-            let credentials = self.socks5_credentials.clone();
             context.tracker.spawn(accept(
                 listener,
                 context.clone(),
-                move |stream, peer, context| {
-                    socks5::serve(stream, peer, context, credentials.clone())
-                },
+                socks5::serve,
                 // Nothing to say in a protocol that has no words for it.
                 |_stream| async {},
             ));
@@ -229,13 +358,10 @@ impl Server {
                 |_stream| async {},
             ));
         }
-        if let Some(pac) = self.pac {
-            context.tracker.spawn(pac.keep_fresh(shutdown.clone()));
-        }
 
         shutdown.cancelled().await;
         context.tracker.close();
-        let grace = context.timeouts.shutdown_grace;
+        let grace = context.live().timeouts.shutdown_grace;
         tracing::info!(
             grace_secs = grace.as_secs(),
             "shutting down, waiting for active connections"
@@ -285,7 +411,7 @@ pub(super) async fn accept<S, SF, D, DF>(
             }
         };
 
-        if context.access.check(peer.ip()) == Action::Deny {
+        if context.live().access.check(peer.ip()) == Action::Deny {
             tracing::info!(peer = %peer.ip(), "connection denied by the access rules");
             context.tracker.spawn(denied(stream));
             continue;
@@ -320,7 +446,7 @@ async fn serve_connection(stream: TcpStream, peer: SocketAddr, context: Arc<Cont
         tracing::debug!(%peer, %err, "cannot set TCP_NODELAY on the client connection");
     }
 
-    let client_idle = context.timeouts.client_idle;
+    let client_idle = context.live().timeouts.client_idle;
     let shutdown = context.shutdown.clone();
     let force = context.force.clone();
     let service = service_fn(move |request| {

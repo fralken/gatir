@@ -22,6 +22,8 @@ pub struct TestProxy {
     pub tunnels: Vec<SocketAddr>,
     /// The SOCKS5 server, if there is one.
     pub socks5: Vec<SocketAddr>,
+    /// Replaces the settings while the proxy runs.
+    pub reloader: gatir::proxy::Reloader,
     pub shutdown: CancellationToken,
     pub force: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -91,11 +93,13 @@ fn run(server: Server) -> TestProxy {
     let shutdown = CancellationToken::new();
     let force = CancellationToken::new();
     let socks5 = server.socks5_addrs();
+    let reloader = server.reloader();
     let task = tokio::spawn(server.run(shutdown.clone(), force.clone()));
     TestProxy {
         addr,
         tunnels,
         socks5,
+        reloader,
         shutdown,
         force,
         task: Some(task),
