@@ -43,6 +43,9 @@ pub enum PacError {
     Broken,
     #[error("the PAC engine is not running")]
     Unavailable,
+    /// No version of the script has loaded yet.
+    #[error("no script is loaded yet ({0}), and gatir keeps trying")]
+    NotLoaded(String),
 }
 
 /// What a script may use.

@@ -36,9 +36,9 @@ pub struct OverrideArgs {
     #[arg(long, global = true, value_name = "ADDR")]
     pub listen: Vec<SocketAddr>,
 
-    /// PAC file that chooses the proxy for each request (replaces `parents` from the file)
-    #[arg(long, global = true, value_name = "FILE")]
-    pub pac: Option<std::path::PathBuf>,
+    /// PAC file or http(s) address that chooses the proxy for each request (replaces `parents` from the file)
+    #[arg(long, global = true, value_name = "FILE|URL")]
+    pub pac: Option<crate::config::PacLocation>,
 
     /// Parent proxy as HOST:PORT; repeat for several (replaces `parents` or `[pac]` from the file)
     #[arg(long = "parent", global = true, value_name = "HOST:PORT")]

@@ -141,13 +141,13 @@ impl Failure {
             ),
             Self::Pac(err) => error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("The PAC file could not tell where to send this request: {err}"),
+                format!("The PAC script could not tell where to send this request: {err}"),
                 false,
             ),
             Self::PacUnsupported(chosen) => error_response(
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "The PAC file chose only ways of reaching the destination that gatir does not \
+                    "The PAC script chose only ways of reaching the destination that gatir does not \
                      support: {chosen}"
                 ),
                 false,

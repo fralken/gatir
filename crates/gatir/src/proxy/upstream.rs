@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hyper::client::conn::http1::SendRequest;
@@ -19,7 +19,7 @@ use super::parent_auth::ParentAuth;
 use super::pool::{Pool, PoolKey};
 use crate::config::ParentAddr;
 use crate::noproxy::NoProxy;
-use crate::pac::{Pac, Route};
+use crate::pac::{PacSource, Route};
 
 /// How long a parent that could not be reached is left for last.
 const BAD_FOR: Duration = Duration::from_secs(60);
@@ -71,13 +71,17 @@ pub(super) struct Upstreams {
     current: AtomicUsize,
     no_proxy: NoProxy,
     /// A PAC script that says where each request goes, in place of `parents`.
-    pac: Option<Pac>,
+    pac: Option<Arc<PacSource>>,
     /// Parents that could not be reached, and when.
     unreachable: Mutex<HashMap<String, Instant>>,
 }
 
 impl Upstreams {
-    pub(super) fn new(parents: Vec<ParentAddr>, no_proxy: NoProxy, pac: Option<Pac>) -> Self {
+    pub(super) fn new(
+        parents: Vec<ParentAddr>,
+        no_proxy: NoProxy,
+        pac: Option<Arc<PacSource>>,
+    ) -> Self {
         Self {
             parents,
             current: AtomicUsize::new(0),
@@ -247,7 +251,8 @@ impl Upstreams {
 }
 
 /// The hops a PAC script chose, skipping the kinds gatir cannot use.
-async fn hops_from_script(pac: &Pac, url: &str, host: &str) -> Result<Vec<Hop>, Failure> {
+async fn hops_from_script(source: &PacSource, url: &str, host: &str) -> Result<Vec<Hop>, Failure> {
+    let pac = source.current().map_err(Failure::Pac)?;
     let routes = pac.find(url, host).await.map_err(Failure::Pac)?;
     let mut hops = Vec::new();
     let mut skipped = Vec::new();
@@ -261,7 +266,7 @@ async fn hops_from_script(pac: &Pac, url: &str, host: &str) -> Result<Vec<Hop>, 
             other => skipped.push(other.to_string()),
         }
     }
-    tracing::debug!(%url, chosen = ?hops, ?skipped, "the PAC file chose");
+    tracing::debug!(%url, chosen = ?hops, ?skipped, "the PAC script chose");
     if hops.is_empty() {
         return Err(Failure::PacUnsupported(skipped.join("; ")));
     }

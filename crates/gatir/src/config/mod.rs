@@ -132,9 +132,9 @@ pub struct Config {
 pub struct Overrides {
     pub listen: Vec<SocketAddr>,
     pub parents: Vec<ParentAddr>,
-    /// A PAC file. Like `parents`, it is a way of finding the proxy, so it
-    /// replaces the other one in the file.
-    pub pac: Option<PathBuf>,
+    /// A PAC file or address. Like `parents`, it is a way of finding the proxy,
+    /// so it replaces the other one in the file.
+    pub pac: Option<PacLocation>,
     pub username: Option<String>,
     pub domain: Option<String>,
     pub method: Option<AuthMethod>,
@@ -158,10 +158,83 @@ struct RawConfig {
     log: Option<RawLog>,
 }
 
-/// The limits on a PAC script, and its name lookups.
+/// Where a PAC script is read from.
+#[derive(Clone, PartialEq, Eq)]
+pub enum PacLocation {
+    File(PathBuf),
+    /// An `http://` or `https://` address.
+    Url(String),
+}
+
+impl PacLocation {
+    /// The address without its query and fragment, which may hold a token.
+    fn shown(&self) -> String {
+        match self {
+            Self::File(path) => path.display().to_string(),
+            Self::Url(url) => url.split(['?', '#']).next().unwrap_or_default().to_owned(),
+        }
+    }
+
+    fn url(text: &str) -> Result<Self, ConfigError> {
+        let invalid = || {
+            ConfigError::invalid(
+                "the PAC address must be http:// or https:// followed by a host, with no user \
+                 name or password in it",
+            )
+        };
+        let uri: hyper::Uri = text.parse().map_err(|_| invalid())?;
+        let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+        let authority_ok = uri.authority().is_some_and(|authority| {
+            !authority.as_str().contains('@') && !authority.host().is_empty()
+        });
+        if scheme_ok && authority_ok {
+            Ok(Self::Url(text.to_owned()))
+        } else {
+            Err(invalid())
+        }
+    }
+}
+
+/// A text that starts with `http://` or `https://` is an address, anything
+/// else is a file.
+impl std::str::FromStr for PacLocation {
+    type Err = ConfigError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let lower = text.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            Self::url(text)
+        } else if text.is_empty() {
+            Err(ConfigError::invalid("the PAC file must not be empty"))
+        } else {
+            Ok(Self::File(PathBuf::from(text)))
+        }
+    }
+}
+
+impl std::fmt::Display for PacLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.shown())
+    }
+}
+
+impl std::fmt::Debug for PacLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(_) => write!(f, "File({:?})", self.shown()),
+            Self::Url(_) => write!(f, "Url({:?})", self.shown()),
+        }
+    }
+}
+
+/// Where the PAC script comes from, its limits, and its name lookups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacConfig {
-    pub file: PathBuf,
+    pub location: PacLocation,
+    /// How often the script is read again to see if it changed.
+    pub refresh: Duration,
+    /// How long to wait for a PAC script to be fetched from an address.
+    pub fetch_timeout: Duration,
     /// How long one evaluation may take.
     pub time_limit: Duration,
     /// Memory one script engine may use, in bytes.
@@ -175,9 +248,16 @@ pub struct PacConfig {
 }
 
 impl PacConfig {
-    fn with_defaults(file: PathBuf) -> Self {
+    pub fn with_defaults(location: PacLocation) -> Self {
+        // A file is cheap to read again, and edited by hand: look often.
+        let refresh = match location {
+            PacLocation::File(_) => Duration::from_secs(60),
+            PacLocation::Url(_) => Duration::from_secs(3600),
+        };
         Self {
-            file,
+            location,
+            refresh,
+            fetch_timeout: Duration::from_secs(15),
             time_limit: Duration::from_secs(5),
             memory_limit: 64 * 1024 * 1024,
             workers: 4,
@@ -191,6 +271,9 @@ impl PacConfig {
 #[serde(deny_unknown_fields)]
 struct RawPac {
     file: Option<PathBuf>,
+    url: Option<String>,
+    refresh_secs: Option<u64>,
+    fetch_timeout_secs: Option<u64>,
     time_limit_ms: Option<u64>,
     memory_limit_mb: Option<u64>,
     workers: Option<u64>,
@@ -209,25 +292,45 @@ fn within(name: &str, value: u64, min: u64, max: u64) -> Result<u64, ConfigError
 }
 
 impl RawPac {
-    /// `file` is the path given on the command line, if any, which replaces the
-    /// one in the file. A path in the file is relative to the file that holds it.
-    fn resolve(self, file: Option<PathBuf>, base: Option<&Path>) -> Result<PacConfig, ConfigError> {
-        let file = match (file, self.file) {
-            (Some(from_command_line), _) => from_command_line,
-            (None, Some(from_file)) => match base {
-                Some(base) if from_file.is_relative() => base.join(from_file),
-                _ => from_file,
-            },
-            (None, None) => {
+    /// `from_command_line` is the location given on the command line, if any,
+    /// which replaces the one in the file. A path in the file is relative to the
+    /// file that holds it.
+    fn resolve(
+        self,
+        from_command_line: Option<PacLocation>,
+        base: Option<&Path>,
+    ) -> Result<PacConfig, ConfigError> {
+        let location = match (from_command_line, self.file, self.url) {
+            (Some(location), _, _) => location,
+            (None, Some(_), Some(_)) => {
                 return Err(ConfigError::invalid(
-                    "pac.file is required in the [pac] table",
+                    "pac.file and pac.url cannot both be set: they are two places to read the \
+                     script from",
+                ));
+            }
+            (None, Some(file), None) => {
+                if file.as_os_str().is_empty() {
+                    return Err(ConfigError::invalid("pac.file must not be empty"));
+                }
+                match base {
+                    Some(base) if file.is_relative() => PacLocation::File(base.join(file)),
+                    _ => PacLocation::File(file),
+                }
+            }
+            (None, None, Some(url)) => PacLocation::url(&url)?,
+            (None, None, None) => {
+                return Err(ConfigError::invalid(
+                    "pac.file or pac.url is required in the [pac] table",
                 ));
             }
         };
-        if file.as_os_str().is_empty() {
-            return Err(ConfigError::invalid("pac.file must not be empty"));
+        let mut pac = PacConfig::with_defaults(location);
+        if let Some(secs) = self.refresh_secs {
+            pac.refresh = Duration::from_secs(within("refresh_secs", secs, 1, 604_800)?);
         }
-        let mut pac = PacConfig::with_defaults(file);
+        if let Some(secs) = self.fetch_timeout_secs {
+            pac.fetch_timeout = Duration::from_secs(within("fetch_timeout_secs", secs, 1, 300)?);
+        }
         if let Some(ms) = self.time_limit_ms {
             pac.time_limit = Duration::from_millis(within("time_limit_ms", ms, 10, 60_000)?);
         }
@@ -333,7 +436,7 @@ impl Config {
     pub fn summary(&self) -> String {
         let listen = join(self.listen.iter());
         let parents = match (&self.pac, self.parents.is_empty()) {
-            (Some(pac), _) => format!("chosen by the PAC file {}", pac.file.display()),
+            (Some(pac), _) => format!("chosen by the PAC script at {}", pac.location),
             (None, true) => "none (direct connections)".to_owned(),
             (None, false) => join(self.parents.iter()),
         };
@@ -1044,9 +1147,76 @@ mod tests {
     fn a_pac_table_needs_only_a_file() {
         let config = load("[pac]\nfile = \"proxy.pac\"").unwrap();
         let pac = config.pac.unwrap();
-        assert_eq!(pac, PacConfig::with_defaults(PathBuf::from("proxy.pac")));
+        assert_eq!(pac, PacConfig::with_defaults(file_location("proxy.pac")));
+        assert_eq!(pac.refresh, Duration::from_secs(60));
         assert!(config.parents.is_empty());
         assert!(load("").unwrap().pac.is_none());
+    }
+
+    fn file_location(path: &str) -> PacLocation {
+        PacLocation::File(PathBuf::from(path))
+    }
+
+    #[test]
+    fn a_pac_table_can_name_an_address_instead() {
+        let config = load("[pac]\nurl = \"https://pac.example.com/proxy.pac\"").unwrap();
+        let pac = config.pac.unwrap();
+        assert_eq!(
+            pac.location,
+            PacLocation::Url("https://pac.example.com/proxy.pac".into())
+        );
+        // An address changes rarely, and each look costs a request.
+        assert_eq!(pac.refresh, Duration::from_secs(3600));
+        assert_eq!(pac.fetch_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn how_often_and_how_long_to_fetch_can_be_set() {
+        let config = load(
+            "[pac]\nurl = \"http://pac.example.com/p\"\nrefresh_secs = 90\n\
+             fetch_timeout_secs = 4",
+        )
+        .unwrap();
+        let pac = config.pac.unwrap();
+        assert_eq!(pac.refresh, Duration::from_secs(90));
+        assert_eq!(pac.fetch_timeout, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_text_is_an_address_only_if_it_starts_like_one() {
+        for text in [
+            "http://h/p.pac",
+            "HTTPS://h:8443/p.pac?x=1",
+            "https://[::1]/p",
+        ] {
+            assert!(matches!(text.parse(), Ok(PacLocation::Url(_))), "{text}");
+        }
+        for text in [
+            "proxy.pac",
+            "/etc/proxy.pac",
+            "C:\\pac\\p.pac",
+            "./http/p.pac",
+        ] {
+            assert!(matches!(text.parse(), Ok(PacLocation::File(_))), "{text}");
+        }
+        for text in [
+            "http://",
+            "https:///p.pac",
+            "http://user:secret@h/p.pac",
+            "http://h with space/p",
+            "",
+        ] {
+            assert!(text.parse::<PacLocation>().is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_pac_address_is_shown_without_its_query() {
+        let location: PacLocation = "https://h.example.com/p.pac?token=hush#frag"
+            .parse()
+            .unwrap();
+        assert_eq!(location.to_string(), "https://h.example.com/p.pac");
+        assert!(!format!("{location:?}").contains("hush"));
     }
 
     #[test]
@@ -1067,7 +1237,25 @@ mod tests {
     #[test]
     fn rejects_a_pac_table_that_makes_no_sense() {
         for (toml, expected) in [
-            ("[pac]", "pac.file is required"),
+            ("[pac]", "pac.file or pac.url is required"),
+            (
+                "[pac]\nfile = \"a\"\nurl = \"http://h/p\"",
+                "pac.file and pac.url cannot both be set",
+            ),
+            ("[pac]\nurl = \"ftp://h/p\"", "must be http:// or https://"),
+            ("[pac]\nurl = \"h/p\"", "must be http:// or https://"),
+            (
+                "[pac]\nurl = \"http://user:pw@h/p\"",
+                "no user name or password",
+            ),
+            (
+                "[pac]\nurl = \"http://h/p\"\nrefresh_secs = 0",
+                "pac.refresh_secs must be between",
+            ),
+            (
+                "[pac]\nurl = \"http://h/p\"\nfetch_timeout_secs = 301",
+                "pac.fetch_timeout_secs must be between",
+            ),
             ("[pac]\nfile = \"\"", "pac.file must not be empty"),
             (
                 "[pac]\nfile = \"p\"\ntime_limit_ms = 1",
@@ -1121,32 +1309,45 @@ mod tests {
         let config = Config::from_toml_str(
             with_parents,
             Overrides {
-                pac: Some(PathBuf::from("cli.pac")),
+                pac: Some(file_location("cli.pac")),
                 ..Overrides::default()
             },
         )
         .unwrap();
         assert!(config.parents.is_empty());
-        assert_eq!(config.pac.unwrap().file, PathBuf::from("cli.pac"));
+        assert_eq!(config.pac.unwrap().location, file_location("cli.pac"));
 
         // A script named on the command line keeps the limits set in the file.
         let config = Config::from_toml_str(
             "[pac]\nfile = \"file.pac\"\nworkers = 2",
             Overrides {
-                pac: Some(PathBuf::from("cli.pac")),
+                pac: Some(file_location("cli.pac")),
                 ..Overrides::default()
             },
         )
         .unwrap();
         let pac = config.pac.unwrap();
-        assert_eq!((pac.file, pac.workers), (PathBuf::from("cli.pac"), 2));
+        assert_eq!((pac.location, pac.workers), (file_location("cli.pac"), 2));
+
+        // An address on the command line takes the place of a file in the file.
+        let config = Config::from_toml_str(
+            "[pac]\nfile = \"file.pac\"",
+            Overrides {
+                pac: Some("http://h.example.com/p.pac".parse().unwrap()),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let pac = config.pac.unwrap();
+        assert!(matches!(pac.location, PacLocation::Url(_)));
+        assert_eq!(pac.refresh, Duration::from_secs(3600));
 
         // Both on the command line is a mistake.
         let error = Config::from_toml_str(
             "",
             Overrides {
                 parents: vec!["cli.example.com:2".parse().unwrap()],
-                pac: Some(PathBuf::from("cli.pac")),
+                pac: Some(file_location("cli.pac")),
                 ..Overrides::default()
             },
         )
@@ -1165,7 +1366,10 @@ mod tests {
         std::fs::write(&file, "[pac]\nfile = \"rules/proxy.pac\"").unwrap();
 
         let config = Config::load(Some(&file), Overrides::default()).unwrap();
-        assert_eq!(config.pac.unwrap().file, dir.path().join("rules/proxy.pac"));
+        assert_eq!(
+            config.pac.unwrap().location,
+            PacLocation::File(dir.path().join("rules/proxy.pac"))
+        );
 
         // An absolute path is left as it is, and so is one from the command line.
         let absolute = dir.path().join("elsewhere.pac");
@@ -1175,26 +1379,35 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(Some(&file), Overrides::default()).unwrap();
-        assert_eq!(config.pac.unwrap().file, absolute);
+        assert_eq!(config.pac.unwrap().location, PacLocation::File(absolute));
 
         let config = Config::load(
             Some(&file),
             Overrides {
-                pac: Some(PathBuf::from("cli.pac")),
+                pac: Some(file_location("cli.pac")),
                 ..Overrides::default()
             },
         )
         .unwrap();
-        assert_eq!(config.pac.unwrap().file, PathBuf::from("cli.pac"));
+        assert_eq!(config.pac.unwrap().location, file_location("cli.pac"));
     }
 
     #[test]
-    fn the_summary_says_that_a_pac_file_chooses() {
+    fn the_summary_says_that_a_pac_script_chooses() {
         let summary = load("[pac]\nfile = \"proxy.pac\"").unwrap().summary();
         assert!(
-            summary.contains("chosen by the PAC file proxy.pac"),
+            summary.contains("chosen by the PAC script at proxy.pac"),
             "{summary}"
         );
+
+        let summary = load("[pac]\nurl = \"https://h.example.com/p.pac?token=hush\"")
+            .unwrap()
+            .summary();
+        assert!(
+            summary.contains("chosen by the PAC script at https://h.example.com/p.pac"),
+            "{summary}"
+        );
+        assert!(!summary.contains("hush"), "{summary}");
     }
 
     #[test]

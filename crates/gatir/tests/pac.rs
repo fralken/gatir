@@ -227,7 +227,7 @@ async fn a_script_error_is_a_gateway_error_that_says_why() {
         assert_eq!(response.status, 502, "{host}");
         let text = response.body_text();
         assert!(
-            text.contains("The PAC file could not tell where to send this request"),
+            text.contains("The PAC script could not tell where to send this request"),
             "{text}"
         );
         assert!(text.contains(expected), "{host}: {text}");

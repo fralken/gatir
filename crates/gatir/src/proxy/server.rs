@@ -24,7 +24,7 @@ use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::auth::TokenSource;
 use crate::config::{Config, HeaderRule, Timeouts};
-use crate::pac;
+use crate::pac::PacSource;
 
 /// Largest request head (target plus header fields) accepted, in bytes.
 ///
@@ -61,6 +61,8 @@ pub struct Server {
     access: Acl,
     timeouts: Timeouts,
     upstreams: Upstreams,
+    /// The PAC script, which is read again from time to time while running.
+    pac: Option<Arc<PacSource>>,
     auth: Option<ParentAuth>,
     request_headers: Vec<HeaderRule>,
 }
@@ -82,7 +84,10 @@ impl Server {
 
     async fn bind_with(config: &Config, tokens: Option<Arc<dyn TokenSource>>) -> io::Result<Self> {
         // A PAC file that is missing or wrong is found here, not on the first request.
-        let pac = config.pac.as_ref().map(pac::load_file).transpose()?;
+        let pac = match &config.pac {
+            Some(settings) => Some(PacSource::start(settings).await?),
+            None => None,
+        };
         // Credentials only matter when there is a parent proxy to give them to.
         let auth = match &config.credentials {
             Some(credentials) if !config.parents.is_empty() || pac.is_some() => Some(
@@ -102,7 +107,8 @@ impl Server {
             listeners,
             access: config.access.clone(),
             timeouts: config.timeouts.clone(),
-            upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone(), pac),
+            upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone(), pac.clone()),
+            pac,
             auth,
             request_headers: config.request_headers.clone(),
         })
@@ -139,6 +145,9 @@ impl Server {
             context
                 .tracker
                 .spawn(accept_loop(listener, context.clone()));
+        }
+        if let Some(pac) = self.pac {
+            context.tracker.spawn(pac.keep_fresh(shutdown.clone()));
         }
 
         shutdown.cancelled().await;
