@@ -36,19 +36,20 @@ cat <<FORMULA
 class Gatir < Formula
   desc "Authenticating proxy for corporate proxies (NTLM, Kerberos)"
   homepage "https://github.com/${repository}"
-  version "${version}"
   license any_of: ["MIT", "Apache-2.0"]
 
   depends_on :macos
 
-  on_arm do
-    url "${arm_url}"
-    sha256 "${arm_sum}"
-  end
+  on_macos do
+    on_arm do
+      url "${arm_url}"
+      sha256 "${arm_sum}"
+    end
 
-  on_intel do
-    url "${intel_url}"
-    sha256 "${intel_sum}"
+    on_intel do
+      url "${intel_url}"
+      sha256 "${intel_sum}"
+    end
   end
 
   def install
