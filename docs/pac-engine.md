@@ -22,7 +22,7 @@ Release builds on macOS (arm64), with a fixed time zone and a deterministic
 stand-in for DNS. Node (V8) evaluated the same scripts as a reference. The
 scripts were a 61 KB PAC written for a real corporate network (kept out of this
 repository) evaluated for 1094 URLs, three generated PACs of 80 to 190 KB that
-call helpers thousands of times per evaluation, and 25 cases of ordinary and
+call helpers thousands of times per evaluation, and 36 cases of ordinary and
 hostile scripts, each in its own process with a time limit.
 
 | | `rquickjs` 0.14 (QuickJS, C) | `boa_engine` 0.22 (Rust) |
