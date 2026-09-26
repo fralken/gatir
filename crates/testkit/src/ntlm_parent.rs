@@ -80,6 +80,8 @@ pub struct Options {
     pub ntlm: bool,
     /// Close the connection when the NEGOTIATE message arrives.
     pub close_on_negotiate: bool,
+    /// Read the NEGOTIATE message and never answer it, keeping the connection open.
+    pub stall_on_negotiate: bool,
     /// Send `Connection: close` with the `407` that carries the challenge.
     pub close_after_challenge: bool,
     /// Forget a connection's authentication once it has served this many
@@ -95,6 +97,7 @@ impl Default for Options {
             offers: vec!["NTLM".to_owned()],
             ntlm: true,
             close_on_negotiate: false,
+            stall_on_negotiate: false,
             close_after_challenge: false,
             forget_after: None,
             timestamp: None,
@@ -243,6 +246,10 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
                     if shared.options.close_on_negotiate {
                         record(false);
                         return;
+                    }
+                    if shared.options.stall_on_negotiate {
+                        record(false);
+                        std::future::pending::<()>().await;
                     }
                     let challenge = challenge_for(id);
                     state = State::Challenged(challenge);

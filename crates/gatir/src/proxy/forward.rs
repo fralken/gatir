@@ -12,7 +12,7 @@ use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
-use super::body::{Body, full};
+use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::{Failure, connect_tcp};
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent_auth::{Admission, Outcome, ParentAuth, reusable};
@@ -73,7 +73,15 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     // when that cannot change anything twice.
     let replay = head.as_ref().filter(|_| is_idempotent(&parts.method));
 
-    let mut request = Request::new(body.boxed_unsync());
+    // The wait for a response is timed from the moment the request is sent.
+    let (body, mut sent) = watch(body.boxed_unsync());
+    let limit = context.timeouts.response;
+    let who = match route {
+        Route::Direct => "the upstream server",
+        Route::Parent => "the parent proxy",
+    };
+
+    let mut request = Request::new(body);
     *request.method_mut() = parts.method.clone();
     *request.uri_mut() = uri;
     *request.headers_mut() = parts.headers;
@@ -108,15 +116,17 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             .await?
             {
                 Authenticated::Answered(response) => break response,
-                Authenticated::Proof(sent) => admission = Some(sent),
+                Authenticated::Proof(proof) => admission = Some(proof),
                 Authenticated::Ready => {}
             }
         }
 
-        let mut failed = match lease.sender.try_send_request(request).await {
-            Ok(response) if demands_authentication(&response, route, context) => {
-                if let Some(sent) = admission.take() {
-                    return Err(sent.refused());
+        let attempt = response_within(limit, &mut sent, lease.sender.try_send_request(request));
+        let mut failed = match attempt.await {
+            None => return Err(Failure::ResponseTimeout(who)),
+            Some(Ok(response)) if demands_authentication(&response, route, context) => {
+                if let Some(proof) = admission.take() {
+                    return Err(proof.refused());
                 }
                 // No proof went out on this connection: it had been
                 // authenticated, and is not any more.
@@ -126,16 +136,17 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 tracing::debug!("a connection lost its authentication, retrying on a new one");
                 lapsed = true;
                 request = head.request();
+                sent = Sent::already();
                 lease = connect(context, route, &target).await?;
                 continue;
             }
-            Ok(response) => {
-                if let Some(sent) = admission.take() {
-                    sent.accepted();
+            Some(Ok(response)) => {
+                if let Some(proof) = admission.take() {
+                    proof.accepted();
                 }
                 break response;
             }
-            Err(failed) => failed,
+            Some(Err(failed)) => failed,
         };
         let returned = failed.take_message();
         let error = failed.into_error();
@@ -148,7 +159,10 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         tracing::debug!(%error, "pooled connection was stale, retrying on a new one");
         request = match (returned, replay) {
             (Some(returned), _) => returned,
-            (None, Some(replay)) => replay.request(),
+            (None, Some(replay)) => {
+                sent = Sent::already();
+                replay.request()
+            }
             (None, None) => return Err(Failure::Upstream(error)),
         };
         lease = connect(context, route, &target).await?;
@@ -213,8 +227,9 @@ async fn authenticate<'a>(
     let is_real = carrier.is_some();
     let first = carrier.unwrap_or_else(|| probe(target, &context.request_headers));
 
+    let limit = context.timeouts.response;
     lease.needs_auth = false;
-    match auth.negotiate(&mut lease.sender, first).await? {
+    match auth.negotiate(&mut lease.sender, first, limit).await? {
         Outcome::Proof(proof) => {
             request.headers_mut().insert(PROXY_AUTHORIZATION, proof);
             Ok(Authenticated::Proof(admission))
@@ -224,7 +239,7 @@ async fn authenticate<'a>(
             // The probe got an answer, which is not for the client. If it
             // cannot be read to the end, the connection is of no further use.
             let (_, body) = response.into_parts();
-            if !reusable(body, &mut lease.sender).await {
+            if !reusable(body, &mut lease.sender, limit).await {
                 *lease = connect(context, Route::Parent, target).await?;
                 lease.needs_auth = false;
             }

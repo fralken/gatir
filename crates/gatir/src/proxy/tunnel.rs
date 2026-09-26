@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-use super::body::{Body, full};
+use super::body::{Body, answer_within, full};
 use super::failure::{Failure, connect_tcp};
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent_auth::Outcome;
@@ -159,21 +159,23 @@ async fn connect_through_parent(
     // Set once a proof has been sent, until the parent has said whether it
     // accepts it.
     let mut admission = None;
+    let limit = context.timeouts.response;
+    let timed_out = Failure::ResponseTimeout("the parent proxy");
     let response = match &context.auth {
-        None => sender
-            .send_request(connect(None))
+        None => answer_within(limit, sender.send_request(connect(None)))
             .await
+            .ok_or(timed_out)?
             .map_err(Failure::Upstream)?,
         Some(auth) => {
             let admitted = auth.admit().await?;
-            match auth.negotiate(&mut sender, connect(None)).await? {
+            match auth.negotiate(&mut sender, connect(None), limit).await? {
                 // The parent asked for nothing: this is its answer.
                 Outcome::Answered(response) => response,
                 Outcome::Proof(proof) => {
                     admission = Some(admitted);
-                    sender
-                        .send_request(connect(Some(proof)))
+                    answer_within(limit, sender.send_request(connect(Some(proof))))
                         .await
+                        .ok_or(timed_out)?
                         .map_err(Failure::Upstream)?
                 }
             }

@@ -19,8 +19,9 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
 use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use hyper::{Request, Response, StatusCode};
+use tokio::time::timeout;
 
-use super::body::Body;
+use super::body::{Body, answer_within};
 use super::failure::Failure;
 use crate::auth::{AuthError, Authenticator};
 use crate::config::Credentials;
@@ -106,13 +107,14 @@ impl ParentAuth {
         &self,
         sender: &mut SendRequest<Body>,
         mut first: Request<Body>,
+        limit: Duration,
     ) -> Result<Outcome, Failure> {
         first
             .headers_mut()
             .insert(PROXY_AUTHORIZATION, self.authenticator.first()?);
-        let response = sender
-            .send_request(first)
+        let response = answer_within(limit, sender.send_request(first))
             .await
+            .ok_or(Failure::ResponseTimeout("the parent proxy"))?
             .map_err(Failure::Upstream)?;
         if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
             return Ok(Outcome::Answered(response));
@@ -122,7 +124,7 @@ impl ParentAuth {
         let proof = self
             .authenticator
             .respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
-        if !reusable(body, sender).await {
+        if !reusable(body, sender, limit).await {
             return Err(Failure::Parent(
                 "the parent proxy did not keep the connection open during authentication",
             ));
@@ -158,7 +160,14 @@ impl Admission<'_> {
 
 /// Reads a response body to its end, so the connection can carry the next
 /// request, and waits until it can. False if the body is too long to bother
-/// with or the connection was closed.
-pub(super) async fn reusable(body: Incoming, sender: &mut SendRequest<Body>) -> bool {
-    Limited::new(body, DRAIN_LIMIT).collect().await.is_ok() && sender.ready().await.is_ok()
+/// with, the connection was closed, or it takes longer than `limit`.
+pub(super) async fn reusable(
+    body: Incoming,
+    sender: &mut SendRequest<Body>,
+    limit: Duration,
+) -> bool {
+    let drained = async {
+        Limited::new(body, DRAIN_LIMIT).collect().await.is_ok() && sender.ready().await.is_ok()
+    };
+    timeout(limit, drained).await.unwrap_or(false)
 }

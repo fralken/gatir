@@ -45,6 +45,8 @@ pub(super) enum Failure {
     Upstream(hyper::Error),
     /// The parent proxy did something unexpected; the text says what.
     Parent(&'static str),
+    /// No response came in time from the named party.
+    ResponseTimeout(&'static str),
     /// The NTLM exchange with the parent could not be carried out.
     Authentication(AuthError),
     /// The parent answered the credentials with another `407`.
@@ -104,6 +106,11 @@ impl Failure {
                 false,
             ),
             Self::Parent(message) => error_response(StatusCode::BAD_GATEWAY, message, false),
+            Self::ResponseTimeout(who) => error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Timed out waiting for a response from {who}"),
+                false,
+            ),
             Self::Authentication(err) => error_response(
                 StatusCode::BAD_GATEWAY,
                 format!("Cannot authenticate to the parent proxy: {err}"),
