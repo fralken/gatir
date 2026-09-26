@@ -314,7 +314,7 @@ mod tests {
                 if line.starts_with('.') && !line.starts_with("..") {
                     let word = line.split_whitespace().next().unwrap_or(line);
                     assert!(
-                        requests.iter().any(|request| word == *request),
+                        requests.contains(&word),
                         "{name}:{}: an unknown request {word:?}",
                         number + 1
                     );
