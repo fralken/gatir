@@ -75,6 +75,7 @@ pub fn exposure(_path: &Path, _holds_secrets: bool) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn os(text: &str) -> Option<OsString> {
         Some(OsString::from(text))
     }
