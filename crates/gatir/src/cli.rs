@@ -61,6 +61,10 @@ pub struct OverrideArgs {
     #[arg(short = 'L', long = "tunnel", global = true, value_name = "SPEC")]
     pub tunnels: Vec<Tunnel>,
 
+    /// Address for a SOCKS5 server; repeat for several (replaces `[socks5] listen` from the file)
+    #[arg(long, global = true, value_name = "ADDR")]
+    pub socks5: Vec<SocketAddr>,
+
     /// Ask for the password on the terminal (replaces any password or hash from the file)
     #[arg(long, global = true)]
     pub password_prompt: bool,
@@ -107,6 +111,7 @@ impl OverrideArgs {
             method: self.method,
             password,
             tunnels: self.tunnels,
+            socks5: self.socks5,
             log_level: self.log_level,
         }
     }

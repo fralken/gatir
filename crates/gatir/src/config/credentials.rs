@@ -203,7 +203,7 @@ fn parse_hash(
 ///
 /// Non-string values are rejected without echoing them: serde's default
 /// "invalid type" message would otherwise print e.g. a numeric password.
-fn secret_string<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
+pub(super) fn secret_string<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
 where
     D: Deserializer<'de>,
 {

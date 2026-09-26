@@ -20,6 +20,8 @@ pub struct TestProxy {
     pub addr: SocketAddr,
     /// The forwarded ports, in the order of the configuration.
     pub tunnels: Vec<SocketAddr>,
+    /// The SOCKS5 server, if there is one.
+    pub socks5: Vec<SocketAddr>,
     pub shutdown: CancellationToken,
     pub force: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -88,10 +90,12 @@ fn run(server: Server) -> TestProxy {
         .collect();
     let shutdown = CancellationToken::new();
     let force = CancellationToken::new();
+    let socks5 = server.socks5_addrs();
     let task = tokio::spawn(server.run(shutdown.clone(), force.clone()));
     TestProxy {
         addr,
         tunnels,
+        socks5,
         shutdown,
         force,
         task: Some(task),

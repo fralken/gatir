@@ -83,6 +83,16 @@ pub(super) enum Upstream {
     Tunnel(TokioIo<Upgraded>),
 }
 
+impl Upstream {
+    /// The local address of a direct connection.
+    pub(super) fn local_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Direct(stream) => stream.local_addr().ok(),
+            Self::Tunnel(_) => None,
+        }
+    }
+}
+
 impl AsyncRead for Upstream {
     fn poll_read(
         self: Pin<&mut Self>,

@@ -21,11 +21,12 @@ use super::body::error_response;
 use super::parent_auth::ParentAuth;
 use super::pool::Pool;
 use super::portfwd;
+use super::socks5;
 use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::auth::TokenSource;
-use crate::config::{Config, HeaderRule, HostPort, Timeouts};
+use crate::config::{Config, HeaderRule, HostPort, Socks5Credentials, Timeouts};
 use crate::pac::{PacSource, Trust};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
@@ -62,6 +63,9 @@ pub struct Server {
     listeners: Vec<TcpListener>,
     /// Ports forwarded to a fixed destination, each with its destination.
     tunnels: Vec<(TcpListener, HostPort)>,
+    /// SOCKS5 listeners, and who may use them (anyone, if not set).
+    socks5: Vec<TcpListener>,
+    socks5_credentials: Option<Arc<Socks5Credentials>>,
     access: Acl,
     timeouts: Timeouts,
     upstreams: Upstreams,
@@ -128,9 +132,25 @@ impl Server {
             })?;
             tunnels.push((listener, tunnel.target.clone()));
         }
+        let mut socks5 = Vec::new();
+        let mut socks5_credentials = None;
+        if let Some(config) = &config.socks5 {
+            for addr in &config.listen {
+                let listener = TcpListener::bind(addr).await.map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!("cannot listen on {addr} for SOCKS5: {err}"),
+                    )
+                })?;
+                socks5.push(listener);
+            }
+            socks5_credentials = config.credentials.clone().map(Arc::new);
+        }
         Ok(Self {
             listeners,
             tunnels,
+            socks5,
+            socks5_credentials,
             access: config.access.clone(),
             timeouts: config.timeouts.clone(),
             upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone(), pac.clone()),
@@ -153,6 +173,14 @@ impl Server {
         self.tunnels
             .iter()
             .filter_map(|(listener, target)| Some((listener.local_addr().ok()?, target.clone())))
+            .collect()
+    }
+
+    /// The bound addresses of the SOCKS5 server.
+    pub fn socks5_addrs(&self) -> Vec<SocketAddr> {
+        self.socks5
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
             .collect()
     }
 
@@ -179,6 +207,18 @@ impl Server {
             context
                 .tracker
                 .spawn(accept(listener, context.clone(), serve_connection, deny));
+        }
+        for listener in self.socks5 {
+            let credentials = self.socks5_credentials.clone();
+            context.tracker.spawn(accept(
+                listener,
+                context.clone(),
+                move |stream, peer, context| {
+                    socks5::serve(stream, peer, context, credentials.clone())
+                },
+                // Nothing to say in a protocol that has no words for it.
+                |_stream| async {},
+            ));
         }
         for (listener, target) in self.tunnels {
             context.tracker.spawn(accept(

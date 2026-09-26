@@ -8,6 +8,7 @@ mod parent_auth;
 mod pool;
 mod portfwd;
 mod server;
+mod socks5;
 mod tunnel;
 mod upstream;
 
@@ -27,6 +28,9 @@ pub async fn run(config: &Config) -> io::Result<()> {
     }
     for (addr, target) in server.tunnel_addrs() {
         tracing::info!(%addr, %target, "forwarding a port");
+    }
+    for addr in server.socks5_addrs() {
+        tracing::info!(%addr, "SOCKS5 listening");
     }
 
     let shutdown = CancellationToken::new();

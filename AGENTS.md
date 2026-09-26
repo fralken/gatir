@@ -26,7 +26,9 @@ CNTLM.
 ## Security rules
 
 - Passwords, NT/NTLMv2 hashes and tokens are handled only in the `config` and
-  `auth` modules, held in `secrecy`/`zeroize` types, and never logged.
+  `auth` modules, held in `secrecy`/`zeroize` types, and never logged. The one
+  exception is the password a SOCKS5 client offers: `proxy::socks5` reads it
+  into a `Zeroizing` buffer, hands it to `config` to compare, and drops it.
 - Never commit real credentials, hashes, internal hostnames or PAC files.
   `*.conf` and `*.pac` are git-ignored; examples use the `.example.toml`
   suffix and synthetic values. Tests use synthetic credentials only.

@@ -309,3 +309,32 @@ fn a_tunnel_that_is_not_one_is_refused_with_the_reason() {
             "expected [BIND:]PORT:HOST:HOSTPORT",
         ));
 }
+
+#[test]
+fn config_check_reports_the_socks5_server_without_its_password() {
+    let file = config_file(
+        "[socks5]\nlisten = [\"127.0.0.1:1080\"]\nusername = \"bob\"\npassword = \"hush-socks-pw\"\n",
+    );
+    gatir()
+        .args(["config", "check", "--log-level", "trace", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("127.0.0.1:1080")
+                .and(predicate::str::contains("user name \"bob\""))
+                .and(predicate::str::contains("hush-socks-pw").not()),
+        )
+        .stderr(predicate::str::contains("hush-socks-pw").not());
+
+    // --socks5 takes the place of the addresses.
+    gatir()
+        .args(["config", "check", "--socks5", "127.0.0.1:2080", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("127.0.0.1:2080")
+                .and(predicate::str::contains("127.0.0.1:1080").not()),
+        );
+}

@@ -13,6 +13,8 @@ depends on a detail of it.
 | RFC 4559, SPNEGO-based Kerberos and NTLM HTTP Authentication in Microsoft Windows | June 2006 | The `Negotiate` scheme (4), which a proxy applies with `Proxy-Authenticate` and `Proxy-Authorization` | `auth/negotiate.rs` |
 | RFC 9112, HTTP/1.1 | June 2022 | Message framing, in particular a request with both `Content-Length` and `Transfer-Encoding` (6.3) | `tests/proxy.rs` |
 | RFC 6585, Additional HTTP Status Codes | April 2012 | `431 Request Header Fields Too Large` (5) | `proxy/server.rs` |
+| RFC 1928, SOCKS Protocol Version 5 | March 1996 | The messages of the server: method selection (3), the request (4) and the reply (6), with the CONNECT command only | `proxy/socks5.rs` |
+| RFC 1929, Username/Password Authentication for SOCKS V5 | March 1996 | The authentication messages of the server | `proxy/socks5.rs`, `config/socks5.rs` |
 | Proxy Auto-Configuration (PAC) file format, as described by MDN (the Netscape original is no longer hosted) | 2026 | The helper functions of a PAC script, the argument forms of `dateRange`, `timeRange` and `weekdayRange`, and the result format | `pac/` |
 | IPv6 extensions to the PAC format, Microsoft | 2026 | `dnsResolveEx`, `isResolvableEx`, `isInNetEx`, `myIpAddressEx`, `sortIpAddressList` and `FindProxyForURLEx` | `pac/` |
 
@@ -25,6 +27,8 @@ depends on a detail of it.
 - RFC 9110: <https://www.rfc-editor.org/rfc/rfc9110>
 - RFC 9112: <https://www.rfc-editor.org/rfc/rfc9112>
 - RFC 3986: <https://www.rfc-editor.org/rfc/rfc3986>
+- RFC 1928: <https://www.rfc-editor.org/rfc/rfc1928>
+- RFC 1929: <https://www.rfc-editor.org/rfc/rfc1929>
 - RFC 4559: <https://www.rfc-editor.org/rfc/rfc4559>
 - RFC 6585: <https://www.rfc-editor.org/rfc/rfc6585>
 - PAC file format (MDN):

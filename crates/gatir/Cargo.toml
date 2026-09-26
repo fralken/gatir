@@ -46,6 +46,7 @@ rpassword = "7.5.4"
 rquickjs = "0.14"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
+subtle = "2.6.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 tokio-native-tls = "0.3.1"
