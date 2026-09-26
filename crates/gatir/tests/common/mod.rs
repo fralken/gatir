@@ -4,8 +4,10 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use gatir::auth::TokenSource;
 use gatir::config::{Config, Overrides};
 use gatir::proxy::Server;
 use gatir_testkit::http::RawClient;
@@ -45,9 +47,26 @@ impl Drop for TestProxy {
 /// Starts a proxy on a free loopback port. `extra` is appended to the
 /// configuration and may contain further top-level keys and tables.
 pub async fn start_proxy(extra: &str) -> TestProxy {
+    run(bind(extra, None).await)
+}
+
+/// Like [`start_proxy`], with Negotiate tokens from `tokens` in place of the
+/// system's Kerberos tickets.
+pub async fn start_proxy_with_tokens(extra: &str, tokens: Arc<dyn TokenSource>) -> TestProxy {
+    run(bind(extra, Some(tokens)).await)
+}
+
+async fn bind(extra: &str, tokens: Option<Arc<dyn TokenSource>>) -> Server {
     let toml = format!("listen = [\"127.0.0.1:0\"]\n{extra}");
     let config = Config::from_toml_str(&toml, Overrides::default()).expect("test configuration");
-    let server = Server::bind(&config).await.expect("bind the proxy");
+    match tokens {
+        Some(tokens) => Server::bind_with_tokens(&config, tokens).await,
+        None => Server::bind(&config).await,
+    }
+    .expect("bind the proxy")
+}
+
+fn run(server: Server) -> TestProxy {
     let addr = server.local_addrs()[0];
     let shutdown = CancellationToken::new();
     let force = CancellationToken::new();

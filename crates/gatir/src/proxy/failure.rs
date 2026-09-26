@@ -55,6 +55,10 @@ pub(super) enum Failure {
     },
     /// The parent refused the credentials recently, so nobody is trying yet.
     CoolingDown(Duration),
+    /// The parent offers Negotiate and did not accept the Kerberos ticket.
+    TicketRejected {
+        service: String,
+    },
     /// A connection the parent had authenticated asked for authentication
     /// again, and the request cannot be sent twice.
     AuthenticationLapsed,
@@ -123,6 +127,15 @@ impl Failure {
                      domain and password. gatir will not try again for {} minutes, so that the \
                      account does not get locked.",
                     COOLDOWN.as_secs() / 60
+                ),
+                false,
+            ),
+            Self::TicketRejected { service } => error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "The parent proxy did not accept the Kerberos ticket for {service}. Check that \
+                     the ticket is valid (klist), that the clock is right, and that this is the \
+                     name the proxy is registered under (credentials.spn)."
                 ),
                 false,
             ),

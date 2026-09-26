@@ -22,6 +22,7 @@ use super::pool::Pool;
 use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
+use crate::auth::TokenSource;
 use crate::config::{Config, HeaderRule, Timeouts};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
@@ -66,10 +67,23 @@ pub struct Server {
 impl Server {
     /// Binds every `listen` address of the configuration.
     pub async fn bind(config: &Config) -> io::Result<Self> {
+        Self::bind_with(config, None).await
+    }
+
+    /// Like [`Server::bind`], taking the Negotiate tokens from `tokens`
+    /// instead of the system's Kerberos tickets. For tests, which have none.
+    pub async fn bind_with_tokens(
+        config: &Config,
+        tokens: Arc<dyn TokenSource>,
+    ) -> io::Result<Self> {
+        Self::bind_with(config, Some(tokens)).await
+    }
+
+    async fn bind_with(config: &Config, tokens: Option<Arc<dyn TokenSource>>) -> io::Result<Self> {
         // Credentials only matter when there is a parent proxy to give them to.
         let auth = match &config.credentials {
             Some(credentials) if !config.parents.is_empty() => Some(
-                ParentAuth::new(credentials)
+                ParentAuth::new(credentials, tokens)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?,
             ),
             _ => None,

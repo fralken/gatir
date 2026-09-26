@@ -89,6 +89,11 @@ pub struct Options {
     pub forget_after: Option<usize>,
     /// The server clock (a Windows FILETIME) to put in the target info.
     pub timestamp: Option<u64>,
+    /// The Negotiate token that authenticates a connection. A request carrying
+    /// `Proxy-Authorization: Negotiate` with exactly these bytes is served, and
+    /// so is everything after it on that connection; any other token is refused.
+    /// `None` refuses every Negotiate token.
+    pub negotiate_token: Option<Vec<u8>>,
 }
 
 impl Default for Options {
@@ -101,6 +106,7 @@ impl Default for Options {
             close_after_challenge: false,
             forget_after: None,
             timestamp: None,
+            negotiate_token: None,
         }
     }
 }
@@ -113,6 +119,8 @@ pub struct Seen {
     pub connection: usize,
     /// The type (1 or 3) of the NTLM message in `Proxy-Authorization`, if any.
     pub message: Option<u32>,
+    /// The token of a `Proxy-Authorization: Negotiate` field, if any.
+    pub negotiate: Option<Vec<u8>>,
     /// True if the handler answered it, false if it got a `407`.
     pub served: bool,
 }
@@ -228,18 +236,35 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
             .get("proxy-authorization")
             .and_then(ntlm_token);
         let message = token.as_deref().and_then(message_type);
+        let negotiate = request
+            .headers
+            .get("proxy-authorization")
+            .and_then(negotiate_token);
         let record = |answered: bool| {
             shared.seen.lock().expect("seen lock").push(Seen {
                 request: request.clone(),
                 connection: id,
                 message,
+                negotiate: negotiate.clone(),
                 served: answered,
             });
         };
 
         // A `407` to send instead of serving the request, and whether to close.
-        let refusal: Option<(Vec<u8>, bool)> = if !shared.options.ntlm {
-            Some((shared.refusal(), false))
+        let refusal: Option<(Vec<u8>, bool)> = if let Some(proof) = &negotiate {
+            if shared.options.negotiate_token.as_ref() == Some(proof) {
+                state = State::Authenticated;
+                None
+            } else {
+                state = State::Anonymous;
+                Some((shared.refusal(), false))
+            }
+        } else if !shared.options.ntlm {
+            if state == State::Authenticated {
+                None
+            } else {
+                Some((shared.refusal(), false))
+            }
         } else {
             match (message, &token) {
                 (Some(1), _) => {
@@ -341,6 +366,15 @@ fn challenge_for(connection: usize) -> [u8; 8] {
 fn ntlm_token(value: &str) -> Option<Vec<u8>> {
     let (scheme, token) = value.trim().split_once(char::is_whitespace)?;
     if !scheme.eq_ignore_ascii_case("NTLM") {
+        return None;
+    }
+    STANDARD_PAD_INDIFFERENT.decode(token.trim()).ok()
+}
+
+/// The bytes of a `Negotiate <base64>` field value.
+fn negotiate_token(value: &str) -> Option<Vec<u8>> {
+    let (scheme, token) = value.trim().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("Negotiate") {
         return None;
     }
     STANDARD_PAD_INDIFFERENT.decode(token.trim()).ok()

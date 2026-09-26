@@ -5,7 +5,7 @@
 mod common;
 
 use common::get;
-use gatir::auth::Authenticator;
+use gatir::auth::NtlmAuthenticator;
 use gatir::config::{Config, Overrides};
 use gatir_testkit::http::{RawClient, Response};
 use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
@@ -14,13 +14,13 @@ use hyper::header::HeaderValue;
 
 const DESTINATION: &str = "origin.example.com";
 
-fn authenticator(method: &str, password: &str) -> Authenticator {
+fn authenticator(method: &str, password: &str) -> NtlmAuthenticator {
     let toml = format!(
         "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"{password}\"\n\
          method = \"{method}\"\n"
     );
     let config = Config::from_toml_str(&toml, Overrides::default()).unwrap();
-    Authenticator::new(&config.credentials.unwrap()).unwrap()
+    NtlmAuthenticator::new(&config.credentials.unwrap()).unwrap()
 }
 
 async fn parent(options: Options) -> MockNtlmParent {
@@ -48,7 +48,7 @@ fn challenge_fields(response: &Response) -> Vec<HeaderValue> {
 }
 
 /// Runs the three-message exchange on `client` and returns the final response.
-async fn authenticate(client: &mut RawClient, auth: &Authenticator) -> Response {
+async fn authenticate(client: &mut RawClient, auth: &NtlmAuthenticator) -> Response {
     client
         .send(with_proof(&auth.first().unwrap()))
         .await

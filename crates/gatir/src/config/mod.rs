@@ -534,6 +534,27 @@ mod tests {
     }
 
     #[test]
+    fn negotiate_can_name_the_service_of_the_parent() {
+        let config = load(
+            "[credentials]\nmethod = \"negotiate\"\nspn = \" HTTP/proxy.example.com@EXAMPLE.COM \"",
+        )
+        .unwrap();
+        let creds = config.credentials.unwrap();
+        assert_eq!(
+            creds.spn.as_deref(),
+            Some("HTTP/proxy.example.com@EXAMPLE.COM")
+        );
+        assert_eq!(
+            load("[credentials]\nmethod = \"negotiate\"")
+                .unwrap()
+                .credentials
+                .unwrap()
+                .spn,
+            None
+        );
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         for toml in [
             "listn = []",
@@ -607,6 +628,14 @@ mod tests {
             (
                 "[credentials]\nmethod = \"kerberos\"\nusername = \"a\"",
                 "unknown variant",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\npassword = \"p\"\nspn = \"HTTP@proxy\"",
+                "credentials.spn only applies to method",
+            ),
+            (
+                "[credentials]\nmethod = \"negotiate\"\nspn = \"  \"",
+                "credentials.spn must not be empty",
             ),
         ];
         for (toml, expected) in cases {

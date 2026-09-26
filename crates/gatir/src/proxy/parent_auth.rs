@@ -1,29 +1,36 @@
 //! Authenticating connections to a parent proxy.
 //!
-//! [`ParentAuth::negotiate`] runs the first half of an NTLM exchange on a
-//! connection; the caller then sends the real request carrying the proof it
-//! returns. NTLM belongs to the connection, so every new connection to the
-//! parent goes through this once, and a pooled one is already authenticated.
+//! Both schemes belong to the connection, so every new connection to the
+//! parent is authenticated once, and a pooled one already is. They differ in
+//! how the proof is made:
 //!
-//! Every attempt with wrong credentials counts as a failed logon against the
-//! account, and a few of them lock it. So [`ParentAuth::admit`] lets one
-//! attempt at a time through until the credentials have worked once, and stays
-//! away from the parent for a while after it refuses them.
+//! - NTLM needs the proxy's challenge. [`ParentAuth::negotiate`] runs the first
+//!   half of the exchange, and the caller then sends the real request carrying
+//!   the proof it returns.
+//! - Negotiate needs none: [`ParentAuth::direct_proof`] makes the proof at
+//!   once, and the real request carries it.
+//!
+//! Every attempt with wrong NTLM credentials counts as a failed logon against
+//! the account, and a few of them lock it. So [`ParentAuth::admit`] lets one
+//! attempt at a time through until the credentials have worked once, and
+//! stays away from the parent for a while after it refuses them. A Kerberos
+//! ticket that the proxy does not accept costs the account nothing, so
+//! Negotiate is never held off.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
-use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
+use hyper::header::{HeaderMap, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use hyper::{Request, Response, StatusCode};
 use tokio::time::timeout;
 
 use super::body::{Body, answer_within};
 use super::failure::Failure;
-use crate::auth::{AuthError, Authenticator};
+use crate::auth::{AuthError, Authenticator, Refusal, TokenSource, negotiate_header, refusal};
 use crate::config::Credentials;
 
 /// How long gatir stays away from a parent that refused the credentials.
@@ -55,12 +62,29 @@ pub(super) enum Outcome {
 pub(super) struct Admission<'a> {
     auth: &'a ParentAuth,
     _gate: Option<tokio::sync::MutexGuard<'a, ()>>,
+    /// The Kerberos service the proof was made for, to say so if it is refused.
+    service: Option<String>,
+}
+
+/// A proof made without a challenge.
+pub(super) struct DirectProof {
+    pub header: HeaderValue,
+    /// The Kerberos service it was made for.
+    pub service: String,
 }
 
 impl ParentAuth {
-    pub(super) fn new(credentials: &Credentials) -> Result<Self, AuthError> {
+    /// `tokens` replaces the system's Kerberos tickets, for tests.
+    pub(super) fn new(
+        credentials: &Credentials,
+        tokens: Option<Arc<dyn TokenSource>>,
+    ) -> Result<Self, AuthError> {
+        let authenticator = match tokens {
+            Some(tokens) => Authenticator::with_tokens(credentials, tokens)?,
+            None => Authenticator::new(credentials)?,
+        };
         Ok(Self {
-            authenticator: Authenticator::new(credentials)?,
+            authenticator,
             rejected_at: Mutex::new(None),
             verified: AtomicBool::new(false),
             gate: tokio::sync::Mutex::new(()),
@@ -90,6 +114,7 @@ impl ParentAuth {
             return Ok(Admission {
                 auth: self,
                 _gate: None,
+                service: None,
             });
         }
         let gate = self.gate.lock().await;
@@ -99,6 +124,40 @@ impl ParentAuth {
         Ok(Admission {
             auth: self,
             _gate: gate,
+            service: None,
+        })
+    }
+
+    /// Whether the proof can be made without asking the parent for anything.
+    pub(super) fn is_direct(&self) -> bool {
+        matches!(self.authenticator, Authenticator::Negotiate(_))
+    }
+
+    /// Makes the Negotiate proof for the parent at `parent_host`.
+    pub(super) async fn direct_proof(
+        &self,
+        parent_host: &str,
+        limit: Duration,
+    ) -> Result<DirectProof, Failure> {
+        let Authenticator::Negotiate(negotiate) = &self.authenticator else {
+            return Err(Failure::Parent(
+                "a proof was made without a challenge for a scheme that needs one",
+            ));
+        };
+        let service = negotiate.service_for(parent_host);
+        let tokens = negotiate.tokens();
+        let asked = service.clone();
+        // A ticket for a new service is fetched from the KDC, which blocks.
+        let token = timeout(
+            limit,
+            tokio::task::spawn_blocking(move || tokens.token(&asked)),
+        )
+        .await
+        .map_err(|_| Failure::ResponseTimeout("the Kerberos server"))?
+        .map_err(|_| Failure::Parent("the Kerberos ticket could not be requested"))??;
+        Ok(DirectProof {
+            header: negotiate_header(&token),
+            service,
         })
     }
 
@@ -109,9 +168,14 @@ impl ParentAuth {
         mut first: Request<Body>,
         limit: Duration,
     ) -> Result<Outcome, Failure> {
+        let Authenticator::Ntlm(ntlm) = &self.authenticator else {
+            return Err(Failure::Parent(
+                "an NTLM exchange was started for a scheme that is not NTLM",
+            ));
+        };
         first
             .headers_mut()
-            .insert(PROXY_AUTHORIZATION, self.authenticator.first()?);
+            .insert(PROXY_AUTHORIZATION, ntlm.first()?);
         let response = answer_within(limit, sender.send_request(first))
             .await
             .ok_or(Failure::ResponseTimeout("the parent proxy"))?
@@ -121,9 +185,7 @@ impl ParentAuth {
         }
 
         let (parts, body) = response.into_parts();
-        let proof = self
-            .authenticator
-            .respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
+        let proof = ntlm.respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
         if !reusable(body, sender, limit).await {
             return Err(Failure::Parent(
                 "the parent proxy did not keep the connection open during authentication",
@@ -134,27 +196,56 @@ impl ParentAuth {
 }
 
 impl Admission<'_> {
+    /// Records the Kerberos service the proof was made for.
+    pub(super) fn made_for(mut self, service: String) -> Self {
+        self.service = Some(service);
+        self
+    }
+
     /// The parent accepted the proof.
     pub(super) fn accepted(self) {
         self.auth.verified.store(true, Ordering::Release);
         tracing::debug!("the parent proxy accepted the credentials");
     }
 
-    /// The parent refused the proof: stay away from it for a while.
-    pub(super) fn refused(self) -> Failure {
-        let user = self.auth.authenticator.user().to_owned();
-        let mut rejected_at = self.auth.rejected_at();
-        let first = rejected_at.is_none_or(|at| at.elapsed() >= COOLDOWN);
-        *rejected_at = Some(Instant::now());
-        self.auth.verified.store(false, Ordering::Release);
-        if first {
-            tracing::warn!(
-                %user,
-                cooldown_secs = COOLDOWN.as_secs(),
-                "the parent proxy rejected the credentials; not trying again for a while"
-            );
+    /// The parent refused the proof; `fields` are the `Proxy-Authenticate`
+    /// fields of its `407`. An NTLM refusal keeps gatir away from the parent
+    /// for a while; a Negotiate one does not.
+    pub(super) fn refused(self, fields: &HeaderMap) -> Failure {
+        match &self.auth.authenticator {
+            Authenticator::Ntlm(ntlm) => {
+                let user = ntlm.user().to_owned();
+                let mut rejected_at = self.auth.rejected_at();
+                let first = rejected_at.is_none_or(|at| at.elapsed() >= COOLDOWN);
+                *rejected_at = Some(Instant::now());
+                self.auth.verified.store(false, Ordering::Release);
+                if first {
+                    tracing::warn!(
+                        %user,
+                        cooldown_secs = COOLDOWN.as_secs(),
+                        "the parent proxy rejected the credentials; not trying again for a while"
+                    );
+                }
+                Failure::CredentialsRejected { user }
+            }
+            Authenticator::Negotiate(_) => {
+                self.auth.verified.store(false, Ordering::Release);
+                let service = self.service.clone().unwrap_or_default();
+                match refusal(fields.get_all(PROXY_AUTHENTICATE)) {
+                    Refusal::NotOffered { offered } => {
+                        Failure::Authentication(AuthError::NegotiateNotOffered { offered })
+                    }
+                    Refusal::AnotherRound => Failure::Parent(
+                        "the parent proxy answered the Negotiate token with a token of its own, \
+                         and a second round is not supported yet",
+                    ),
+                    Refusal::Rejected => {
+                        tracing::warn!(%service, "the parent proxy did not accept the Kerberos ticket");
+                        Failure::TicketRejected { service }
+                    }
+                }
+            }
         }
-        Failure::CredentialsRejected { user }
     }
 }
 

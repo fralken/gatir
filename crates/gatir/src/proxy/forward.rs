@@ -126,7 +126,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             None => return Err(Failure::ResponseTimeout(who)),
             Some(Ok(response)) if demands_authentication(&response, route, context) => {
                 if let Some(proof) = admission.take() {
-                    return Err(proof.refused());
+                    return Err(proof.refused(response.headers()));
                 }
                 // No proof went out on this connection: it had been
                 // authenticated, and is not any more.
@@ -221,13 +221,29 @@ async fn authenticate<'a>(
     lapsed: bool,
 ) -> Result<Authenticated<'a>, Failure> {
     let admission = auth.admit().await?;
+    let limit = context.timeouts.response;
+    if auth.is_direct() {
+        // No challenge to wait for: the request carries the proof itself.
+        let PoolKey::Parent(parent) = lease.key else {
+            return Err(Failure::Parent(
+                "a connection to an origin server was asked to authenticate as a parent",
+            ));
+        };
+        let proof = auth
+            .direct_proof(context.upstreams.parent_host(parent), limit)
+            .await?;
+        request
+            .headers_mut()
+            .insert(PROXY_AUTHORIZATION, proof.header);
+        lease.needs_auth = false;
+        return Ok(Authenticated::Proof(admission.made_for(proof.service)));
+    }
     let carrier = head
         .filter(|head| lapsed || head.method != Method::HEAD)
         .map(Head::request);
     let is_real = carrier.is_some();
     let first = carrier.unwrap_or_else(|| probe(target, &context.request_headers));
 
-    let limit = context.timeouts.response;
     lease.needs_auth = false;
     match auth.negotiate(&mut lease.sender, first, limit).await? {
         Outcome::Proof(proof) => {

@@ -45,6 +45,11 @@ impl Upstreams {
         }
     }
 
+    /// The host of the parent at `index`, as configured.
+    pub(super) fn parent_host(&self, index: usize) -> &str {
+        &self.parents[index].host
+    }
+
     /// Index of the parent that requests currently start with.
     pub(super) fn current_parent(&self) -> usize {
         self.current.load(Ordering::Relaxed) % self.parents.len().max(1)

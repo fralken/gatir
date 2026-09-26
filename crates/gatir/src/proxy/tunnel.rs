@@ -74,8 +74,8 @@ async fn open(
             if let Some(auth) = &context.auth {
                 auth.check()?;
             }
-            let (_, stream) = context.upstreams.connect_parent(limit).await?;
-            match connect_through_parent(stream, &address, &mut request, context).await? {
+            let (parent, stream) = context.upstreams.connect_parent(limit).await?;
+            match connect_through_parent(stream, parent, &address, &mut request, context).await? {
                 ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
                 ParentAnswer::Refused(response) => return Ok(response),
             }
@@ -112,10 +112,11 @@ enum ParentAnswer {
 /// hop-by-hop ones and its proxy credentials.
 ///
 /// If the parent wants NTLM, the CONNECT request itself opens the exchange and
-/// is sent again with the proof. The connection then becomes the tunnel, so it
-/// is never reused.
+/// is sent again with the proof. With Negotiate it carries the proof at once.
+/// The connection then becomes the tunnel, so it is never reused.
 async fn connect_through_parent(
     stream: TcpStream,
+    parent: usize,
     address: &str,
     client_request: &mut Request<Incoming>,
     context: &Context,
@@ -166,6 +167,16 @@ async fn connect_through_parent(
             .await
             .ok_or(timed_out)?
             .map_err(Failure::Upstream)?,
+        Some(auth) if auth.is_direct() => {
+            let admitted = auth.admit().await?;
+            let host = context.upstreams.parent_host(parent);
+            let proof = auth.direct_proof(host, limit).await?;
+            admission = Some(admitted.made_for(proof.service));
+            answer_within(limit, sender.send_request(connect(Some(proof.header))))
+                .await
+                .ok_or(timed_out)?
+                .map_err(Failure::Upstream)?
+        }
         Some(auth) => {
             let admitted = auth.admit().await?;
             match auth.negotiate(&mut sender, connect(None), limit).await? {
@@ -184,7 +195,7 @@ async fn connect_through_parent(
 
     if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         if let Some(sent) = admission {
-            return Err(sent.refused());
+            return Err(sent.refused(response.headers()));
         }
         tracing::warn!(
             "the parent proxy answered 407: it wants authentication, but no credentials are configured"

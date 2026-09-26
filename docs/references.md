@@ -8,7 +8,8 @@ depends on a detail of it.
 | Document | Revision used | Used for | Where |
 |---|---|---|---|
 | [MS-NLMP] NT LAN Manager (NTLM) Authentication Protocol | 37.0 (v20260330) | The NTLM messages, password hashes and challenge responses, and the test vectors | `crates/gatir/src/auth/ntlm/` |
-| RFC 9110, HTTP Semantics | June 2022 | Connection-specific header fields (7.6.1) and idempotent methods (9.2.2) | `proxy/headers.rs`, `proxy/forward.rs` |
+| RFC 9110, HTTP Semantics | June 2022 | Connection-specific header fields (7.6.1), idempotent methods (9.2.2), and authentication to proxies (11.7) | `proxy/headers.rs`, `proxy/forward.rs`, `auth/negotiate.rs` |
+| RFC 4559, SPNEGO-based Kerberos and NTLM HTTP Authentication in Microsoft Windows | June 2006 | The `Negotiate` scheme (4), which a proxy applies with `Proxy-Authenticate` and `Proxy-Authorization` | `auth/negotiate.rs` |
 | RFC 9112, HTTP/1.1 | June 2022 | Message framing, in particular a request with both `Content-Length` and `Transfer-Encoding` (6.3) | `tests/proxy.rs` |
 | RFC 6585, Additional HTTP Status Codes | April 2012 | `431 Request Header Fields Too Large` (5) | `proxy/server.rs` |
 
@@ -20,6 +21,7 @@ depends on a detail of it.
   <https://winprotocoldocs-bhdugrdyduf5h2e4.b02.azurefd.net/MS-NLMP/%5bMS-NLMP%5d-260330.pdf>
 - RFC 9110: <https://www.rfc-editor.org/rfc/rfc9110>
 - RFC 9112: <https://www.rfc-editor.org/rfc/rfc9112>
+- RFC 4559: <https://www.rfc-editor.org/rfc/rfc4559>
 - RFC 6585: <https://www.rfc-editor.org/rfc/rfc6585>
 
 ## [MS-NLMP]: sections used

@@ -75,6 +75,9 @@ pub struct Credentials {
     pub workstation: Option<String>,
     /// `None` only for [`AuthMethod::Negotiate`].
     pub secret: Option<Secret>,
+    /// Service name of the parent proxy, for [`AuthMethod::Negotiate`] only.
+    /// `None` means `HTTP@` followed by the parent's host.
+    pub spn: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,6 +86,7 @@ pub(super) struct RawCredentials {
     pub username: Option<String>,
     pub domain: Option<String>,
     pub workstation: Option<String>,
+    pub spn: Option<String>,
     pub method: Option<AuthMethod>,
     #[serde(default, deserialize_with = "secret_string")]
     pub password: Option<SecretString>,
@@ -153,12 +157,26 @@ impl RawCredentials {
             }
         }
 
+        let spn = match self.spn {
+            None => None,
+            Some(_) if method != AuthMethod::Negotiate => {
+                return Err(ConfigError::invalid(
+                    "credentials.spn only applies to method = \"negotiate\"",
+                ));
+            }
+            Some(spn) if spn.trim().is_empty() => {
+                return Err(ConfigError::invalid("credentials.spn must not be empty"));
+            }
+            Some(spn) => Some(spn.trim().to_owned()),
+        };
+
         Ok(Credentials {
             method,
             username,
             domain,
             workstation: self.workstation,
             secret,
+            spn,
         })
     }
 }
