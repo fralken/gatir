@@ -1,6 +1,7 @@
 //! Listeners, the accept loop and per-connection HTTP serving.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,11 +20,12 @@ use tokio_util::task::TaskTracker;
 use super::body::error_response;
 use super::parent_auth::ParentAuth;
 use super::pool::Pool;
+use super::portfwd;
 use super::upstream::Upstreams;
 use super::{forward, tunnel};
 use crate::acl::{Acl, Action};
 use crate::auth::TokenSource;
-use crate::config::{Config, HeaderRule, Timeouts};
+use crate::config::{Config, HeaderRule, HostPort, Timeouts};
 use crate::pac::{PacSource, Trust};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
@@ -58,6 +60,8 @@ pub(super) struct Context {
 /// Bound listeners, ready to accept clients.
 pub struct Server {
     listeners: Vec<TcpListener>,
+    /// Ports forwarded to a fixed destination, each with its destination.
+    tunnels: Vec<(TcpListener, HostPort)>,
     access: Acl,
     timeouts: Timeouts,
     upstreams: Upstreams,
@@ -114,8 +118,19 @@ impl Server {
             })?;
             listeners.push(listener);
         }
+        let mut tunnels = Vec::with_capacity(config.tunnels.len());
+        for tunnel in &config.tunnels {
+            let listener = TcpListener::bind(tunnel.listen).await.map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("cannot listen on {} for a tunnel: {err}", tunnel.listen),
+                )
+            })?;
+            tunnels.push((listener, tunnel.target.clone()));
+        }
         Ok(Self {
             listeners,
+            tunnels,
             access: config.access.clone(),
             timeouts: config.timeouts.clone(),
             upstreams: Upstreams::new(config.parents.clone(), config.no_proxy.clone(), pac.clone()),
@@ -130,6 +145,14 @@ impl Server {
         self.listeners
             .iter()
             .filter_map(|listener| listener.local_addr().ok())
+            .collect()
+    }
+
+    /// The bound addresses of the forwarded ports, with where each leads.
+    pub fn tunnel_addrs(&self) -> Vec<(SocketAddr, HostPort)> {
+        self.tunnels
+            .iter()
+            .filter_map(|(listener, target)| Some((listener.local_addr().ok()?, target.clone())))
             .collect()
     }
 
@@ -155,7 +178,16 @@ impl Server {
         for listener in self.listeners {
             context
                 .tracker
-                .spawn(accept_loop(listener, context.clone()));
+                .spawn(accept(listener, context.clone(), serve_connection, deny));
+        }
+        for (listener, target) in self.tunnels {
+            context.tracker.spawn(accept(
+                listener,
+                context.clone(),
+                move |stream, peer, context| portfwd::serve(stream, peer, target.clone(), context),
+                // Nothing to say in a protocol that has no words for it.
+                |_stream| async {},
+            ));
         }
         if let Some(pac) = self.pac {
             context.tracker.spawn(pac.keep_fresh(shutdown.clone()));
@@ -184,7 +216,20 @@ impl Server {
     }
 }
 
-async fn accept_loop(listener: TcpListener, context: Arc<Context>) {
+/// Accepts clients on `listener` until shutdown. Each one the access rules
+/// allow is handed to `serve`, in a task the shutdown waits for; each one they
+/// reject is handed to `denied`.
+pub(super) async fn accept<S, SF, D, DF>(
+    listener: TcpListener,
+    context: Arc<Context>,
+    serve: S,
+    denied: D,
+) where
+    S: Fn(TcpStream, SocketAddr, Arc<Context>) -> SF,
+    SF: Future<Output = ()> + Send + 'static,
+    D: Fn(TcpStream) -> DF,
+    DF: Future<Output = ()> + Send + 'static,
+{
     loop {
         let accepted = tokio::select! {
             () = context.shutdown.cancelled() => return,
@@ -202,12 +247,10 @@ async fn accept_loop(listener: TcpListener, context: Arc<Context>) {
 
         if context.access.check(peer.ip()) == Action::Deny {
             tracing::info!(peer = %peer.ip(), "connection denied by the access rules");
-            context.tracker.spawn(deny(stream));
+            context.tracker.spawn(denied(stream));
             continue;
         }
-        context
-            .tracker
-            .spawn(serve_connection(stream, peer, context.clone()));
+        context.tracker.spawn(serve(stream, peer, context.clone()));
     }
 }
 

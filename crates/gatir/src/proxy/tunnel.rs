@@ -1,5 +1,6 @@
 //! CONNECT tunnels: an opaque byte pipe between the client and a destination.
 
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +12,8 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
-use hyper::header::{HOST, HeaderValue, PROXY_AUTHORIZATION};
+use hyper::header::{HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
+use hyper::http::Extensions;
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
@@ -60,33 +62,125 @@ async fn open(
         .port_u16()
         .ok_or(Failure::BadRequest("CONNECT needs a host:port target"))?;
     let host = authority.host().to_owned();
-    let address = format!("{host}:{port}");
-    let limit = context.timeouts.connect;
 
     let client_upgrade = hyper::upgrade::on(&mut request);
-    // What a PAC script sees of a tunnel is the address it leads to.
+    let headers = std::mem::take(request.headers_mut());
+    // Carries the original capitalization of the header names.
+    let extensions = std::mem::take(request.extensions_mut());
+    match reach(context, &host, port, headers, extensions).await? {
+        Reached::Open(upstream) => spawn_tunnel(context, client_upgrade, upstream),
+        Reached::Refused(response) => return Ok(response),
+    }
+    Ok(Response::new(full(Bytes::new())))
+}
+
+/// A connection that carries bytes to a destination.
+pub(super) enum Upstream {
+    /// Straight to the destination.
+    Direct(TcpStream),
+    /// A parent proxy agreed to open a tunnel: the connection is now a pipe to
+    /// the destination.
+    Tunnel(TokioIo<Upgraded>),
+}
+
+impl AsyncRead for Upstream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Upstream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_write(cx, data),
+            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_write(cx, data),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_shutdown(cx),
+        }
+    }
+}
+
+pub(super) enum Reached {
+    Open(Upstream),
+    /// The parent said no: its answer is for the client.
+    Refused(Response<Body>),
+}
+
+/// Opens a connection to `host:port`, the way the configuration says: straight
+/// to it, or through a parent proxy that is asked to open a tunnel. `host` is
+/// as it appears in a URL, so an IPv6 address is in brackets. `headers` are
+/// what a parent is told about the client, on top of the configured rules.
+///
+/// What a PAC script sees of a tunnel is the address it leads to.
+pub(super) async fn reach(
+    context: &Context,
+    host: &str,
+    port: u16,
+    headers: HeaderMap,
+    extensions: Extensions,
+) -> Result<Reached, Failure> {
+    let address = format!("{host}:{port}");
     let pac_url = if port == 443 {
         format!("https://{}/", host.to_ascii_lowercase())
     } else {
         format!("https://{}:{port}/", host.to_ascii_lowercase())
     };
-    let hops = context.upstreams.hops(&pac_url, &host).await?;
+    let hops = context.upstreams.hops(&pac_url, host).await?;
     let (hop, stream) = context
         .upstreams
-        .connect(hops, &address, limit, context.auth.as_ref())
+        .connect(
+            hops,
+            &address,
+            context.timeouts.connect,
+            context.auth.as_ref(),
+        )
         .await?;
     match hop {
-        Hop::Direct => spawn_tunnel(context, client_upgrade, stream),
+        Hop::Direct => Ok(Reached::Open(Upstream::Direct(stream))),
         Hop::Parent(parent) => {
-            match connect_through_parent(stream, &parent.host, &address, &mut request, context)
-                .await?
-            {
-                ParentAnswer::Tunnel(upstream) => spawn_tunnel(context, client_upgrade, upstream),
-                ParentAnswer::Refused(response) => return Ok(response),
-            }
+            connect_through_parent(stream, &parent.host, &address, headers, extensions, context)
+                .await
         }
     }
-    Ok(Response::new(full(Bytes::new())))
+}
+
+/// Carries bytes between `client` and `upstream` until one side is done or
+/// idle, for a client that is not speaking HTTP (a SOCKS5 client, a forwarded
+/// port). Never returns before the tunnel is closed.
+pub(super) async fn pipe<C>(context: &Context, client: C, upstream: Upstream)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    relay(
+        client,
+        upstream,
+        context.timeouts.tunnel_idle,
+        context.force.clone(),
+    )
+    .await;
 }
 
 /// Relays between the client, once its connection is upgraded, and `upstream`.
@@ -105,16 +199,9 @@ where
     });
 }
 
-enum ParentAnswer {
-    /// The parent agreed: the stream is now a pipe to the destination.
-    Tunnel(TokioIo<Upgraded>),
-    /// The parent said no: its answer is for the client.
-    Refused(Response<Body>),
-}
-
 /// Asks a parent proxy, over `stream`, to open a tunnel to `address`. The
-/// client's own header fields (User-Agent and the like) go along, minus the
-/// hop-by-hop ones and its proxy credentials.
+/// client's own header fields (User-Agent and the like), if it has any, go
+/// along, minus the hop-by-hop ones and its proxy credentials.
 ///
 /// If the parent wants NTLM, the CONNECT request itself opens the exchange and
 /// is sent again with the proof. With Negotiate it carries the proof at once.
@@ -123,10 +210,10 @@ async fn connect_through_parent(
     stream: TcpStream,
     parent_host: &str,
     address: &str,
-    client_request: &mut Request<Incoming>,
+    mut headers: HeaderMap,
+    extensions: Extensions,
     context: &Context,
-) -> Result<ParentAnswer, Failure> {
-    let mut headers = std::mem::take(client_request.headers_mut());
+) -> Result<Reached, Failure> {
     strip_hop_by_hop(&mut headers);
     apply_rules(&mut headers, &context.request_headers);
     headers.insert(
@@ -137,8 +224,6 @@ async fn connect_through_parent(
     let uri = address
         .parse::<Uri>()
         .map_err(|_| Failure::BadRequest("the CONNECT target is invalid"))?;
-    // Carries the original capitalization of the header names.
-    let extensions = std::mem::take(client_request.extensions_mut());
     let connect = |proof: Option<HeaderValue>| {
         let mut request = Request::new(full(Bytes::new()));
         *request.method_mut() = Method::CONNECT;
@@ -213,13 +298,13 @@ async fn connect_through_parent(
         let upgraded = hyper::upgrade::on(response)
             .await
             .map_err(Failure::Upstream)?;
-        return Ok(ParentAnswer::Tunnel(TokioIo::new(upgraded)));
+        return Ok(Reached::Open(Upstream::Tunnel(TokioIo::new(upgraded))));
     }
 
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop(&mut parts.headers);
     parts.version = Version::HTTP_11;
-    Ok(ParentAnswer::Refused(Response::from_parts(
+    Ok(Reached::Refused(Response::from_parts(
         parts,
         body.boxed_unsync(),
     )))

@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::ntlm::NtHash;
 
-use crate::config::{AuthMethod, Config, LogLevel, Overrides, ParentAddr};
+use crate::config::{AuthMethod, Config, HostPort, LogLevel, Overrides, Tunnel};
 use crate::logging;
 
 #[derive(Debug, Parser)]
@@ -42,7 +42,7 @@ pub struct OverrideArgs {
 
     /// Parent proxy as HOST:PORT; repeat for several (replaces `parents` or `[pac]` from the file)
     #[arg(long = "parent", global = true, value_name = "HOST:PORT")]
-    pub parents: Vec<ParentAddr>,
+    pub parents: Vec<HostPort>,
 
     /// User name for the parent proxy
     #[arg(short, long, global = true)]
@@ -55,6 +55,11 @@ pub struct OverrideArgs {
     /// Authentication method
     #[arg(short, long, global = true, value_enum)]
     pub method: Option<AuthMethod>,
+
+    /// Forward a local port to a destination through the proxy, as in OpenSSH: [BIND:]PORT:HOST:HOSTPORT;
+    /// repeat for several (replaces `[[tunnels]]` from the file)
+    #[arg(short = 'L', long = "tunnel", global = true, value_name = "SPEC")]
+    pub tunnels: Vec<Tunnel>,
 
     /// Ask for the password on the terminal (replaces any password or hash from the file)
     #[arg(long, global = true)]
@@ -101,6 +106,7 @@ impl OverrideArgs {
             domain: self.domain,
             method: self.method,
             password,
+            tunnels: self.tunnels,
             log_level: self.log_level,
         }
     }

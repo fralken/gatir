@@ -80,19 +80,18 @@ impl From<AuthError> for Failure {
 }
 
 impl Failure {
-    pub(super) fn into_response(self) -> Response<Body> {
+    /// The status an HTTP client is given, and what it is told.
+    fn status_and_message(&self) -> (StatusCode, String) {
+        let bad_gateway = |message: String| (StatusCode::BAD_GATEWAY, message);
         match self {
-            Self::BadRequest(message) => error_response(StatusCode::BAD_REQUEST, message, true),
-            Self::ConnectTimeout(address) => error_response(
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, (*message).to_owned()),
+            Self::ConnectTimeout(address) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("Timed out connecting to {address}"),
-                false,
             ),
-            Self::Connect { address, source } => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Cannot connect to {address}: {source}"),
-                false,
-            ),
+            Self::Connect { address, source } => {
+                bad_gateway(format!("Cannot connect to {address}: {source}"))
+            }
             Self::ParentsUnavailable(attempts) => {
                 let all_timed_out = attempts
                     .iter()
@@ -107,82 +106,68 @@ impl Failure {
                     .map(|attempt| format!("{} ({})", attempt.address, attempt.error))
                     .collect::<Vec<_>>()
                     .join("; ");
-                error_response(
-                    status,
-                    format!("No parent proxy is reachable: {tried}"),
-                    false,
-                )
+                (status, format!("No parent proxy is reachable: {tried}"))
             }
-            Self::Upstream(err) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Invalid response from the upstream server: {err}"),
-                false,
-            ),
-            Self::Parent(message) => error_response(StatusCode::BAD_GATEWAY, message, false),
-            Self::ResponseTimeout(who) => error_response(
+            Self::Upstream(err) => {
+                bad_gateway(format!("Invalid response from the upstream server: {err}"))
+            }
+            Self::Parent(message) => bad_gateway((*message).to_owned()),
+            Self::ResponseTimeout(who) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("Timed out waiting for a response from {who}"),
-                false,
             ),
-            Self::Authentication(err) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Cannot authenticate to the parent proxy: {err}"),
-                false,
-            ),
-            Self::CredentialsRejected { user } => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "The parent proxy rejected the credentials of {user}. Check the user name, \
-                     domain and password. gatir will not try again for {} minutes, so that the \
-                     account does not get locked.",
-                    COOLDOWN.as_secs() / 60
-                ),
-                false,
-            ),
-            Self::Pac(err) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("The PAC script could not tell where to send this request: {err}"),
-                false,
-            ),
-            Self::PacUnsupported(chosen) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "The PAC script chose only ways of reaching the destination that gatir does not \
-                     support: {chosen}"
-                ),
-                false,
-            ),
-            Self::TicketRejected { service } => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "The parent proxy did not accept the Kerberos ticket for {service}. Check that \
-                     the ticket is valid (klist), that the clock is right, and that this is the \
-                     name the proxy is registered under (credentials.spn)."
-                ),
-                false,
-            ),
-            Self::CoolingDown(remaining) => {
-                let seconds = remaining.as_secs() + 1;
-                let mut response = error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "The parent proxy rejected the credentials recently. Not trying again for \
-                         {seconds} seconds, so that the account does not get locked."
-                    ),
-                    false,
-                );
-                response
-                    .headers_mut()
-                    .insert(RETRY_AFTER, HeaderValue::from(seconds));
-                response
+            Self::Authentication(err) => {
+                bad_gateway(format!("Cannot authenticate to the parent proxy: {err}"))
             }
-            Self::AuthenticationLapsed => error_response(
-                StatusCode::BAD_GATEWAY,
+            Self::CredentialsRejected { user } => bad_gateway(format!(
+                "The parent proxy rejected the credentials of {user}. Check the user name, \
+                 domain and password. gatir will not try again for {} minutes, so that the \
+                 account does not get locked.",
+                COOLDOWN.as_secs() / 60
+            )),
+            Self::Pac(err) => bad_gateway(format!(
+                "The PAC script could not tell where to send this request: {err}"
+            )),
+            Self::PacUnsupported(chosen) => bad_gateway(format!(
+                "The PAC script chose only ways of reaching the destination that gatir does not \
+                 support: {chosen}"
+            )),
+            Self::TicketRejected { service } => bad_gateway(format!(
+                "The parent proxy did not accept the Kerberos ticket for {service}. Check that \
+                 the ticket is valid (klist), that the clock is right, and that this is the \
+                 name the proxy is registered under (credentials.spn)."
+            )),
+            Self::CoolingDown(remaining) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "The parent proxy rejected the credentials recently. Not trying again for \
+                     {} seconds, so that the account does not get locked.",
+                    remaining.as_secs() + 1
+                ),
+            ),
+            Self::AuthenticationLapsed => bad_gateway(
                 "The parent proxy asked for authentication again on a connection it had \
-                 authenticated, and this request cannot be sent twice. Try again.",
-                false,
+                 authenticated, and this request cannot be sent twice. Try again."
+                    .to_owned(),
             ),
         }
+    }
+
+    /// What went wrong, in words: for the log, when the client speaks a
+    /// protocol that has no place for an HTTP answer.
+    pub(super) fn message(&self) -> String {
+        self.status_and_message().1
+    }
+
+    pub(super) fn into_response(self) -> Response<Body> {
+        let (status, message) = self.status_and_message();
+        let mut response = error_response(status, message, matches!(self, Self::BadRequest(_)));
+        if let Self::CoolingDown(remaining) = &self {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(remaining.as_secs() + 1));
+        }
+        response
     }
 }
 

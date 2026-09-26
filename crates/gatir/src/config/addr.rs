@@ -4,21 +4,21 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer};
 
-/// A parent proxy endpoint: `host:port`, or `[ipv6]:port` for IPv6 literals.
+/// A `host:port` endpoint (a parent proxy, or the destination of a tunnel), written `[ipv6]:port` for IPv6 literals.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParentAddr {
+pub struct HostPort {
     pub host: String,
     pub port: u16,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("invalid parent proxy address \"{input}\": {reason}")]
-pub struct ParentAddrError {
+#[error("invalid address \"{input}\": {reason}")]
+pub struct HostPortError {
     input: String,
     reason: &'static str,
 }
 
-impl ParentAddrError {
+impl HostPortError {
     fn new(input: &str, reason: &'static str) -> Self {
         Self {
             input: input.to_owned(),
@@ -27,11 +27,11 @@ impl ParentAddrError {
     }
 }
 
-impl FromStr for ParentAddr {
-    type Err = ParentAddrError;
+impl FromStr for HostPort {
+    type Err = HostPortError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let fail = |reason| ParentAddrError::new(input, reason);
+        let fail = |reason| HostPortError::new(input, reason);
 
         if input.contains('/') {
             return Err(fail("expected HOST:PORT without a scheme or path"));
@@ -80,7 +80,18 @@ impl FromStr for ParentAddr {
     }
 }
 
-impl fmt::Display for ParentAddr {
+impl HostPort {
+    /// The host as it is written in a URL: an IPv6 address in brackets.
+    pub fn host_in_url(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
+}
+
+impl fmt::Display for HostPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.host.contains(':') {
             write!(f, "[{}]:{}", self.host, self.port)
@@ -90,7 +101,7 @@ impl fmt::Display for ParentAddr {
     }
 }
 
-impl<'de> Deserialize<'de> for ParentAddr {
+impl<'de> Deserialize<'de> for HostPort {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         text.parse().map_err(serde::de::Error::custom)
@@ -101,8 +112,8 @@ impl<'de> Deserialize<'de> for ParentAddr {
 mod tests {
     use super::*;
 
-    fn parent(host: &str, port: u16) -> ParentAddr {
-        ParentAddr {
+    fn parent(host: &str, port: u16) -> HostPort {
+        HostPort {
             host: host.to_owned(),
             port,
         }
@@ -119,11 +130,7 @@ mod tests {
             ("[2001:db8::1]:3128", parent("2001:db8::1", 3128)),
         ];
         for (input, expected) in cases {
-            assert_eq!(
-                input.parse::<ParentAddr>().as_ref(),
-                Ok(&expected),
-                "{input}"
-            );
+            assert_eq!(input.parse::<HostPort>().as_ref(), Ok(&expected), "{input}");
         }
     }
 
@@ -148,7 +155,7 @@ mod tests {
         ];
         for input in cases {
             assert!(
-                input.parse::<ParentAddr>().is_err(),
+                input.parse::<HostPort>().is_err(),
                 "should reject {input:?}"
             );
         }
@@ -157,7 +164,7 @@ mod tests {
     #[test]
     fn display_round_trips() {
         for input in ["proxy.example.com:8080", "[::1]:8080"] {
-            let addr: ParentAddr = input.parse().unwrap();
+            let addr: HostPort = input.parse().unwrap();
             assert_eq!(addr.to_string(), input);
         }
     }

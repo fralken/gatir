@@ -6,6 +6,7 @@ mod forward;
 mod headers;
 mod parent_auth;
 mod pool;
+mod portfwd;
 mod server;
 mod tunnel;
 mod upstream;
@@ -23,6 +24,9 @@ pub async fn run(config: &Config) -> io::Result<()> {
     let server = Server::bind(config).await?;
     for addr in server.local_addrs() {
         tracing::info!(%addr, "listening");
+    }
+    for (addr, target) in server.tunnel_addrs() {
+        tracing::info!(%addr, %target, "forwarding a port");
     }
 
     let shutdown = CancellationToken::new();

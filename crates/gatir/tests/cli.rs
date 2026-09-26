@@ -264,3 +264,48 @@ fn the_hash_line_is_accepted_by_the_configuration() {
         .success()
         .stdout(predicate::str::contains("secret: nt_hash (hidden)"));
 }
+
+#[test]
+fn config_check_lists_the_tunnels_of_the_file_and_the_command_line() {
+    let file =
+        config_file("[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"file.example.com:22\"\n");
+    gatir()
+        .args(["config", "check", "--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "127.0.0.1:2222 -> file.example.com:22",
+        ));
+
+    // -L takes the place of the ones in the file.
+    gatir()
+        .args([
+            "config",
+            "check",
+            "-L",
+            "3333:cli.example.com:5432",
+            "-L",
+            "[::1]:4444:[2001:db8::1]:22",
+        ])
+        .args(["--config"])
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("127.0.0.1:3333 -> cli.example.com:5432")
+                .and(predicate::str::contains("[::1]:4444 -> [2001:db8::1]:22"))
+                .and(predicate::str::contains("file.example.com").not()),
+        );
+}
+
+#[test]
+fn a_tunnel_that_is_not_one_is_refused_with_the_reason() {
+    gatir()
+        .args(["config", "check", "-L", "2222:git"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "expected [BIND:]PORT:HOST:HOSTPORT",
+        ));
+}

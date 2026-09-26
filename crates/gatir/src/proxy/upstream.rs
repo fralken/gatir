@@ -17,7 +17,7 @@ use super::body::Body;
 use super::failure::{ConnectError, Failure, ParentAttempt, connect_failure, try_connect};
 use super::parent_auth::ParentAuth;
 use super::pool::{Pool, PoolKey};
-use crate::config::ParentAddr;
+use crate::config::HostPort;
 use crate::noproxy::NoProxy;
 use crate::pac::{PacSource, Route};
 
@@ -30,7 +30,7 @@ pub(super) enum Hop {
     /// Connect to the destination itself.
     Direct,
     /// Send the request to a parent proxy.
-    Parent(ParentAddr),
+    Parent(HostPort),
 }
 
 impl Hop {
@@ -65,7 +65,7 @@ pub(super) enum Opened {
 }
 
 pub(super) struct Upstreams {
-    parents: Vec<ParentAddr>,
+    parents: Vec<HostPort>,
     /// Index of the parent used most recently with success. Requests start
     /// there, so a healthy parent is kept ("sticky") until it fails.
     current: AtomicUsize,
@@ -78,7 +78,7 @@ pub(super) struct Upstreams {
 
 impl Upstreams {
     pub(super) fn new(
-        parents: Vec<ParentAddr>,
+        parents: Vec<HostPort>,
         no_proxy: NoProxy,
         pac: Option<Arc<PacSource>>,
     ) -> Self {
@@ -259,7 +259,7 @@ async fn hops_from_script(source: &PacSource, url: &str, host: &str) -> Result<V
     for route in routes {
         match route {
             Route::Direct => hops.push(Hop::Direct),
-            Route::Proxy(proxy) => hops.push(Hop::Parent(ParentAddr {
+            Route::Proxy(proxy) => hops.push(Hop::Parent(HostPort {
                 host: proxy.host,
                 port: proxy.port,
             })),
@@ -295,7 +295,7 @@ fn hop_failure(hop: &Hop, origin: &str, error: ConnectError) -> Failure {
 mod tests {
     use super::*;
 
-    fn parent(text: &str) -> ParentAddr {
+    fn parent(text: &str) -> HostPort {
         text.parse().unwrap()
     }
 

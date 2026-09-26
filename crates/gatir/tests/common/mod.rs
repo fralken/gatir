@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 pub struct TestProxy {
     pub addr: SocketAddr,
+    /// The forwarded ports, in the order of the configuration.
+    pub tunnels: Vec<SocketAddr>,
     pub shutdown: CancellationToken,
     pub force: CancellationToken,
     task: Option<JoinHandle<()>>,
@@ -79,11 +81,17 @@ async fn bind(
 
 fn run(server: Server) -> TestProxy {
     let addr = server.local_addrs()[0];
+    let tunnels = server
+        .tunnel_addrs()
+        .into_iter()
+        .map(|(addr, _)| addr)
+        .collect();
     let shutdown = CancellationToken::new();
     let force = CancellationToken::new();
     let task = tokio::spawn(server.run(shutdown.clone(), force.clone()));
     TestProxy {
         addr,
+        tunnels,
         shutdown,
         force,
         task: Some(task),

@@ -6,6 +6,7 @@
 mod addr;
 mod credentials;
 mod headers;
+mod tunnel;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,10 +21,11 @@ use zeroize::Zeroizing;
 use crate::acl::{Acl, Action, Rule};
 use crate::noproxy::NoProxy;
 
-pub use addr::{ParentAddr, ParentAddrError};
+pub use addr::{HostPort, HostPortError};
 pub use credentials::{AuthMethod, Credentials, NT_HASH_LEN, Secret};
 use credentials::{RawCredentials, SecretValue};
 pub use headers::HeaderRule;
+pub use tunnel::{Tunnel, TunnelError};
 
 const DEFAULT_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3128);
@@ -111,7 +113,7 @@ pub struct Config {
     pub listen: Vec<SocketAddr>,
     /// Parent proxies in order of preference. Empty means direct connections,
     /// unless a PAC file chooses.
-    pub parents: Vec<ParentAddr>,
+    pub parents: Vec<HostPort>,
     /// A PAC file that decides, for each request, which proxy to use. Not
     /// together with `parents`.
     pub pac: Option<PacConfig>,
@@ -123,6 +125,8 @@ pub struct Config {
     /// Header fields set on every forwarded request, replacing any the client
     /// sent. Values are sensitive.
     pub request_headers: Vec<HeaderRule>,
+    /// Local ports whose connections are carried to a fixed destination.
+    pub tunnels: Vec<Tunnel>,
     pub timeouts: Timeouts,
     pub log_level: LogLevel,
 }
@@ -131,7 +135,7 @@ pub struct Config {
 #[derive(Debug, Default)]
 pub struct Overrides {
     pub listen: Vec<SocketAddr>,
-    pub parents: Vec<ParentAddr>,
+    pub parents: Vec<HostPort>,
     /// A PAC file or address. Like `parents`, it is a way of finding the proxy,
     /// so it replaces the other one in the file.
     pub pac: Option<PacLocation>,
@@ -141,6 +145,8 @@ pub struct Overrides {
     /// A password supplied interactively. Replaces any password or hash
     /// from the config file.
     pub password: Option<SecretString>,
+    /// Replaces the tunnels of the file.
+    pub tunnels: Vec<Tunnel>,
     pub log_level: Option<LogLevel>,
 }
 
@@ -148,12 +154,13 @@ pub struct Overrides {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: Option<Vec<SocketAddr>>,
-    parents: Option<Vec<ParentAddr>>,
+    parents: Option<Vec<HostPort>>,
     pac: Option<RawPac>,
     credentials: Option<RawCredentials>,
     access: Option<RawAccess>,
     no_proxy: Option<Vec<String>>,
     headers: Option<BTreeMap<String, SecretValue>>,
+    tunnels: Option<Vec<tunnel::RawTunnel>>,
     timeouts: Option<RawTimeouts>,
     log: Option<RawLog>,
 }
@@ -486,6 +493,11 @@ impl Config {
         } else {
             join(self.request_headers.iter().map(|(name, _)| name))
         };
+        let tunnels = if self.tunnels.is_empty() {
+            "none".to_owned()
+        } else {
+            join(self.tunnels.iter())
+        };
         let timeouts = format!(
             "connect {}s, client idle {}s, response {}s, tunnel idle {}s, shutdown grace {}s",
             self.timeouts.connect.as_secs(),
@@ -496,8 +508,8 @@ impl Config {
         );
         format!(
             "listen:      {listen}\nparents:     {parents}\ncredentials: {credentials}\n\
-             access:      {access}\nno_proxy:    {no_proxy}\nheaders:     {headers} (set on every request)\ntimeouts:    {timeouts}\n\
-             log level:   {}",
+             access:      {access}\nno_proxy:    {no_proxy}\nheaders:     {headers} (set on every request)\ntunnels:     {tunnels}\n\
+             timeouts:    {timeouts}\nlog level:   {}",
             self.log_level.as_str()
         )
     }
@@ -542,6 +554,28 @@ impl RawConfig {
             if listen[..i].contains(addr) {
                 return Err(ConfigError::invalid(format!(
                     "listen address {addr} is repeated"
+                )));
+            }
+        }
+
+        let tunnels: Vec<Tunnel> = if overrides.tunnels.is_empty() {
+            self.tunnels
+                .unwrap_or_default()
+                .into_iter()
+                .map(Tunnel::from)
+                .collect()
+        } else {
+            overrides.tunnels
+        };
+        // Two listeners cannot share an address.
+        let taken = listen
+            .iter()
+            .chain(tunnels.iter().map(|tunnel| &tunnel.listen));
+        for (i, addr) in taken.clone().enumerate() {
+            // Port 0 asks for any free port, so it cannot clash.
+            if addr.port() != 0 && taken.clone().take(i).any(|earlier| earlier == addr) {
+                return Err(ConfigError::invalid(format!(
+                    "the address {addr} is used by more than one listener"
                 )));
             }
         }
@@ -636,6 +670,7 @@ impl RawConfig {
             access,
             no_proxy,
             request_headers,
+            tunnels,
             timeouts,
             log_level,
         })
@@ -878,6 +913,7 @@ mod tests {
             domain: Some("OTHER".into()),
             method: Some(AuthMethod::Nt),
             password: Some(SecretString::from("prompted".to_owned())),
+            tunnels: Vec::new(),
             log_level: Some(LogLevel::Trace),
         };
         let config = Config::from_toml_str(FULL, overrides).unwrap();
@@ -1408,6 +1444,80 @@ mod tests {
             "{summary}"
         );
         assert!(!summary.contains("hush"), "{summary}");
+    }
+
+    #[test]
+    fn tunnels_are_listed_as_tables() {
+        let config = load(
+            "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"git.example.com:22\"\n\
+             [[tunnels]]\nlisten = \"[::1]:8443\"\ntarget = \"[2001:db8::1]:443\"",
+        )
+        .unwrap();
+        let shown: Vec<String> = config.tunnels.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "127.0.0.1:2222 -> git.example.com:22",
+                "[::1]:8443 -> [2001:db8::1]:443"
+            ]
+        );
+        assert!(load("").unwrap().tunnels.is_empty());
+        assert!(
+            config
+                .summary()
+                .contains("tunnels:     127.0.0.1:2222 -> git.example.com:22, ")
+        );
+        assert!(load("").unwrap().summary().contains("tunnels:     none"));
+    }
+
+    #[test]
+    fn rejects_tunnels_that_make_no_sense() {
+        for (toml, expected) in [
+            ("[[tunnels]]\nlisten = \"127.0.0.1:2222\"", "missing field"),
+            ("[[tunnels]]\ntarget = \"git:22\"", "missing field"),
+            (
+                "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"git\"",
+                "invalid address",
+            ),
+            (
+                "[[tunnels]]\nlisten = \"2222\"\ntarget = \"git:22\"",
+                "invalid socket address",
+            ),
+            (
+                "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"git:22\"\nsecret = 1",
+                "unknown field",
+            ),
+            (
+                "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"a:22\"\n\
+                 [[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"b:22\"",
+                "127.0.0.1:2222 is used by more than one listener",
+            ),
+            (
+                "listen = [\"127.0.0.1:3128\"]\n[[tunnels]]\nlisten = \"127.0.0.1:3128\"\ntarget = \"a:22\"",
+                "127.0.0.1:3128 is used by more than one listener",
+            ),
+        ] {
+            let text = error_text(toml);
+            assert!(text.contains(expected), "{toml:?} -> {text}");
+        }
+    }
+
+    #[test]
+    fn tunnels_on_the_command_line_replace_those_of_the_file() {
+        let file = "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"file.example.com:22\"";
+        let config = Config::from_toml_str(
+            file,
+            Overrides {
+                tunnels: vec!["3333:cli.example.com:22".parse().unwrap()],
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.tunnels.len(), 1);
+        assert_eq!(config.tunnels[0].target.host, "cli.example.com");
+        // Without any on the command line, the file's stay.
+        let config = Config::from_toml_str(file, Overrides::default()).unwrap();
+        assert_eq!(config.tunnels[0].target.host, "file.example.com");
     }
 
     #[test]
