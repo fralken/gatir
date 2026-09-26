@@ -37,8 +37,9 @@ registered under; an address, or another alias, may have none.
 - **Windows** uses SSPI (`secur32.dll`) with the credentials of the session the
   user is logged on with. It has been tried on a computer of the domain against a
   corporate proxy that offers Negotiate and NTLM: Windows made a Kerberos token,
-  the proxy accepted it, and `GET`, `HEAD`, `POST` and `CONNECT` worked. The fall back to
-  NTLM inside Negotiate has been tried only against a stand-in for the proxy.
+  the proxy accepted it, and `GET`, `HEAD`, `POST` and `CONNECT` worked. So did the fall
+  back to NTLM inside Negotiate, forced by naming the proxy by its address, for which no
+  Kerberos service is registered.
 
 ## Finding out why it does not work
 
