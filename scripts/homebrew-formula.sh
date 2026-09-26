@@ -54,6 +54,7 @@ class Gatir < Formula
 
   def install
     bin.install "gatir"
+    man1.install Dir["man/man1/*"]
     doc.install "README.md", "gatir.example.toml"
     doc.install Dir["docs/*"]
   end

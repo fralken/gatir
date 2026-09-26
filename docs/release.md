@@ -40,7 +40,8 @@ of that run; nothing is published.
 | `SHA256SUMS` | the checksum of each of the files above but the formula |
 
 An archive holds one directory with the program, the two licenses, the README,
-`gatir.example.toml` and the documentation. The packages hold the same, in the places
+`gatir.example.toml`, the documentation and, except for Windows, the manual pages
+(`man/man1`, written by `crates/mangen` from the command-line definition). The packages hold the same, in the places
 their systems keep them (`/usr/bin/gatir`, `/usr/share/doc/gatir`), and nothing else:
 no service, no file in `/etc`.
 

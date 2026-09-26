@@ -50,6 +50,12 @@ lay_out() {
   for page in "$stage"/docs/*.md; do
     install -Dm644 "$page" "$doc/docs/$(basename "$page")"
   done
+  # The manual pages, compressed as Debian and Fedora keep them.
+  for page in "$stage"/man/man1/*.1; do
+    install -dm755 "$root/usr/share/man/man1"
+    gzip -9n -c "$page" > "$root/usr/share/man/man1/$(basename "$page").gz"
+    chmod 644 "$root/usr/share/man/man1/$(basename "$page").gz"
+  done
 }
 
 # ---- .deb ----
@@ -147,12 +153,18 @@ install -Dm644 ${stage}/LICENSE-APACHE %{buildroot}%{_licensedir}/gatir/LICENSE-
 for page in ${stage}/docs/*.md; do
   install -Dm644 "\$page" "%{buildroot}%{_docdir}/gatir/docs/\$(basename "\$page")"
 done
+for page in ${stage}/man/man1/*.1; do
+  install -dm755 %{buildroot}%{_mandir}/man1
+  gzip -9n -c "\$page" > "%{buildroot}%{_mandir}/man1/\$(basename "\$page").gz"
+  chmod 644 "%{buildroot}%{_mandir}/man1/\$(basename "\$page").gz"
+done
 
 %files
 /usr/bin/gatir
 %license %{_licensedir}/gatir/LICENSE-MIT
 %license %{_licensedir}/gatir/LICENSE-APACHE
 %{_docdir}/gatir
+%{_mandir}/man1/gatir*.1.gz
 SPEC
 # gzip in the payload, so that older versions of rpm can read the package.
 rpmbuild -bb --quiet --target "${rpm_arch}-linux" \

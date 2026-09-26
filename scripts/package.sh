@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds gatir in release mode and packs it, with its licenses, README, example
-# configuration and documentation, into dist/gatir-<version>-<target>.tar.gz (a
+# configuration, manual pages (not for Windows) and documentation, into dist/gatir-<version>-<target>.tar.gz (a
 # .zip for Windows) next to a .sha256 file that `sha256sum -c` or
 # `shasum -a 256 -c` checks. The release workflow runs this on every target;
 # it can be run by hand to see what a release holds.
@@ -29,6 +29,12 @@ mkdir -p "$stage"
 cp "target/${target}/release/${exe}" "$stage/"
 cp README.md LICENSE-MIT LICENSE-APACHE gatir.example.toml "$stage/"
 cp -R docs "$stage/docs"
+# The manual pages do not depend on the target, and are of no use on Windows.
+# They are written by a program of this workspace, which runs here: every target
+# is built on a machine of its own kind.
+if [ "$ext" != "zip" ]; then
+  cargo run --quiet --release --locked --target "$target" -p gatir-mangen -- "$stage/man/man1" > /dev/null
+fi
 
 archive="dist/${name}.${ext}"
 if [ "$ext" = "zip" ]; then

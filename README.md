@@ -42,8 +42,9 @@ gatir run
 Then point a program at `http://127.0.0.1:3128`, for instance
 `curl -x http://127.0.0.1:3128 https://example.com/`.
 
-`gatir --help` lists the options. A command-line option takes the place of the same
-setting in the file.
+`gatir --help` lists the options, and `man gatir` (with `man gatir-run` and the other
+commands) says more: the files, the environment, the signals. A command-line option
+takes the place of the same setting in the file.
 
 ## Where it runs
 
