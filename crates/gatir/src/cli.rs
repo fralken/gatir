@@ -85,6 +85,18 @@ pub enum Command {
     /// Inspect the configuration
     #[command(subcommand)]
     Config(ConfigCommand),
+
+    /// Ask the system for a Negotiate token for a service, and say what it is:
+    /// to find out why Kerberos or NTLM single sign-on does not work
+    Negotiate(NegotiateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NegotiateArgs {
+    /// The service of the parent proxy: `HTTP@proxy.example.com`, or a Kerberos
+    /// principal such as `HTTP/proxy.example.com@EXAMPLE.COM`
+    #[arg(long, value_name = "SERVICE")]
+    pub service: String,
 }
 
 #[derive(Debug, Args)]
@@ -142,6 +154,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 .block_on(crate::proxy::run(&config, load))?;
             Ok(())
         }
+        Command::Negotiate(args) => negotiate_check(&args),
         Command::Config(ConfigCommand::Check) => {
             let source = Source::new(cli.config, cli.overrides)?;
             let config = load_config(&source)?;
@@ -154,6 +167,31 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Asks the system for a token, and prints what it is.
+fn negotiate_check(args: &NegotiateArgs) -> anyhow::Result<()> {
+    let tokens = crate::auth::system_tokens()?;
+    let diagnosis = crate::auth::diagnose(tokens.as_ref(), &args.service)?;
+    println!("service:     {}", args.service);
+    println!("token:       {} bytes", diagnosis.token_bytes);
+    if diagnosis.mechanisms.is_empty() {
+        println!("mechanisms:  none that gatir recognizes");
+    } else {
+        println!("mechanisms:  {}", diagnosis.mechanisms.join(", "));
+    }
+    if diagnosis.complete {
+        println!("answer:      the parent's answer is not needed: the token goes with the request");
+    } else {
+        println!("answer:      gatir sends the token with the first request, and answers a");
+        println!(
+            "             challenge if the parent sends one (NTLM inside Negotiate works this"
+        );
+        println!(
+            "             way; a parent that accepts a Kerberos ticket at once needs nothing more)"
+        );
+    }
+    Ok(())
 }
 
 /// Where the configuration comes from, so that it can be read again: the file,

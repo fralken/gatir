@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent_auth::{Admission, Outcome, ParentAuth, reusable};
+use super::parent_auth::{Admission, Begun, Outcome, ParentAuth, reusable};
 use super::pool::{Lease, Pool};
 use super::server::{Context, Live};
 use super::upstream::{Hop, Opened};
@@ -252,20 +252,22 @@ async fn authenticate<'a>(
 ) -> Result<Authenticated<'a>, Failure> {
     let admission = auth.admit().await?;
     let limit = context.timeouts.response;
-    if auth.is_direct() {
-        // No challenge to wait for: the request carries the proof itself.
-        let Hop::Parent(parent) = &lease.hop else {
-            return Err(Failure::Parent(
-                "a connection to an origin server was asked to authenticate as a parent",
-            ));
-        };
-        let proof = auth.direct_proof(&parent.host, limit).await?;
-        request
-            .headers_mut()
-            .insert(PROXY_AUTHORIZATION, proof.header);
-        lease.needs_auth = false;
-        return Ok(Authenticated::Proof(admission.made_for(proof.service)));
-    }
+    let Hop::Parent(parent) = &lease.hop else {
+        return Err(Failure::Parent(
+            "a connection to an origin server was asked to authenticate as a parent",
+        ));
+    };
+    let pending = match auth.begin(&parent.host, limit).await? {
+        Begun::Ready(proof) => {
+            // No challenge to wait for: the request carries the proof itself.
+            request
+                .headers_mut()
+                .insert(PROXY_AUTHORIZATION, proof.header);
+            lease.needs_auth = false;
+            return Ok(Authenticated::Proof(admission.made_for(proof.service)));
+        }
+        Begun::Challenge(pending) => pending,
+    };
     let carrier = head
         .filter(|head| lapsed || head.method != Method::HEAD)
         .map(Head::request);
@@ -273,10 +275,16 @@ async fn authenticate<'a>(
     let first = carrier.unwrap_or_else(|| probe(target, &context.request_headers));
 
     lease.needs_auth = false;
-    match auth.negotiate(&mut lease.sender, first, limit).await? {
-        Outcome::Proof(proof) => {
-            request.headers_mut().insert(PROXY_AUTHORIZATION, proof);
-            Ok(Authenticated::Proof(admission))
+    match auth
+        .negotiate(&mut lease.sender, first, pending, limit)
+        .await?
+    {
+        Outcome::Proof { header, service } => {
+            request.headers_mut().insert(PROXY_AUTHORIZATION, header);
+            Ok(Authenticated::Proof(match service {
+                Some(service) => admission.made_for(service),
+                None => admission,
+            }))
         }
         Outcome::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
         Outcome::Answered(response) => {

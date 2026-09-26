@@ -10,8 +10,8 @@ mod offers;
 use std::sync::Arc;
 
 pub use negotiate::{
-    NegotiateAuthenticator, Refusal, TokenSource, header as negotiate_header, refusal,
-    system_tokens,
+    Diagnosis, NegotiateAuthenticator, Refusal, SecurityContext, Step, TokenSource, challenge,
+    diagnose, header as negotiate_header, refusal, system_tokens,
 };
 pub use ntlm_authenticator::NtlmAuthenticator;
 
@@ -40,6 +40,8 @@ pub enum AuthError {
     NoTicket { service: String, reason: String },
     #[error("the parent proxy does not offer Negotiate authentication{}", offered_list(.offered))]
     NegotiateNotOffered { offered: Vec<String> },
+    #[error("the Negotiate exchange with {service} went wrong: {reason}")]
+    Exchange { service: String, reason: String },
 }
 
 fn offered_list(offered: &[String]) -> String {

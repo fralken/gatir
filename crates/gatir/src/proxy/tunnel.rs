@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::body::{Body, answer_within, full};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent_auth::Outcome;
+use super::parent_auth::{Begun, Outcome};
 use super::server::{Context, Live};
 use super::upstream::Hop;
 
@@ -264,26 +264,35 @@ async fn connect_through_parent(
             .await
             .ok_or(timed_out)?
             .map_err(Failure::Upstream)?,
-        Some(auth) if auth.is_direct() => {
-            let admitted = auth.admit().await?;
-            let proof = auth.direct_proof(parent_host, limit).await?;
-            admission = Some(admitted.made_for(proof.service));
-            answer_within(limit, sender.send_request(connect(Some(proof.header))))
-                .await
-                .ok_or(timed_out)?
-                .map_err(Failure::Upstream)?
-        }
         Some(auth) => {
             let admitted = auth.admit().await?;
-            match auth.negotiate(&mut sender, connect(None), limit).await? {
-                // The parent asked for nothing: this is its answer.
-                Outcome::Answered(response) => response,
-                Outcome::Proof(proof) => {
-                    admission = Some(admitted);
-                    answer_within(limit, sender.send_request(connect(Some(proof))))
+            match auth.begin(parent_host, limit).await? {
+                // No challenge to wait for: the request carries the proof.
+                Begun::Ready(proof) => {
+                    admission = Some(admitted.made_for(proof.service));
+                    answer_within(limit, sender.send_request(connect(Some(proof.header))))
                         .await
                         .ok_or(timed_out)?
                         .map_err(Failure::Upstream)?
+                }
+                Begun::Challenge(pending) => {
+                    match auth
+                        .negotiate(&mut sender, connect(None), pending, limit)
+                        .await?
+                    {
+                        // The parent asked for nothing: this is its answer.
+                        Outcome::Answered(response) => response,
+                        Outcome::Proof { header, service } => {
+                            admission = Some(match service {
+                                Some(service) => admitted.made_for(service),
+                                None => admitted,
+                            });
+                            answer_within(limit, sender.send_request(connect(Some(header))))
+                                .await
+                                .ok_or(timed_out)?
+                                .map_err(Failure::Upstream)?
+                        }
+                    }
                 }
             }
         }

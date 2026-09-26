@@ -7,8 +7,10 @@
 //! - NTLM needs the proxy's challenge. [`ParentAuth::negotiate`] runs the first
 //!   half of the exchange, and the caller then sends the real request carrying
 //!   the proof it returns.
-//! - Negotiate needs none: [`ParentAuth::direct_proof`] makes the proof at
-//!   once, and the real request carries it.
+//! - Negotiate with Kerberos needs none: [`ParentAuth::begin`] makes the proof at
+//!   once, and the real request carries it. When the system falls back to NTLM
+//!   inside Negotiate, `begin` says so, and the exchange goes on as NTLM's does,
+//!   through [`ParentAuth::negotiate`].
 //!
 //! Every attempt with wrong NTLM credentials counts as a failed logon against
 //! the account, and a few of them lock it. So [`ParentAuth::admit`] lets one
@@ -30,7 +32,10 @@ use tokio::time::timeout;
 
 use super::body::{Body, answer_within};
 use super::failure::Failure;
-use crate::auth::{AuthError, Authenticator, Refusal, TokenSource, negotiate_header, refusal};
+use crate::auth::{
+    AuthError, Authenticator, Refusal, SecurityContext, TokenSource, challenge, negotiate_header,
+    refusal,
+};
 use crate::config::Credentials;
 
 /// How long gatir stays away from a parent that refused the credentials.
@@ -48,13 +53,37 @@ pub(super) struct ParentAuth {
     gate: tokio::sync::Mutex<()>,
 }
 
-/// The parent's answer to the request that carried the NEGOTIATE message.
+/// The parent's answer to the request that carried the first message.
 pub(super) enum Outcome {
     /// The parent asked for no authentication: this is its answer.
     Answered(Response<Incoming>),
     /// The parent sent a challenge. The connection is ready for the real
     /// request, which must carry this `Proxy-Authorization` value.
-    Proof(HeaderValue),
+    Proof {
+        header: HeaderValue,
+        /// The Kerberos service the proof was made for, with Negotiate.
+        service: Option<String>,
+    },
+}
+
+/// How the authentication of a connection begins.
+pub(super) enum Begun {
+    /// The proof is made and needs nothing from the parent: the real request
+    /// carries it.
+    Ready(DirectProof),
+    /// The parent has to be asked first; [`ParentAuth::negotiate`] does it.
+    Challenge(Pending),
+}
+
+/// What is kept between the first message and the answer to the challenge.
+pub(super) enum Pending {
+    Ntlm,
+    Negotiate {
+        context: Box<dyn SecurityContext>,
+        /// The token that opens the exchange.
+        first: Vec<u8>,
+        service: String,
+    },
 }
 
 /// Permission to try to authenticate, held until the parent has said whether
@@ -128,54 +157,65 @@ impl ParentAuth {
         })
     }
 
-    /// Whether the proof can be made without asking the parent for anything.
-    pub(super) fn is_direct(&self) -> bool {
-        matches!(self.authenticator, Authenticator::Negotiate(_))
-    }
-
-    /// Makes the Negotiate proof for the parent at `parent_host`.
-    pub(super) async fn direct_proof(
-        &self,
-        parent_host: &str,
-        limit: Duration,
-    ) -> Result<DirectProof, Failure> {
+    /// Begins to authenticate a connection to the parent at `parent_host`.
+    pub(super) async fn begin(&self, parent_host: &str, limit: Duration) -> Result<Begun, Failure> {
         let Authenticator::Negotiate(negotiate) = &self.authenticator else {
-            return Err(Failure::Parent(
-                "a proof was made without a challenge for a scheme that needs one",
-            ));
+            return Ok(Begun::Challenge(Pending::Ntlm));
         };
         let service = negotiate.service_for(parent_host);
         let tokens = negotiate.tokens();
         let asked = service.clone();
         // A ticket for a new service is fetched from the KDC, which blocks.
-        let token = timeout(
+        let (context, step) = timeout(
             limit,
-            tokio::task::spawn_blocking(move || tokens.token(&asked)),
+            tokio::task::spawn_blocking(move || {
+                let mut context = tokens.start(&asked)?;
+                let step = context.step(None)?;
+                Ok::<_, AuthError>((context, step))
+            }),
         )
         .await
         .map_err(|_| Failure::ResponseTimeout("the Kerberos server"))?
         .map_err(|_| Failure::Parent("the Kerberos ticket could not be requested"))??;
-        Ok(DirectProof {
-            header: negotiate_header(&token),
-            service,
-        })
+        let token = step.token.ok_or_else(|| AuthError::NoTicket {
+            service: service.clone(),
+            reason: "the system produced no token".to_owned(),
+        })?;
+        if step.complete {
+            Ok(Begun::Ready(DirectProof {
+                header: negotiate_header(&token),
+                service,
+            }))
+        } else {
+            tracing::debug!(%service, "the system needs an answer from the parent to go on");
+            Ok(Begun::Challenge(Pending::Negotiate {
+                context,
+                first: token,
+                service,
+            }))
+        }
     }
 
-    /// Sends `first`, adding the NEGOTIATE message, and reads the answer.
+    /// Sends `first`, adding the first message, and reads the answer.
     pub(super) async fn negotiate(
         &self,
         sender: &mut SendRequest<Body>,
         mut first: Request<Body>,
+        pending: Pending,
         limit: Duration,
     ) -> Result<Outcome, Failure> {
-        let Authenticator::Ntlm(ntlm) = &self.authenticator else {
-            return Err(Failure::Parent(
-                "an NTLM exchange was started for a scheme that is not NTLM",
-            ));
+        let (opening, ntlm) = match (&pending, &self.authenticator) {
+            (Pending::Ntlm, Authenticator::Ntlm(ntlm)) => (ntlm.first()?, Some(ntlm)),
+            (Pending::Negotiate { first: token, .. }, Authenticator::Negotiate(_)) => {
+                (negotiate_header(token), None)
+            }
+            _ => {
+                return Err(Failure::Parent(
+                    "an exchange was started for a scheme that is not the configured one",
+                ));
+            }
         };
-        first
-            .headers_mut()
-            .insert(PROXY_AUTHORIZATION, ntlm.first()?);
+        first.headers_mut().insert(PROXY_AUTHORIZATION, opening);
         let response = answer_within(limit, sender.send_request(first))
             .await
             .ok_or(Failure::ResponseTimeout("the parent proxy"))?
@@ -185,14 +225,57 @@ impl ParentAuth {
         }
 
         let (parts, body) = response.into_parts();
-        let proof = ntlm.respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
+        let (header, service) = match pending {
+            Pending::Ntlm => (
+                ntlm.expect("NTLM was matched above")
+                    .respond(parts.headers.get_all(PROXY_AUTHENTICATE))?,
+                None,
+            ),
+            Pending::Negotiate {
+                context, service, ..
+            } => (
+                answer_challenge(context, service.clone(), &parts.headers, limit).await?,
+                Some(service),
+            ),
+        };
         if !reusable(body, sender, limit).await {
             return Err(Failure::Parent(
                 "the parent proxy did not keep the connection open during authentication",
             ));
         }
-        Ok(Outcome::Proof(proof))
+        Ok(Outcome::Proof { header, service })
     }
+}
+
+/// The answer to the token a parent sent with its `407`, made by the security
+/// context that made the first one.
+async fn answer_challenge(
+    mut context: Box<dyn SecurityContext>,
+    service: String,
+    headers: &HeaderMap,
+    limit: Duration,
+) -> Result<HeaderValue, Failure> {
+    let Some(from_parent) = challenge(headers.get_all(PROXY_AUTHENTICATE)) else {
+        // No token: the parent does not offer Negotiate, or it refused.
+        return Err(match refusal(headers.get_all(PROXY_AUTHENTICATE)) {
+            Refusal::NotOffered { offered } => {
+                Failure::Authentication(AuthError::NegotiateNotOffered { offered })
+            }
+            Refusal::AnotherRound | Refusal::Rejected => Failure::TicketRejected { service },
+        });
+    };
+    let step = timeout(
+        limit,
+        tokio::task::spawn_blocking(move || context.step(Some(&from_parent))),
+    )
+    .await
+    .map_err(|_| Failure::ResponseTimeout("the Kerberos server"))?
+    .map_err(|_| Failure::Parent("the answer to the parent's token could not be made"))??;
+    let token = step.token.ok_or(AuthError::Exchange {
+        service,
+        reason: "the system had nothing to answer the parent's token with".to_owned(),
+    })?;
+    Ok(negotiate_header(&token))
 }
 
 impl Admission<'_> {

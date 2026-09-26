@@ -94,6 +94,22 @@ pub struct Options {
     /// so is everything after it on that connection; any other token is refused.
     /// `None` refuses every Negotiate token.
     pub negotiate_token: Option<Vec<u8>>,
+    /// A Negotiate exchange of two rounds, as when SPNEGO falls back to NTLM:
+    /// the first token is answered with a `407` that carries a token of its
+    /// own, and the second, on the same connection, authenticates it. Any
+    /// other token is refused. Used instead of `negotiate_token`.
+    pub negotiate_exchange: Option<NegotiateExchange>,
+}
+
+/// The three messages of a Negotiate exchange of two rounds.
+#[derive(Debug, Clone)]
+pub struct NegotiateExchange {
+    /// What the client sends first.
+    pub first: Vec<u8>,
+    /// What the parent answers it with, in a `407`.
+    pub challenge: Vec<u8>,
+    /// What the client answers that with.
+    pub second: Vec<u8>,
 }
 
 impl Default for Options {
@@ -107,6 +123,7 @@ impl Default for Options {
             forget_after: None,
             timestamp: None,
             negotiate_token: None,
+            negotiate_exchange: None,
         }
     }
 }
@@ -222,6 +239,8 @@ enum State {
     Anonymous,
     /// The challenge sent, waiting for the answer.
     Challenged([u8; 8]),
+    /// The first Negotiate token answered, waiting for the second.
+    Continuing,
     Authenticated,
 }
 
@@ -251,7 +270,21 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
         };
 
         // A `407` to send instead of serving the request, and whether to close.
-        let refusal: Option<(Vec<u8>, bool)> = if let Some(proof) = &negotiate {
+        let refusal: Option<(Vec<u8>, bool)> = if let (Some(proof), Some(exchange)) =
+            (&negotiate, &shared.options.negotiate_exchange)
+        {
+            if *proof == exchange.first {
+                state = State::Continuing;
+                let field = format!("Negotiate {}", STANDARD.encode(&exchange.challenge));
+                Some((reply_407(&[field], false), false))
+            } else if *proof == exchange.second && state == State::Continuing {
+                state = State::Authenticated;
+                None
+            } else {
+                state = State::Anonymous;
+                Some((shared.refusal(), false))
+            }
+        } else if let Some(proof) = &negotiate {
             if shared.options.negotiate_token.as_ref() == Some(proof) {
                 state = State::Authenticated;
                 None
