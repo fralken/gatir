@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::body::{Body, answer_within, full};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent::{Begun, Outcome};
+use super::parent::Outcome;
 use super::server::{Context, Live};
 use super::upstream::Hop;
 
@@ -266,30 +266,19 @@ async fn connect_through_parent(
             .map_err(Failure::Upstream)?,
         Some(auth) => {
             let admitted = auth.admit().await?;
-            match auth.begin(parent_host, limit).await? {
-                // No challenge to wait for: the request carries the proof.
-                Begun::Ready(proof) => {
-                    admission = Some(admitted.made_from(Some(proof.made)));
-                    answer_within(limit, sender.send_request(connect(Some(proof.header))))
+            let pending = auth.begin(parent_host);
+            match auth
+                .negotiate(&mut sender, || connect(None), pending, limit)
+                .await?
+            {
+                // The parent asked for nothing: this is its answer.
+                Outcome::Answered(response) => response,
+                Outcome::Proof { header, made } => {
+                    admission = Some(admitted.made_from(made));
+                    answer_within(limit, sender.send_request(connect(Some(header))))
                         .await
                         .ok_or(timed_out)?
                         .map_err(Failure::Upstream)?
-                }
-                Begun::Challenge(pending) => {
-                    match auth
-                        .negotiate(&mut sender, || connect(None), pending, limit)
-                        .await?
-                    {
-                        // The parent asked for nothing: this is its answer.
-                        Outcome::Answered(response) => response,
-                        Outcome::Proof { header, made } => {
-                            admission = Some(admitted.made_from(made));
-                            answer_within(limit, sender.send_request(connect(Some(header))))
-                                .await
-                                .ok_or(timed_out)?
-                                .map_err(Failure::Upstream)?
-                        }
-                    }
                 }
             }
         }
@@ -297,7 +286,7 @@ async fn connect_through_parent(
 
     if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         if let Some(sent) = admission {
-            return Err(sent.refused(response.headers()));
+            return Err(sent.refused());
         }
         tracing::warn!(
             "the parent proxy answered 407: it wants authentication, but no credentials are configured"

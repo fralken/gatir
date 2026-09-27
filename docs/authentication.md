@@ -22,9 +22,14 @@ that has changed credentials (a reload, or a restart) is the way to try again.
 
 The identity of the logged-in user, and nothing to keep in the file: Kerberos
 when the system can use it, and NTLM inside Negotiate when it cannot (away from
-the domain, or for a name that no service is registered under). The exchange
-takes a second round when the system falls back to NTLM: the parent answers the
-first token with a `407` and a token of its own, and gatir answers that.
+the domain, or for a name that no service is registered under). The first
+request on a new connection carries no credential at all, so a parent that a PAC
+script sends some requests to and that turns out to need no authentication (a
+local, already-authenticated relay, say) is never asked for one: only once a
+parent answers with a `407` that offers Negotiate does gatir ask the system for
+a ticket, since that can mean a real request to the KDC. The exchange takes a
+further round when the system falls back to NTLM: the parent answers the ticket
+with a `407` and a token of its own, and gatir answers that.
 
 What the system answers an NTLM challenge with is made from the password of the
 logged-on user, so it is guarded like a configured password: one attempt at a
@@ -32,15 +37,13 @@ time until it has worked once, and five minutes away from a parent that refuses
 it. A password changed on another computer is the usual cause of a refusal, and
 signing out and in again gives the session the new one.
 
-A parent that offers NTLM and not Negotiate answers the first token with a `407`
-that names only NTLM. Where the system can do NTLM by itself (Windows can, with
-the NTLM package of SSPI), gatir starts that exchange on the same connection,
-with the identity of the logged-on user: no password is configured, and the
-messages go with the `NTLM` scheme instead of `Negotiate`. It costs one more
-round trip on each new connection to that parent, as the Negotiate token is
-tried first. Linux and macOS have no NTLM without a password, so there the error
-says what the parent offers, and `method = "ntlmv2"` with a password or a hash is
-the way.
+A parent that offers NTLM and not Negotiate says so in that same first, bare
+answer, before any ticket was ever asked for. Where the system can do NTLM by
+itself (Windows can, with the NTLM package of SSPI), gatir starts that exchange
+instead, with the identity of the logged-on user: no password is configured, and
+the messages go with the `NTLM` scheme instead of `Negotiate`. Linux and macOS
+have no NTLM without a password, so there the error says what the parent offers,
+and `method = "ntlmv2"` with a password or a hash is the way.
 
 The service is `HTTP@` and the host name of the parent, or what
 `credentials.spn` says: `HTTP/proxy.example.com`, or with a realm,
@@ -75,8 +78,9 @@ and says what came back:
 service:     HTTP@proxy.example.com
 token:       2081 bytes
 mechanisms:  Kerberos
-answer:      gatir sends the token with the first request, and answers a
-             challenge if the parent sends one (...)
+answer:      gatir asks nothing until the parent's 407 asks for Negotiate; then this
+             token goes with the request, and answers a challenge if the parent
+             sends one (...)
 ```
 
 - `mechanisms` lists what the token offers, in the order the system prefers: **Kerberos**

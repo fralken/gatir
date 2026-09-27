@@ -87,7 +87,7 @@ async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> Response {
 }
 
 #[tokio::test]
-async fn a_request_carries_the_ticket_and_needs_no_probe_or_challenge() {
+async fn a_bare_request_opens_the_exchange_then_the_real_one_carries_the_ticket() {
     let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
@@ -99,16 +99,22 @@ async fn a_request_carries_the_ticket_and_needs_no_probe_or_challenge() {
     assert_eq!(response.status, 200, "{}", response.body_text());
     assert_eq!(response.body_text(), "GET 0 bytes");
 
-    // One request, with the proof in it: nothing was sent to get a challenge.
+    // The system is asked for a ticket only once the parent's bare answer
+    // says it wants one; the real request (repeated, since it has no body)
+    // then carries it.
     let seen = parent.requests();
-    assert_eq!(seen.len(), 1);
-    assert!(seen[0].served);
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].negotiate.is_none() && !seen[0].served);
     assert_eq!(
-        seen[0].negotiate.as_deref(),
+        seen[1].negotiate.as_deref(),
         Some(b"ticket for HTTP@127.0.0.1".as_slice())
     );
-    assert_eq!(seen[0].request.target, "http://origin.example.com/page");
-    assert_eq!(seen[0].request.headers.get("x-keep"), Some("yes"));
+    assert!(seen[1].served);
+    assert!(
+        seen.iter()
+            .all(|s| s.request.target == "http://origin.example.com/page")
+    );
+    assert_eq!(seen[1].request.headers.get("x-keep"), Some("yes"));
 }
 
 #[tokio::test]
@@ -129,7 +135,7 @@ async fn the_configured_service_name_is_used() {
 }
 
 #[tokio::test]
-async fn a_post_goes_once_with_its_body_and_the_ticket() {
+async fn a_post_is_sent_once_the_bare_probes_have_authenticated_the_connection() {
     let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
@@ -142,16 +148,23 @@ async fn a_post_goes_once_with_its_body_and_the_ticket() {
     assert_eq!(response.status, 200, "{}", response.body_text());
     assert_eq!(response.body_text(), "POST 5 bytes");
 
-    // No probe: the only request is the client's own.
+    // Probes (a GET, never POST) open the exchange; the body goes once, on the
+    // connection they have already authenticated.
     let seen = parent.requests();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].request.method, "POST");
-    assert_eq!(seen[0].request.body, b"hello");
-    assert!(seen[0].negotiate.is_some());
+    let methods: Vec<&str> = seen.iter().map(|s| s.request.method.as_str()).collect();
+    assert_eq!(methods, ["GET", "GET", "POST"]);
+    assert!(seen[0].negotiate.is_none());
+    assert_eq!(
+        seen[1].negotiate.as_deref(),
+        Some(b"ticket for HTTP@127.0.0.1".as_slice())
+    );
+    assert!(seen[2].negotiate.is_none());
+    assert_eq!(seen[2].request.body, b"hello");
+    assert!(seen[2].served);
 }
 
 #[tokio::test]
-async fn a_head_needs_no_probe_either() {
+async fn a_head_is_opened_with_probes_too() {
     let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
@@ -161,8 +174,18 @@ async fn a_head_needs_no_probe_either() {
         .await
         .unwrap();
     assert_eq!(client.read_response(true).await.unwrap().status, 200);
-    assert_eq!(parent.requests().len(), 1);
-    assert_eq!(parent.requests()[0].request.method, "HEAD");
+
+    // Two GET probes (a HEAD is never its own carrier) open the exchange, and
+    // the real HEAD follows on the connection they have authenticated.
+    let seen = parent.requests();
+    let methods: Vec<&str> = seen.iter().map(|s| s.request.method.as_str()).collect();
+    assert_eq!(methods, ["GET", "GET", "HEAD"]);
+    assert!(seen[0].negotiate.is_none());
+    assert_eq!(
+        seen[1].negotiate.as_deref(),
+        Some(b"ticket for HTTP@127.0.0.1".as_slice())
+    );
+    assert!(seen[2].negotiate.is_none() && seen[2].served);
 }
 
 #[tokio::test]
@@ -181,13 +204,19 @@ async fn an_authenticated_connection_is_reused_without_another_ticket() {
 
     assert_eq!(parent.connection_count(), 1);
     let seen = parent.requests();
-    assert_eq!(seen.len(), 3);
-    assert!(seen[0].negotiate.is_some());
-    assert!(seen[1].negotiate.is_none() && seen[2].negotiate.is_none());
+    // A bare probe, then the ticket, authenticate the connection once; the
+    // other two requests need neither.
+    assert_eq!(seen.len(), 4);
+    assert!(seen[0].negotiate.is_none());
+    assert_eq!(
+        seen[1].negotiate.as_deref(),
+        Some(b"ticket for HTTP@127.0.0.1".as_slice())
+    );
+    assert!(seen[2].negotiate.is_none() && seen[3].negotiate.is_none());
 }
 
 #[tokio::test]
-async fn a_tunnel_opens_with_one_connect_carrying_the_ticket() {
+async fn a_tunnel_opens_bare_then_a_connect_carries_the_ticket() {
     let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
@@ -196,9 +225,13 @@ async fn a_tunnel_opens_with_one_connect_carrying_the_ticket() {
     assert_eq!(client.read_exact(18).await.unwrap(), b"through the tunnel");
 
     let seen = parent.requests();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].request.method, "CONNECT");
-    assert!(seen[0].negotiate.is_some());
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|s| s.request.method == "CONNECT"));
+    assert!(seen[0].negotiate.is_none());
+    assert_eq!(
+        seen[1].negotiate.as_deref(),
+        Some(b"ticket for HTTP@127.0.0.1".as_slice())
+    );
 }
 
 #[tokio::test]
@@ -275,8 +308,9 @@ async fn a_ticket_the_parent_refuses_is_reported_and_asked_for_again() {
             response.body_text()
         );
     }
-    // Nothing here can lock an account, so there is no pause: both were tried.
-    assert_eq!(parent.requests().len(), 2);
+    // Nothing here can lock an account, so there is no pause: both were
+    // tried, each opening with a bare probe before its ticket.
+    assert_eq!(parent.requests().len(), 4);
 }
 
 #[tokio::test]
@@ -296,7 +330,7 @@ async fn a_parent_without_negotiate_is_reported_with_the_schemes_it_offers() {
 }
 
 #[tokio::test]
-async fn without_a_ticket_no_request_is_sent() {
+async fn without_a_ticket_the_bare_probe_still_went_out() {
     let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = start_proxy_with_tokens(&config(&parent), Arc::new(NoTickets)).await;
 
@@ -309,7 +343,11 @@ async fn without_a_ticket_no_request_is_sent() {
         "{}",
         response.body_text()
     );
-    assert!(parent.requests().is_empty());
+    // The parent was asked once, bare: only its answer said a ticket was
+    // wanted, and the system had none to give.
+    let seen = parent.requests();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].negotiate.is_none());
 }
 
 #[tokio::test]

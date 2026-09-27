@@ -159,11 +159,12 @@ async fn ntlm_takes_over_when_the_parent_does_not_offer_negotiate() {
     assert_eq!(response.status, 200, "{}", response.body_text());
     assert_eq!(response.body_text(), "GET 0 bytes");
 
-    // The Negotiate token is refused, and the exchange starts over in NTLM on
-    // the same connection: NEGOTIATE, then the real request with AUTHENTICATE.
+    // A bare probe finds that only NTLM is offered, so no ticket is ever
+    // asked for: the exchange runs entirely in NTLM on the same connection,
+    // NEGOTIATE and then the real request with AUTHENTICATE.
     let seen = parent.requests();
     assert_eq!(seen.len(), 3);
-    assert!(seen[0].negotiate.is_some() && seen[0].message.is_none());
+    assert!(seen[0].negotiate.is_none() && seen[0].message.is_none());
     assert_eq!(seen[1].message, Some(1));
     assert_eq!(seen[2].message, Some(3));
     assert_eq!(
@@ -272,7 +273,8 @@ async fn a_parent_that_offers_negotiate_too_gets_negotiate() {
     let response = ask(&proxy, get("origin.example.com", "/", "")).await;
     assert_eq!(response.status, 200, "{}", response.body_text());
     assert_eq!(parent.messages(1), 0);
-    assert_eq!(parent.requests().len(), 1);
+    // A bare probe, then the same request again with the ticket.
+    assert_eq!(parent.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -346,7 +348,8 @@ async fn a_parent_that_answers_the_negotiate_token_with_its_own_is_not_sent_ntlm
     let response = ask(&proxy, get("origin.example.com", "/", "")).await;
     assert_eq!(response.status, 200, "{}", response.body_text());
     assert_eq!(parent.messages(1), 0);
-    assert_eq!(parent.requests().len(), 2);
+    // A bare probe, then the first ticket, then the second: three in all.
+    assert_eq!(parent.requests().len(), 3);
 }
 
 #[tokio::test]

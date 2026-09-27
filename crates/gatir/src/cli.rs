@@ -180,16 +180,17 @@ fn negotiate_check(args: &NegotiateArgs) -> anyhow::Result<()> {
     } else {
         println!("mechanisms:  {}", diagnosis.mechanisms.join(", "));
     }
+    println!(
+        "answer:      gatir asks nothing until the parent's 407 asks for Negotiate; then this"
+    );
     if diagnosis.complete {
-        println!("answer:      the parent's answer is not needed: the token goes with the request");
+        println!("             token goes with the request, and nothing more is needed");
     } else {
-        println!("answer:      gatir sends the token with the first request, and answers a");
+        println!("             token goes with the request, and gatir answers a challenge if the");
         println!(
-            "             challenge if the parent sends one (NTLM inside Negotiate works this"
+            "             parent sends one (NTLM inside Negotiate works this way; a parent that"
         );
-        println!(
-            "             way; a parent that accepts a Kerberos ticket at once needs nothing more)"
-        );
+        println!("             accepts a Kerberos ticket at once needs nothing more)");
     }
     Ok(())
 }
@@ -244,7 +245,7 @@ fn load_config(source: &Source) -> anyhow::Result<Config> {
         }
         None => tracing::info!("no configuration file: using the built-in defaults"),
     }
-    tracing::debug!(?config, "configuration loaded");
+    tracing::debug!("configuration loaded\n{}", config.summary());
     Ok(config)
 }
 

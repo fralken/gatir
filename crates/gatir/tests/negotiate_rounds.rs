@@ -111,7 +111,7 @@ async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>, head: bool) -> Respon
 }
 
 #[tokio::test]
-async fn a_get_carries_the_first_token_and_then_the_second() {
+async fn a_get_opens_bare_then_carries_the_first_token_and_then_the_second() {
     let parent = parent_with(exchange()).await;
     let source = TwoRounds::default();
     let heard = source.heard.clone();
@@ -121,14 +121,16 @@ async fn a_get_carries_the_first_token_and_then_the_second() {
     assert_eq!(response.status, 200, "{}", response.body_text());
     assert_eq!(response.body_text(), "GET 0 bytes");
 
-    // The request is the carrier of the first token, and is sent again with the second.
+    // A bare probe opens the exchange; the request then carries the first
+    // token, and is sent again with the second.
     let seen = parent.requests();
-    assert_eq!(seen.len(), 2);
-    assert_eq!(seen[0].negotiate.as_deref(), Some(FIRST));
-    assert!(!seen[0].served);
-    assert_eq!(seen[1].negotiate.as_deref(), Some(SECOND));
-    assert!(seen[1].served);
-    assert_eq!(seen[0].connection, seen[1].connection);
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].negotiate.is_none() && !seen[0].served);
+    assert_eq!(seen[1].negotiate.as_deref(), Some(FIRST));
+    assert!(!seen[1].served);
+    assert_eq!(seen[2].negotiate.as_deref(), Some(SECOND));
+    assert!(seen[2].served);
+    assert!(seen.iter().all(|s| s.connection == seen[0].connection));
     assert!(
         seen.iter()
             .all(|s| s.request.target == "http://origin.example.com/page")
@@ -151,16 +153,18 @@ async fn a_post_is_sent_only_once_the_exchange_is_done() {
     .await;
     assert_eq!(response.body_text(), "POST 5 bytes");
 
-    // A probe opens the exchange, a GET and never the method of the request,
-    // so that nothing is done twice; the POST goes once, with the second token.
+    // A bare probe, then one with the first token, open the exchange; the
+    // second token goes with the real request, and never the method of the
+    // request, so that nothing is done twice.
     let seen = parent.requests();
     let methods: Vec<&str> = seen.iter().map(|s| s.request.method.as_str()).collect();
-    assert_eq!(methods, ["GET", "POST"]);
-    assert_eq!(seen[0].negotiate.as_deref(), Some(FIRST));
-    assert!(seen[0].request.body.is_empty());
-    assert_eq!(seen[1].negotiate.as_deref(), Some(SECOND));
-    assert_eq!(seen[1].request.body, b"hello");
-    assert!(seen[1].served);
+    assert_eq!(methods, ["GET", "GET", "POST"]);
+    assert!(seen[0].negotiate.is_none());
+    assert_eq!(seen[1].negotiate.as_deref(), Some(FIRST));
+    assert!(seen[0].request.body.is_empty() && seen[1].request.body.is_empty());
+    assert_eq!(seen[2].negotiate.as_deref(), Some(SECOND));
+    assert_eq!(seen[2].request.body, b"hello");
+    assert!(seen[2].served);
 }
 
 #[tokio::test]
@@ -179,7 +183,7 @@ async fn a_head_is_opened_with_a_probe_too() {
         .iter()
         .map(|s| s.request.method.clone())
         .collect();
-    assert_eq!(methods, ["GET", "HEAD"]);
+    assert_eq!(methods, ["GET", "GET", "HEAD"]);
 }
 
 #[tokio::test]
@@ -192,14 +196,15 @@ async fn a_tunnel_is_authenticated_in_two_rounds() {
     assert_eq!(client.read_exact(18).await.unwrap(), b"through the tunnel");
 
     let seen = parent.requests();
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 3);
     assert!(
         seen.iter()
             .all(|s| s.request.method == "CONNECT" && s.request.target == "example.com:443")
     );
-    assert_eq!(seen[0].negotiate.as_deref(), Some(FIRST));
-    assert_eq!(seen[1].negotiate.as_deref(), Some(SECOND));
-    assert_eq!(seen[0].connection, seen[1].connection);
+    assert!(seen[0].negotiate.is_none());
+    assert_eq!(seen[1].negotiate.as_deref(), Some(FIRST));
+    assert_eq!(seen[2].negotiate.as_deref(), Some(SECOND));
+    assert!(seen.iter().all(|s| s.connection == seen[0].connection));
 }
 
 #[tokio::test]
@@ -219,7 +224,7 @@ async fn the_connection_stays_authenticated_for_the_requests_after() {
     // served, the first of them after the exchange.
     assert_eq!(parent.connection_count(), 1);
     let seen = parent.requests();
-    assert_eq!(seen.len(), 4);
+    assert_eq!(seen.len(), 5);
     assert_eq!(seen.iter().filter(|s| s.negotiate.is_some()).count(), 2);
     assert_eq!(seen.iter().filter(|s| s.served).count(), 3);
 }
@@ -237,10 +242,12 @@ async fn a_parent_that_accepts_the_first_token_needs_no_second_round() {
 
     let response = ask(&proxy, get("origin.example.com", "/", ""), false).await;
     assert_eq!(response.body_text(), "GET 0 bytes");
-    assert_eq!(parent.requests().len(), 1);
+    // A bare probe, then the same request again with the token: nothing more
+    // is needed once the parent takes it.
+    assert_eq!(parent.requests().len(), 2);
 
-    // With a body, the probe is answered, and the request follows on the
-    // connection that the answer authenticated.
+    // With a body, the probes are answered, and the request follows on the
+    // connection that they authenticated.
     let response = ask(
         &proxy,
         "POST http://origin.example.com/up HTTP/1.1\r\nHost: origin.example.com\r\n\
@@ -334,8 +341,9 @@ async fn a_refused_second_token_is_not_tried_again_for_a_while() {
         text.contains("did not accept the credentials of the logged-on user for HTTP@127.0.0.1"),
         "{text}"
     );
+    // A bare probe, then the first token, then the rejected second: three in all.
     let tried = parent.requests().len();
-    assert_eq!(tried, 2);
+    assert_eq!(tried, 3);
 
     let response = ask(&proxy, get("origin.example.com", "/", ""), false).await;
     assert_eq!(response.status, 503);

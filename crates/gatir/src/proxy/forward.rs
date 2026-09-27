@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent::{Admission, Begun, Outcome, ParentAuth, reusable};
+use super::parent::{Admission, Outcome, ParentAuth, reusable};
 use super::pool::{Lease, Pool};
 use super::server::{Context, Live};
 use super::upstream::{Hop, Opened};
@@ -154,7 +154,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             None => return Err(Failure::ResponseTimeout(lease.hop.who())),
             Some(Ok(response)) if demands_authentication(&response, &lease.hop, context) => {
                 if let Some(proof) = admission.take() {
-                    return Err(proof.refused(response.headers()));
+                    return Err(proof.refused());
                 }
                 // No proof went out on this connection: it had been
                 // authenticated, and is not any more.
@@ -257,17 +257,7 @@ async fn authenticate<'a>(
             "a connection to an origin server was asked to authenticate as a parent",
         ));
     };
-    let pending = match auth.begin(&parent.host, limit).await? {
-        Begun::Ready(proof) => {
-            // No challenge to wait for: the request carries the proof itself.
-            request
-                .headers_mut()
-                .insert(PROXY_AUTHORIZATION, proof.header);
-            lease.needs_auth = false;
-            return Ok(Authenticated::Proof(admission.made_from(Some(proof.made))));
-        }
-        Begun::Challenge(pending) => pending,
-    };
+    let pending = auth.begin(&parent.host);
     let real = head.filter(|head| lapsed || head.method != Method::HEAD);
     let is_real = real.is_some();
     let carrier = || match real {
