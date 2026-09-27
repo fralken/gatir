@@ -76,10 +76,38 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  msi:
+    name: build (.msi)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download the Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: gatir-x86_64-pc-windows-msvc
+          path: dist
+      - name: Check the downloaded archive
+        working-directory: dist
+        run: sha256sum -c gatir-*-x86_64-pc-windows-msvc.zip.sha256
+      - name: Make the .msi
+        run: |
+          sudo apt-get update && sudo apt-get install -y msitools
+          mkdir -p dist/stage
+          unzip -q dist/gatir-*-x86_64-pc-windows-msvc.zip -d dist/stage
+          scripts/package-windows.sh x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gatir-msi
+          path: |
+            dist/*.msi
+            dist/*.msi.sha256
+          if-no-files-found: error
+
   release:
     name: publish
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, msi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -103,5 +131,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/SHA256SUMS dist/gatir.rb \
+            dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/*.msi dist/SHA256SUMS dist/gatir.rb \
             --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag

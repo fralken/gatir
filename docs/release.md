@@ -36,6 +36,7 @@ of that run; nothing is published.
 | `gatir-<version>-x86_64-pc-windows-msvc.zip` | Windows, x86-64 |
 | `gatir_<version>-1_amd64.deb`, `gatir_<version>-1_arm64.deb` | Debian and Ubuntu |
 | `gatir-<version>-1.x86_64.rpm`, `gatir-<version>-1.aarch64.rpm` | Fedora and other RPM systems |
+| `gatir-<version>-x64.msi` | Windows, x86-64, as an installer |
 | `gatir.rb` | the Homebrew formula of the release |
 | `SHA256SUMS` | the checksum of each of the files above but the formula |
 
@@ -82,6 +83,23 @@ brew install gatir
 `scripts/homebrew-formula.sh REPOSITORY TAG SHA256SUMS` writes the formula for any
 release. It is for macOS only: on Linux, use the package or the archive.
 
+### The Windows installer
+
+`gatir-<version>-x64.msi` installs `gatir.exe` under Program Files and adds that
+folder to the `PATH`, so that `gatir` can be run from a new terminal without naming
+its path; both are undone when it is uninstalled. Installing a newer version removes
+the older one first (a major upgrade, by the Windows Installer itself). There is no
+setup wizard: double-clicking the file shows the ordinary Windows Installer progress
+dialog, and
+
+```powershell
+msiexec /i gatir-<version>-x64.msi /quiet
+```
+
+installs it without asking anything, which is also how it would be rolled out to
+several computers. The installer needs Windows to be x86-64: on Arm64 Windows it runs
+under emulation, as `gatir.exe` itself does.
+
 ## Checking a download
 
 Put the archive and `SHA256SUMS` in one directory, and check the archive that was
@@ -97,7 +115,12 @@ shasum -a 256 --check --ignore-missing SHA256SUMS  # macOS
 `scripts/package.sh [TARGET]` does what the workflow does for one target: it builds
 in release mode, then writes the archive and its `.sha256` file to `dist/`.
 `scripts/package-linux.sh [TARGET]` then makes the `.deb` and the `.rpm` from it (it needs
-`dpkg-dev` and `rpm`). The workflow calls both, so that what is tried here is what is released.
+`dpkg-dev` and `rpm`), and `scripts/package-windows.sh [TARGET]` makes the `.msi` from a
+Windows one (it needs `wixl`, from msitools: `brew install msitools` on macOS,
+`apt-get install msitools` on Linux). None of the three needs Windows or a copy of WiX
+itself, so the `.msi` can be made, and tried (`msiinfo tables`, `msiextract`, from the
+same package), on any machine that builds gatir. The workflow calls all of them, so
+that what is tried here is what is released.
 
 The workflow is not run anywhere but on GitHub. What it depends on there (the
 names of the runners, the actions it uses) is the part to look at first if a release

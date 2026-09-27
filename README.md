@@ -26,6 +26,7 @@ Take what fits your system from the releases page, and check it against `SHA256S
 - **Debian, Ubuntu**: `sudo apt install ./gatir_<version>-1_<arch>.deb`
 - **Fedora**: `sudo dnf install ./gatir-<version>-1.<arch>.rpm`
 - **macOS**: the Homebrew formula in the release, or the archive
+- **Windows**: the `.msi`, which puts `gatir.exe` on your `PATH`
 - **any system**: the archive, which holds the program to put on your `PATH`
 
 ## Quick start
