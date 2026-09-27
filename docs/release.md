@@ -65,9 +65,11 @@ What each package requires is worked out from the program itself, by `dpkg-shlib
 and by `rpmbuild`, not written by hand. For the archives it is for the user to install
 them.
 
-The maintainer written in the packages is `The gatir contributors
-<gatir@example.invalid>` until `GATIR_MAINTAINER` says otherwise, in the form `Name
-<address>`. The packages are not signed: check them with `SHA256SUMS`.
+The maintainer written in the packages is `Francesco MDE
+<6103677+fralken@users.noreply.github.com>` unless `GATIR_MAINTAINER` says otherwise, in
+the form `Name <address>`. That address is a GitHub-privacy relay: it does not receive
+mail, so open an issue on the repository instead of writing to it. The packages are not
+signed: check them with `SHA256SUMS`.
 
 ### Homebrew
 

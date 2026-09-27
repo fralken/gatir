@@ -22,7 +22,7 @@ case "$target" in
   *) echo "packages are made for Linux targets only, not ${target}" >&2; exit 1 ;;
 esac
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-maintainer="${GATIR_MAINTAINER:-The gatir contributors <gatir@example.invalid>}"
+maintainer="${GATIR_MAINTAINER:-Francesco MDE <6103677+fralken@users.noreply.github.com>}"
 summary="Authenticating proxy for corporate proxies (NTLM, Kerberos)"
 
 stage="$PWD/dist/stage/gatir-${version}-${target}"
