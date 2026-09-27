@@ -198,7 +198,9 @@ async fn try_one_outcome(
     let pending = auth.begin(&parent.host);
     let carrier = || request(url, None).expect("a URL already used for the probe");
     match auth
-        .negotiate(&mut sender, carrier, pending, response_limit)
+        .negotiate(&mut sender, carrier, pending, response_limit, || {
+            Box::pin(connect(parent, connect_limit))
+        })
         .await
     {
         // A Negotiate ticket (or its NTLM-inside-Negotiate fallback) that the

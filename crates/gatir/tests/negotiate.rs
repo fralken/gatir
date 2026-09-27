@@ -117,6 +117,36 @@ async fn a_bare_request_opens_the_exchange_then_the_real_one_carries_the_ticket(
     assert_eq!(seen[1].request.headers.get("x-keep"), Some("yes"));
 }
 
+/// A real corporate proxy was found to send `Connection: close` with the bare
+/// probe's `407`, before Negotiate had offered anything on that connection:
+/// the ticket must still get through, on a second connection.
+#[tokio::test]
+async fn a_parent_that_closes_after_the_bare_probe_still_gets_the_ticket_on_a_new_connection() {
+    let parent = parent_with(Options {
+        close_after_refusal: true,
+        ..accepting("ticket for HTTP@127.0.0.1")
+    })
+    .await;
+    let proxy = proxy_for(&parent).await;
+
+    let response = ask(&proxy, get("origin.example.com", "/", "")).await;
+    assert_eq!(response.status, 200, "{}", response.body_text());
+
+    // The bare probe's connection dies right after the parent refuses it; the
+    // ticket goes out on a second, fresh one.
+    assert_eq!(parent.connection_count(), 2);
+    let seen = parent.requests();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].connection, 1);
+    assert!(seen[0].negotiate.is_none() && !seen[0].served);
+    assert_eq!(seen[1].connection, 2);
+    assert_eq!(
+        seen[1].negotiate.as_deref(),
+        Some(b"ticket for HTTP@127.0.0.1".as_slice())
+    );
+    assert!(seen[1].served);
+}
+
 #[tokio::test]
 async fn the_configured_service_name_is_used() {
     let parent = parent_with(accepting("ticket for HTTP/proxy.example.com@EXAMPLE.COM")).await;
@@ -228,6 +258,35 @@ async fn a_tunnel_opens_bare_then_a_connect_carries_the_ticket() {
     assert_eq!(seen.len(), 2);
     assert!(seen.iter().all(|s| s.request.method == "CONNECT"));
     assert!(seen[0].negotiate.is_none());
+    assert_eq!(
+        seen[1].negotiate.as_deref(),
+        Some(b"ticket for HTTP@127.0.0.1".as_slice())
+    );
+}
+
+/// The same reconnect as the plain-request case, for a `CONNECT` tunnel: the
+/// parent proxy is asked to open the tunnel over the connection the ticket
+/// ends up going out on, whichever one that is.
+#[tokio::test]
+async fn a_tunnel_reconnects_when_the_bare_probe_closes_the_connection() {
+    let parent = parent_with(Options {
+        close_after_refusal: true,
+        ..accepting("ticket for HTTP@127.0.0.1")
+    })
+    .await;
+    let proxy = proxy_for(&parent).await;
+
+    let mut client = open_tunnel(&proxy, "example.com:443").await;
+    client.send("through the tunnel").await.unwrap();
+    assert_eq!(client.read_exact(18).await.unwrap(), b"through the tunnel");
+
+    assert_eq!(parent.connection_count(), 2);
+    let seen = parent.requests();
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|s| s.request.method == "CONNECT"));
+    assert_eq!(seen[0].connection, 1);
+    assert!(seen[0].negotiate.is_none() && !seen[0].served);
+    assert_eq!(seen[1].connection, 2);
     assert_eq!(
         seen[1].negotiate.as_deref(),
         Some(b"ticket for HTTP@127.0.0.1".as_slice())

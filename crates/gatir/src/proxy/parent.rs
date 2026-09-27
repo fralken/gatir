@@ -16,7 +16,12 @@
 //!   outright for a destination that was never going to need one (an address
 //!   with no realm, say). So the first request of a Negotiate exchange is
 //!   sent bare, and the system is asked for a token only once the parent's
-//!   `407` says it wants one.
+//!   `407` says it wants one. Some proxies close the connection right after
+//!   that bare request, before Negotiate ever gets to answer on it (seen in
+//!   practice: a `407` with `Connection: close` for a request that carried no
+//!   credential at all). A Kerberos ticket answers no challenge from a
+//!   particular connection, unlike an NTLM one, so [`ParentAuth::negotiate`]
+//!   opens a fresh connection and sends it there instead of giving up.
 //! - A parent that offers NTLM and not Negotiate says so in that same first
 //!   `407`, before any token was ever built. If the system can do NTLM by
 //!   itself (Windows can), `negotiate` starts that exchange instead, with the
@@ -40,6 +45,8 @@
 //! a refusal), so it is held off in the same way. A Kerberos ticket that the
 //! proxy does not accept costs the account nothing, so it never is.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -62,6 +69,14 @@ use crate::auth::{
 };
 use crate::config::Credentials;
 use crate::noproxy::NoProxy;
+
+/// A fresh connection to the parent, for [`ParentAuth::negotiate`]'s
+/// `reconnect` parameter: boxed, since a plain `impl AsyncFnMut` here runs
+/// into a known rustc limitation ("implementation of `Send` is not general
+/// enough") once this is nested inside the connection tasks `tokio::spawn`
+/// requires to be `Send` for every lifetime.
+pub(super) type Reconnect<'a> =
+    Pin<Box<dyn Future<Output = Result<SendRequest<Body>, Failure>> + Send + 'a>>;
 
 /// How long gatir stays away from a parent that refused the credentials.
 pub(super) const COOLDOWN: Duration = Duration::from_secs(300);
@@ -213,13 +228,16 @@ impl ParentAuth {
     /// Runs the exchange on a new connection, and reads the parent's answer.
     /// `carrier` makes a fresh copy of what is sent each time it is called (a
     /// probe, or the real request when it is safe to repeat): the exchange may
-    /// need it more than once.
-    pub(super) async fn negotiate(
+    /// need it more than once. `reconnect` opens a fresh connection to the
+    /// same parent, for a Kerberos ticket that the connection it was asked on
+    /// turned out not to survive; see the comment where it is called.
+    pub(super) async fn negotiate<'r>(
         &self,
         sender: &mut SendRequest<Body>,
         carrier: impl Fn() -> Request<Body>,
         pending: Pending,
         limit: Duration,
+        mut reconnect: impl FnMut() -> Reconnect<'r>,
     ) -> Result<Outcome, Failure> {
         // NTLM has nothing to lose by opening with its own message: making one
         // costs nothing, and a parent that never asks for it just ignores it.
@@ -284,9 +302,15 @@ impl ParentAuth {
                 let (context, header) =
                     first_ticket(negotiate.tokens(), service.clone(), limit).await?;
                 if !reusable(body, sender, limit).await {
-                    return Err(Failure::Parent(
-                        "the parent proxy did not keep the connection open during authentication",
-                    ));
+                    // Some proxies close the connection right after refusing a
+                    // request that carried no credential at all, before
+                    // Negotiate ever gets to prove anything on it (seen in
+                    // practice: a bare `407` with `Connection: close`). A
+                    // Kerberos ticket, unlike an NTLM challenge, answers no
+                    // challenge from this connection in particular, so a fresh
+                    // one still carries it fine; nothing was spent asking for
+                    // it that a new connection would waste.
+                    *sender = reconnect().await?;
                 }
 
                 let mut second = carrier();
@@ -301,9 +325,10 @@ impl ParentAuth {
                 let header =
                     answer_challenge(context, service.clone(), &parts.headers, limit).await?;
                 if !reusable(body, sender, limit).await {
-                    return Err(Failure::Parent(
-                        "the parent proxy did not keep the connection open during authentication",
-                    ));
+                    // The token this answers does not depend on the connection
+                    // either: it was made from what the parent's own token
+                    // held, not from anything tied to this specific socket.
+                    *sender = reconnect().await?;
                 }
                 Ok(Outcome::Proof {
                     header,

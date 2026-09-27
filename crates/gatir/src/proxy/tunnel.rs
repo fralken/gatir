@@ -27,6 +27,7 @@ use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent::Outcome;
 use super::server::{Context, Live};
 use super::upstream::Hop;
+use crate::config::HostPort;
 
 pub(super) async fn handle(
     request: Request<Incoming>,
@@ -173,7 +174,7 @@ pub(super) async fn reach(
     match hop {
         Hop::Direct => Ok(Reached::Open(Upstream::Direct(stream))),
         Hop::Parent(parent) => {
-            connect_through_parent(stream, &parent.host, &address, headers, extensions, &live).await
+            connect_through_parent(stream, &parent, &address, headers, extensions, &live).await
         }
     }
 }
@@ -238,16 +239,36 @@ fn spawn_tunnel<U>(
     });
 }
 
+/// Starts the HTTP/1 client driver on a connection to a parent proxy, ready to
+/// be upgraded into a tunnel.
+async fn handshake_with_parent(stream: TcpStream) -> Result<http1::SendRequest<Body>, Failure> {
+    let (sender, connection) = http1::Builder::new()
+        .preserve_header_case(true)
+        .handshake::<_, Body>(TokioIo::new(stream))
+        .await
+        .map_err(Failure::Upstream)?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.with_upgrades().await {
+            tracing::debug!(%err, "parent proxy connection ended with error");
+        }
+    });
+    Ok(sender)
+}
+
 /// Asks a parent proxy, over `stream`, to open a tunnel to `address`. The
 /// client's own header fields (User-Agent and the like), if it has any, go
 /// along, minus the hop-by-hop ones and its proxy credentials.
 ///
 /// If the parent wants NTLM, the CONNECT request itself opens the exchange and
 /// is sent again with the proof. With Negotiate it carries the proof at once.
-/// The connection then becomes the tunnel, so it is never reused.
+/// If the connection dies while asking a parent for a Kerberos ticket (some
+/// close it right after refusing a bare, credential-less probe), a fresh one
+/// to the same parent carries the ticket instead: see the module doc of
+/// `parent`. Whichever connection ends up authenticated becomes the tunnel,
+/// so none of this is ever reused for anything else.
 async fn connect_through_parent(
     stream: TcpStream,
-    parent_host: &str,
+    parent: &HostPort,
     address: &str,
     mut headers: HeaderMap,
     extensions: Extensions,
@@ -275,16 +296,7 @@ async fn connect_through_parent(
         request
     };
 
-    let (mut sender, connection) = http1::Builder::new()
-        .preserve_header_case(true)
-        .handshake::<_, Body>(TokioIo::new(stream))
-        .await
-        .map_err(Failure::Upstream)?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.with_upgrades().await {
-            tracing::debug!(%err, "parent proxy connection ended with error");
-        }
-    });
+    let mut sender = handshake_with_parent(stream).await?;
 
     // Set once a proof has been sent, until the parent has said whether it
     // accepts it.
@@ -298,9 +310,24 @@ async fn connect_through_parent(
             .map_err(Failure::Upstream)?,
         Some(auth) => {
             let admitted = auth.admit().await?;
-            let pending = auth.begin(parent_host);
+            let pending = auth.begin(&parent.host);
+            let hop = Hop::Parent(parent.clone());
             match auth
-                .negotiate(&mut sender, || connect(None), pending, limit)
+                .negotiate(
+                    &mut sender,
+                    || connect(None),
+                    pending,
+                    limit,
+                    || {
+                        Box::pin(async {
+                            let stream = live
+                                .upstreams
+                                .connect_hop(&hop, address, live.timeouts.connect)
+                                .await?;
+                            handshake_with_parent(stream).await
+                        })
+                    },
+                )
                 .await?
             {
                 // The parent asked for nothing: this is its answer.

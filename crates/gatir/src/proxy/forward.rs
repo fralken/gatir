@@ -284,8 +284,17 @@ async fn authenticate<'a>(
     let (outcome, proof_goes_in) = match &lease.hop {
         Hop::Parent(parent) => {
             let pending = auth.begin(&parent.host);
+            let hop = lease.hop.clone();
             let outcome = auth
-                .negotiate(&mut lease.sender, carrier, pending, limit)
+                .negotiate(&mut lease.sender, carrier, pending, limit, || {
+                    Box::pin(async {
+                        let stream = context
+                            .upstreams
+                            .connect_hop(&hop, &target.address, context.timeouts.connect)
+                            .await?;
+                        handshake(stream).await
+                    })
+                })
                 .await?;
             (outcome, PROXY_AUTHORIZATION)
         }
