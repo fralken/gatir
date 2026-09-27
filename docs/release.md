@@ -100,6 +100,19 @@ installs it without asking anything, which is also how it would be rolled out to
 several computers. The installer needs Windows to be x86-64: on Arm64 Windows it runs
 under emulation, as `gatir.exe` itself does.
 
+Installing it needs an administrator, since it writes to Program Files and to the
+`PATH` of every user. Without one, the `.zip` works with no privilege at all: extract
+it anywhere in your own folders, and put it on your own `PATH` instead of the
+computer's:
+
+```powershell
+setx PATH "%PATH%;C:\path\to\the\extracted\folder"
+```
+
+(open a new terminal afterwards, as with the installer). With only the `.msi` in
+hand, `msiexec /a gatir-<version>-x64.msi /qn TARGETDIR=C:\path\to\extract\to` copies
+out its files the same way, without installing anything.
+
 ## Checking a download
 
 Put the archive and `SHA256SUMS` in one directory, and check the archive that was
