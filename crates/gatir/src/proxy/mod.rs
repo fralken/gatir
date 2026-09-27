@@ -1,6 +1,7 @@
 //! The proxy server: accepts clients and forwards their requests.
 
 mod body;
+mod detect;
 mod failure;
 mod forward;
 mod headers;
@@ -16,6 +17,7 @@ use std::io;
 
 use tokio_util::sync::CancellationToken;
 
+pub use detect::{Attempt, AttemptOutcome, Probe, Report, run as detect};
 pub use server::{Reloader, Server};
 
 use crate::config::{Config, ConfigError};

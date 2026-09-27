@@ -122,3 +122,36 @@ answer:      gatir asks nothing until the parent's 407 asks for Negotiate; then 
   `SEC_E_NO_CREDENTIALS` (nobody is logged on with a domain identity).
 - `RUST_LOG=gatir=debug` shows, for each new connection to the parent, whether an
   answer from the parent was waited for.
+
+`gatir negotiate` asks nothing of the network: it only says what the system
+would send. To find out what a real parent actually does with it:
+
+```sh
+gatir detect --parent proxy.example.com:8080 --url http://example.com/
+```
+
+sends a bare, unauthenticated request first, to see whether the parent asks for
+authentication at all and what it offers; then, if credentials are configured
+and the parent offers the scheme they need, it tries them for real, one
+dialect at a time for NTLM (`ntlmv2`, `ntlm2sr`, `nt`, stopping at the first
+accepted) or once for Negotiate:
+
+```
+parent:      proxy.example.com:8080
+url:         http://example.com/
+probe:       HTTP 407 (authentication required)
+offers:      Negotiate, NTLM
+trying ntlmv2... rejected
+trying ntlm2sr... rejected
+trying nt... accepted
+----------------------------------------
+gatir can authenticate to this parent with the configured credentials using
+method = "nt".
+```
+
+Each dialect tried is a real login against the account behind the
+credentials, exactly as a real request would make: a wrong password is
+rejected by every one of them, which is three failed logons, not one. Only
+`config.parents` (or `--parent`) is tested, never a PAC script (name the
+parent it would choose with `--parent` instead), and only the first
+configured parent if there are several.

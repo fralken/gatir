@@ -44,6 +44,15 @@ pub enum AuthError {
     Exchange { service: String, reason: String },
 }
 
+/// The authentication schemes named in a `407`/`401`'s challenge fields, in the
+/// order they were offered: for reporting what a server offers, regardless of
+/// which of them gatir itself can use.
+pub fn offered_schemes<'a>(
+    fields: impl IntoIterator<Item = &'a hyper::header::HeaderValue>,
+) -> Vec<String> {
+    offers::names(&offers::all(fields))
+}
+
 fn offered_list(offered: &[String]) -> String {
     if offered.is_empty() {
         String::new()

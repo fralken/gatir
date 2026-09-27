@@ -377,7 +377,7 @@ fn offered_schemes(headers: &HeaderMap) -> Vec<String> {
 }
 
 /// Sends a request and reads the head of the answer.
-async fn send(
+pub(super) async fn send(
     sender: &mut SendRequest<Body>,
     request: Request<Body>,
     limit: Duration,
