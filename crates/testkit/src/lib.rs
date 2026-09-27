@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 
+pub mod fuzz;
 pub mod http;
 pub mod ntlm_parent;
 pub mod origin;

@@ -61,6 +61,47 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_what_a_connection_field_names() {
+        use gatir_testkit::fuzz::each_variant;
+
+        let seeds: [&[u8]; 4] = [
+            b"keep-alive, X-Drop",
+            b"close",
+            b"Upgrade, x-drop , , X-Other",
+            b"x-drop,x-keep2",
+        ];
+        each_variant(&seeds, 20_000, |value| {
+            let Ok(value) = HeaderValue::from_bytes(value) else {
+                return;
+            };
+            let mut map = headers(&[
+                ("x-drop", "1"),
+                ("x-other", "2"),
+                ("host", "example.com"),
+                ("content-length", "0"),
+                ("x-keep2", "3"),
+            ]);
+            let named = value.to_str().unwrap_or_default().to_owned();
+            map.append(CONNECTION, value);
+            strip_hop_by_hop(&mut map);
+            // Whatever `Connection` says, what only the two ends need stays,
+            // and the field itself is gone.
+            assert!(map.contains_key("host") && map.contains_key("content-length"));
+            assert!(!map.contains_key(CONNECTION));
+            for name in HOP_BY_HOP {
+                assert!(!map.contains_key(name), "{name}");
+            }
+            // A field goes if `Connection` names it, and only then.
+            for name in ["x-drop", "x-other", "x-keep2"] {
+                let is_named = named
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(name));
+                assert_eq!(map.contains_key(name), !is_named, "{name} in {named:?}");
+            }
+        });
+    }
+
+    #[test]
     fn removes_hop_by_hop_and_proxy_credentials() {
         let mut map = headers(&[
             ("connection", "keep-alive"),

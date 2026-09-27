@@ -344,7 +344,116 @@ pub(super) async fn serve(mut client: TcpStream, peer: SocketAddr, context: Arc<
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use gatir_testkit::fuzz::each_variant;
+
     use super::*;
+
+    /// Runs the handshake against what a client sends, and says what came of it.
+    fn handshake_with(
+        runtime: &tokio::runtime::Runtime,
+        input: &[u8],
+        credentials: Option<&Socks5Credentials>,
+    ) -> Result<Destination, Stop> {
+        runtime.block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+            client.write_all(input).await.unwrap();
+            // The client says no more, and stays to hear the replies.
+            client.shutdown().await.unwrap();
+            let done = timeout(Duration::from_secs(2), handshake(&mut server, credentials)).await;
+            drop(client);
+            done.expect("the handshake ended, for want of more from the client")
+        })
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    fn bob() -> Socks5Credentials {
+        let config = crate::config::Config::from_toml_str(
+            "[socks5]\nlisten = [\"127.0.0.1:1080\"]\nusername = \"bob\"\npassword = \"s3cret\"\n",
+            crate::config::Overrides::default(),
+        )
+        .unwrap();
+        config.socks5.unwrap().credentials.unwrap()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// What a destination must be for the CONNECT request that is made of it.
+    fn assert_safe(destination: &Destination) {
+        assert_ne!(destination.port, 0);
+        assert!(!destination.host.is_empty());
+        assert!(
+            destination
+                .host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-_:[]".contains(&byte)),
+            "{destination}"
+        );
+    }
+
+    #[test]
+    fn fuzz_a_socks5_request_without_authentication() {
+        let runtime = runtime();
+        // Methods offered, then CONNECT to a name, to an IPv4 and to an IPv6 address.
+        let mut domain = vec![5, 1, 0, 5, 1, 0, 3, 11];
+        domain.extend_from_slice(b"example.com");
+        domain.extend_from_slice(&443u16.to_be_bytes());
+        let ipv4 = [5, 2, 0, 2, 5, 1, 0, 1, 192, 0, 2, 1, 0, 80];
+        let mut ipv6 = vec![5, 1, 0, 5, 1, 0, 4];
+        ipv6.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        ipv6.extend_from_slice(&8080u16.to_be_bytes());
+
+        let wanted = handshake_with(&runtime, &domain, None).expect("the seed is a request");
+        assert_eq!(
+            wanted,
+            Destination {
+                host: "example.com".into(),
+                port: 443
+            }
+        );
+        each_variant(&[&domain, &ipv4, &ipv6], 5_000, |input| {
+            if let Ok(destination) = handshake_with(&runtime, input, None) {
+                assert_safe(&destination);
+            }
+        });
+    }
+
+    #[test]
+    fn fuzz_a_socks5_request_with_a_user_name_and_password() {
+        let runtime = runtime();
+        let bob = bob();
+        // Methods (user name and password), then the pair, then CONNECT to a name.
+        let mut seed = vec![5, 1, 2, 1, 3];
+        seed.extend_from_slice(b"bob");
+        seed.push(6);
+        seed.extend_from_slice(b"s3cret");
+        seed.extend_from_slice(&[5, 1, 0, 3, 11]);
+        seed.extend_from_slice(b"example.com");
+        seed.extend_from_slice(&443u16.to_be_bytes());
+
+        handshake_with(&runtime, &seed, Some(&bob)).expect("the seed is a request");
+        each_variant(&[&seed], 8_000, |input| {
+            if let Ok(destination) = handshake_with(&runtime, input, Some(&bob)) {
+                assert_safe(&destination);
+                // Nobody gets in without the pair, whatever else is changed.
+                assert!(
+                    contains(input, b"bob") && contains(input, b"s3cret"),
+                    "let in without the user name and password"
+                );
+            }
+        });
+    }
 
     #[test]
     fn a_host_name_is_letters_digits_dots_hyphens_and_underscores() {

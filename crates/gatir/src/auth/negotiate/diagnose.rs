@@ -106,6 +106,39 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_the_mechanisms_of_a_token() {
+        use gatir_testkit::fuzz::each_variant;
+
+        let kerberos = [
+            0x60, 0x82, 0x01, 0x00, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02, 0x06, 0x09,
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02, 0x06, 0x0a, 0x2b, 0x06, 0x01,
+            0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+        ];
+        // A token that names NTLM twice: as a message, and by its identifier.
+        let ntlm_twice = [
+            b"NTLMSSP\0".as_slice(),
+            &[
+                0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+            ],
+        ]
+        .concat();
+        assert_eq!(mechanisms(&ntlm_twice), ["NTLM"]);
+        each_variant(
+            &[&kerberos, b"NTLMSSP\0\x01\0\0\0", &ntlm_twice],
+            20_000,
+            |token| {
+                let found = mechanisms(token);
+                // Each is named once, and only when its identifier is there.
+                let mut sorted = found.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(sorted.len(), found.len(), "{found:?}");
+                assert!(found.len() <= 3);
+            },
+        );
+    }
+
+    #[test]
     fn a_source_is_diagnosed_by_its_first_token() {
         #[derive(Debug)]
         struct Says(&'static [u8]);

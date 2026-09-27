@@ -47,6 +47,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+The parsers that read what others send (the NTLM challenge, SOCKS5, the PAC
+script and its result, the configuration, addresses, `Proxy-Authenticate`) have
+`fuzz_` tests: they start from valid inputs and change them in thousands of
+ways (`gatir_testkit::fuzz`), and ask that nothing panics or takes for ever and
+that what is accepted is safe to use. The inputs are the same on every run, so a
+failure can be repeated, and it names the input in hex. For a longer search:
+
+```sh
+GATIR_FUZZ_SCALE=100 cargo test fuzz_
+```
+
+A new parser gets a `fuzz_` test of its own, and a defect it finds becomes an
+ordinary test before it is fixed.
+
 Kerberos (Negotiate) goes through the system GSS-API on Unix, which gatir loads
 at run time (`libloading`, in `auth/negotiate/gss/api.rs`) instead of linking it:
 nothing about it is needed to build, and a computer without the library
