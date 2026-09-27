@@ -38,6 +38,10 @@ CNTLM.
 - `crates/gatir`: library + `gatir` binary.
 - `crates/testkit`: dev-only test support (mock origin/parent proxies,
   injectable clock and nonce). Never a dependency of the shipped binary.
+- `crates/mangen`: writes the manual pages from the `clap` definition, for a
+  release. Not shipped.
+- `crates/loadgen`: `gatir-loadgen`, for load-testing a proxy by hand; see
+  `docs/load-testing.md`. Not shipped.
 
 ## Commands
 

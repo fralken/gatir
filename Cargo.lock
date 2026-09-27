@@ -530,6 +530,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gatir-loadgen"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "gatir-testkit",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tokio",
+]
+
+[[package]]
 name = "gatir-mangen"
 version = "0.1.0"
 dependencies = [
