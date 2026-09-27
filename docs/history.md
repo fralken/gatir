@@ -179,8 +179,32 @@ plain proxy, parent authentication with both NTLM and Kerberos, PAC scripts
 from a file or a URL, SOCKS5 and port forwarding, reload, and packaging for all
 three operating systems — is done, tested, and, for the parts that could only
 be proven on real infrastructure, tried against a real corporate proxy and a
-real domain-joined Windows PC. A short list of optional extensions was
-deliberately left for later, because nothing about them was ever decided:
-authenticating to an origin server rather than a parent, a setup helper that
-probes a proxy to say what authentication it wants (CNTLM's `-M`), `Expect:
-100-continue`, and a side-by-side load comparison against CNTLM itself.
+real domain-joined Windows PC.
+
+A short list of optional extensions, once left for later because nothing
+about them was ever decided, has since been settled too, rounding out a first
+version with everything originally on the list in place. gatir can now
+authenticate directly to a small, explicitly named set of origin servers that
+ask for NTLM themselves — an intranet site with Windows-integrated
+authentication, reached directly rather than through a parent — with the same
+identity, and the same one-attempt-at-a-time, five-minute-lockout discipline,
+as the parent gets. A `gatir detect` command answers "why doesn't this work"
+by asking a live parent directly, rather than guessing: a bare request first,
+to see whether it wants authentication at all and what it offers, then, only
+if credentials are configured, one real attempt per dialect gatir knows,
+stopping at the first the parent accepts. `Expect: 100-continue` turned out to
+need no new code: reading the HTTP library's own low-level source directly,
+rather than assuming, confirmed gatir already answers it correctly — just not
+with the full bandwidth-saving optimization the header promises for a request
+the far end would have rejected outright, a trade judged not worth the
+complexity of relaying that decision end to end. And a small, repeatable
+load-testing tool, built after doing the exercise by hand once and hitting a
+couple of its own pitfalls along the way (a proxy setting silently bypassed by
+a stray environment variable; a well-known load-testing tool's own unreliable
+handling of persistent connections through a proxy), made a fair side-by-side
+comparison against another such proxy possible: pointed at the same real,
+authenticating parent rather than a bare backend that would hide the very
+thing worth measuring, gatir's pooled, authenticate-once-per-connection design
+sustained about twenty thousand requests a second with no errors over a full
+minute, an order of magnitude ahead of a proxy that re-authenticates on every
+single request, neither one leaking memory over that time.
