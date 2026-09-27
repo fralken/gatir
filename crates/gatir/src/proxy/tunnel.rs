@@ -1,7 +1,7 @@
 //! CONNECT tunnels: an opaque byte pipe between the client and a destination.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +34,7 @@ pub(super) async fn handle(
     peer: SocketAddr,
 ) -> Response<Body> {
     let destination = request.uri().authority().map(ToString::to_string);
-    let response = match open(request, context).await {
+    let response = match open(request, context, peer).await {
         Ok(response) => response,
         Err(failure) => failure.into_response(),
     };
@@ -53,6 +53,7 @@ pub(super) async fn handle(
 async fn open(
     mut request: Request<Incoming>,
     context: &Context,
+    peer: SocketAddr,
 ) -> Result<Response<Body>, Failure> {
     let authority = request
         .uri()
@@ -62,13 +63,16 @@ async fn open(
         .port_u16()
         .ok_or(Failure::BadRequest("CONNECT needs a host:port target"))?;
     let host = authority.host().to_owned();
+    let destination = format!("{host}:{port}");
 
     let client_upgrade = hyper::upgrade::on(&mut request);
     let headers = std::mem::take(request.headers_mut());
     // Carries the original capitalization of the header names.
     let extensions = std::mem::take(request.extensions_mut());
     match reach(context, &host, port, headers, extensions).await? {
-        Reached::Open(upstream) => spawn_tunnel(context, client_upgrade, upstream),
+        Reached::Open(upstream) => {
+            spawn_tunnel(context, client_upgrade, upstream, peer.ip(), destination);
+        }
         Reached::Refused(response) => return Ok(response),
     }
     Ok(Response::new(full(Bytes::new())))
@@ -177,8 +181,16 @@ pub(super) async fn reach(
 /// Carries bytes between `client` and `upstream` until one side is done or
 /// idle, for a client that is not speaking HTTP (a SOCKS5 client, a forwarded
 /// port). Never returns before the tunnel is closed.
-pub(super) async fn pipe<C>(context: &Context, client: C, upstream: Upstream)
-where
+/// `peer` and `destination` are logged with the tunnel, matching what the
+/// caller logged when it opened it, so a "tunnel closed" can be matched back
+/// to it.
+pub(super) async fn pipe<C>(
+    context: &Context,
+    client: C,
+    upstream: Upstream,
+    peer: IpAddr,
+    destination: &str,
+) where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     relay(
@@ -186,13 +198,22 @@ where
         upstream,
         context.live().timeouts.tunnel_idle,
         context.force.clone(),
+        peer,
+        destination,
     )
     .await;
 }
 
 /// Relays between the client, once its connection is upgraded, and `upstream`.
-fn spawn_tunnel<U>(context: &Context, client: OnUpgrade, upstream: U)
-where
+/// Unlike the other two callers of [`relay`], nothing has logged this tunnel
+/// as opened yet, so this does, with the same `peer`/`destination` fields.
+fn spawn_tunnel<U>(
+    context: &Context,
+    client: OnUpgrade,
+    upstream: U,
+    peer: IpAddr,
+    destination: String,
+) where
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let idle = context.live().timeouts.tunnel_idle;
@@ -200,8 +221,19 @@ where
     // Tracked, so a graceful shutdown waits for the tunnel.
     context.tracker.spawn(async move {
         match client.await {
-            Ok(upgraded) => relay(TokioIo::new(upgraded), upstream, idle, force).await,
-            Err(err) => tracing::debug!(%err, "CONNECT upgrade failed"),
+            Ok(upgraded) => {
+                tracing::debug!(%peer, %destination, "tunnel opened");
+                relay(
+                    TokioIo::new(upgraded),
+                    upstream,
+                    idle,
+                    force,
+                    peer,
+                    &destination,
+                )
+                .await;
+            }
+            Err(err) => tracing::debug!(%peer, %destination, %err, "CONNECT upgrade failed"),
         }
     });
 }
@@ -314,8 +346,16 @@ async fn connect_through_parent(
 
 /// Copies bytes both ways until both directions finish, one side fails, no
 /// byte has moved in either direction for `idle`, or `force` is cancelled.
-async fn relay<C, U>(client: C, mut upstream: U, idle: Duration, force: CancellationToken)
-where
+/// `peer` and `destination` name the tunnel in every line here, so a "tunnel
+/// closed" can be matched back to the "tunnel opened" it closes.
+async fn relay<C, U>(
+    client: C,
+    mut upstream: U,
+    idle: Duration,
+    force: CancellationToken,
+    peer: IpAddr,
+    destination: &str,
+) where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
@@ -330,12 +370,16 @@ where
     tokio::select! {
         result = copy_bidirectional(&mut client, &mut upstream) => match result {
             Ok((from_client, from_upstream)) => {
-                tracing::debug!(from_client, from_upstream, "tunnel closed");
+                tracing::debug!(%peer, %destination, from_client, from_upstream, "tunnel closed");
             }
-            Err(err) => tracing::debug!(%err, "tunnel ended with error"),
+            Err(err) => tracing::debug!(%peer, %destination, %err, "tunnel ended with error"),
         },
-        () = wait_until_idle(&activity, idle) => tracing::debug!("tunnel closed after being idle"),
-        () = force.cancelled() => tracing::debug!("tunnel closed at shutdown"),
+        () = wait_until_idle(&activity, idle) => {
+            tracing::debug!(%peer, %destination, "tunnel closed after being idle");
+        }
+        () = force.cancelled() => {
+            tracing::debug!(%peer, %destination, "tunnel closed at shutdown");
+        }
     }
 }
 
@@ -429,6 +473,10 @@ mod tests {
 
     const IDLE: Duration = Duration::from_millis(300);
 
+    fn peer() -> IpAddr {
+        IpAddr::from([127, 0, 0, 1])
+    }
+
     #[tokio::test]
     async fn bytes_flow_both_ways_and_close_propagates() {
         let (mut client, client_side) = duplex(1024);
@@ -438,6 +486,8 @@ mod tests {
             upstream_side,
             Duration::from_secs(30),
             CancellationToken::new(),
+            peer(),
+            "test",
         ));
 
         client.write_all(b"ping").await.unwrap();
@@ -459,7 +509,15 @@ mod tests {
         let (mut client, client_side) = duplex(1024);
         let (upstream_side, mut upstream) = duplex(1024);
         let started = Instant::now();
-        relay(client_side, upstream_side, IDLE, CancellationToken::new()).await;
+        relay(
+            client_side,
+            upstream_side,
+            IDLE,
+            CancellationToken::new(),
+            peer(),
+            "test",
+        )
+        .await;
 
         assert!(started.elapsed() >= IDLE);
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -478,6 +536,8 @@ mod tests {
             upstream_side,
             IDLE,
             CancellationToken::new(),
+            peer(),
+            "test",
         ));
 
         // Well past the idle limit in total, but never idle for that long.
@@ -511,6 +571,8 @@ mod tests {
             upstream_side,
             Duration::from_secs(30),
             force.clone(),
+            peer(),
+            "test",
         ));
 
         client.write_all(b"x").await.unwrap();
@@ -534,6 +596,8 @@ mod tests {
             upstream_side,
             Duration::from_secs(30),
             CancellationToken::new(),
+            peer(),
+            "test",
         ));
 
         client.write_all(b"request").await.unwrap();

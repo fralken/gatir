@@ -316,7 +316,14 @@ pub(super) async fn serve(mut client: TcpStream, peer: SocketAddr, context: Arc<
                 return;
             }
             tracing::debug!(peer = %peer_ip, %destination, "SOCKS5 tunnel opened");
-            tunnel::pipe(&context, client, upstream).await;
+            tunnel::pipe(
+                &context,
+                client,
+                upstream,
+                peer_ip,
+                &destination.to_string(),
+            )
+            .await;
             return;
         }
         Ok(Reached::Refused(response)) => {

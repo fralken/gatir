@@ -35,7 +35,7 @@ pub(super) async fn serve(
     match reached {
         Ok(Reached::Open(upstream)) => {
             tracing::debug!(peer = %peer.ip(), %target, "tunnel opened");
-            tunnel::pipe(&context, client, upstream).await;
+            tunnel::pipe(&context, client, upstream, peer.ip(), &target.to_string()).await;
         }
         Ok(Reached::Refused(response)) => tracing::warn!(
             peer = %peer.ip(),
