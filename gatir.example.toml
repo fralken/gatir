@@ -30,6 +30,12 @@ domain = "EXAMPLE"
 password = "change-me"
 # nt_hash = "0123456789abcdef0123456789abcdef"
 
+# Origin servers, reached directly, that also ask for NTLM themselves (401,
+# not the parent's 407) with these same credentials: an intranet site with
+# Windows-integrated authentication, say. Matched like no_proxy. Without this,
+# a 401 from any server is left for the client.
+# origin_hosts = ["intranet.example.com", "*.corp.example.com"]
+
 # [pac]
 # file = "proxy.pac"
 # url = "https://pac.example.com/proxy.pac"

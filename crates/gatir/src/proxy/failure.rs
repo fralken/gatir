@@ -57,6 +57,12 @@ pub(super) enum Failure {
     CredentialsRejected {
         user: String,
     },
+    /// An origin server named in `credentials.origin_hosts` answered the NTLM
+    /// proof with another `401`.
+    OriginCredentialsRejected {
+        user: String,
+        host: String,
+    },
     /// The parent refused the credentials recently, so nobody is trying yet.
     CoolingDown(Duration),
     /// The parent offers Negotiate and did not accept the Kerberos ticket.
@@ -128,6 +134,12 @@ impl Failure {
                 "The parent proxy rejected the credentials of {user}. Check the user name, \
                  domain and password. gatir will not try again for {} minutes, so that the \
                  account does not get locked.",
+                COOLDOWN.as_secs() / 60
+            )),
+            Self::OriginCredentialsRejected { user, host } => bad_gateway(format!(
+                "{host} rejected the credentials of {user}. Check credentials.origin_hosts, and \
+                 the user name, domain and password. gatir will not try again for {} minutes, \
+                 so that the account does not get locked.",
                 COOLDOWN.as_secs() / 60
             )),
             Self::Pac(err) => bad_gateway(format!(

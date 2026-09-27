@@ -211,6 +211,7 @@ mod tests {
             workstation: None,
             secret: None,
             spn: spn.map(str::to_owned),
+            origin_hosts: crate::noproxy::NoProxy::default(),
         }
     }
 

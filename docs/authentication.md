@@ -2,7 +2,8 @@
 
 The credentials apply to whichever parent proxy a request goes to: the ones in
 `parents`, or the one a PAC script chooses. What the `[credentials]` table needs
-depends on `method`.
+depends on `method`. The same credentials can also answer a small, named set of
+origin servers directly: see [below](#authenticating-to-an-origin-server-directly).
 
 ## NTLM: `ntlmv2` (the default), `ntlm2sr`, `nt`
 
@@ -64,6 +65,33 @@ registered under; an address, or another alias, may have none.
   Kerberos service is registered. The NTLM of SSPI for a parent that offers only NTLM
   is written and tested against a mock parent, and has not yet been tried against a
   real one.
+
+## Authenticating to an origin server directly
+
+`credentials.origin_hosts` names servers, reached directly (never through a
+parent, and never through a `CONNECT` tunnel, which gatir cannot see inside),
+that also ask for NTLM themselves — `401` and `WWW-Authenticate`, not the
+parent's `407` — the way an intranet site with Windows-integrated
+authentication does:
+
+```toml
+[credentials]
+username = "alice"
+domain = "CORP"
+password = "change-me"
+origin_hosts = ["intranet.example.com", "*.corp.example.com"]
+```
+
+Matched the same way as `no_proxy`: names with `*`/`?`, IP addresses and CIDR
+ranges, case-insensitive. Without this list, a `401` from any other server is
+left for the client to deal with, exactly as before; gatir never offers these
+credentials to a server that was not named. Negotiate has no password to
+answer such a challenge with, so `origin_hosts` needs an NTLM secret
+(`password`, `nt_hash` or `ntlmv2_hash`) and is rejected at start-up otherwise.
+
+A wrong password here counts as a failed logon against the same account as a
+wrong one against the parent, and is held off the same way: one attempt at a
+time, and five minutes away from a server that refuses it.
 
 ## Finding out why it does not work
 

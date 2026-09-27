@@ -182,6 +182,7 @@ mod tests {
             workstation: Some("Computer".to_owned()),
             secret: Some(Secret::Password(SecretString::from("Password"))),
             spn: None,
+            origin_hosts: crate::noproxy::NoProxy::default(),
         }
     }
 

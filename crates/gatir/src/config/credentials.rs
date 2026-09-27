@@ -12,6 +12,7 @@ use serde::de::{self, Deserializer, Visitor};
 use zeroize::Zeroize;
 
 use super::ConfigError;
+use crate::noproxy::NoProxy;
 
 /// Length in bytes of an NT hash (MD4 digest).
 pub const NT_HASH_LEN: usize = 16;
@@ -107,6 +108,10 @@ pub struct Credentials {
     /// Service name of the parent proxy, for [`AuthMethod::Negotiate`] only.
     /// `None` means `HTTP@` followed by the parent's host.
     pub spn: Option<String>,
+    /// Origin servers, reached directly, that these credentials also answer an
+    /// NTLM challenge from (`401`, not the parent's `407`). Empty unless
+    /// configured: gatir never offers them to a server that was not named.
+    pub origin_hosts: NoProxy,
 }
 
 impl Credentials {
@@ -124,6 +129,7 @@ impl Credentials {
             && self.domain == other.domain
             && self.workstation == other.workstation
             && self.spn == other.spn
+            && self.origin_hosts.entries() == other.origin_hosts.entries()
             && same_secret
     }
 }
@@ -142,6 +148,7 @@ pub(super) struct RawCredentials {
     pub nt_hash: Option<SecretString>,
     #[serde(default, deserialize_with = "secret_string")]
     pub ntlmv2_hash: Option<SecretString>,
+    pub origin_hosts: Option<Vec<String>>,
 }
 
 impl RawCredentials {
@@ -218,6 +225,17 @@ impl RawCredentials {
             Some(spn) => Some(spn.trim().to_owned()),
         };
 
+        let origin_hosts = self.origin_hosts.unwrap_or_default();
+        if !origin_hosts.is_empty() && secret.is_none() {
+            return Err(ConfigError::invalid(
+                "credentials.origin_hosts needs an NTLM secret (password, nt_hash or \
+                 ntlmv2_hash); method = \"negotiate\" has none to answer a server's \
+                 challenge with",
+            ));
+        }
+        let origin_hosts =
+            NoProxy::new(origin_hosts).map_err(|err| ConfigError::invalid(err.to_string()))?;
+
         Ok(Credentials {
             method,
             username,
@@ -225,6 +243,7 @@ impl RawCredentials {
             workstation: self.workstation,
             secret,
             spn,
+            origin_hosts,
         })
     }
 }

@@ -23,6 +23,14 @@
 //!   identity of the logged-on user: no password is configured, and the
 //!   messages go with the `NTLM` scheme.
 //!
+//! [`ParentAuth::negotiate_origin`] is a third, narrower exchange: with a
+//! server reached directly (never through a parent, and never through a
+//! `CONNECT` tunnel, which gatir cannot see inside), named in
+//! `credentials.origin_hosts`, that asks for NTLM itself (`401`,
+//! `WWW-Authenticate`), the way an intranet site with Windows-integrated
+//! authentication does. It reuses the same configured NTLM identity: Negotiate
+//! has no password to answer such a challenge with, so it does not apply.
+//!
 //! Every attempt with wrong NTLM credentials counts as a failed logon against
 //! the account, and a few of them lock it. So [`ParentAuth::admit`] lets one
 //! attempt at a time through until the credentials have worked once, and
@@ -39,7 +47,10 @@ use std::time::{Duration, Instant};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
-use hyper::header::{HeaderMap, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
+use hyper::header::{
+    AUTHORIZATION, HeaderMap, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
+    WWW_AUTHENTICATE,
+};
 use hyper::{Request, Response, StatusCode};
 use tokio::time::timeout;
 
@@ -50,6 +61,7 @@ use crate::auth::{
     ntlm, refusal,
 };
 use crate::config::Credentials;
+use crate::noproxy::NoProxy;
 
 /// How long gatir stays away from a parent that refused the credentials.
 pub(super) const COOLDOWN: Duration = Duration::from_secs(300);
@@ -58,6 +70,8 @@ const DRAIN_LIMIT: usize = 64 * 1024;
 
 pub(super) struct ParentAuth {
     authenticator: Authenticator,
+    /// Origin servers this may also answer an NTLM challenge from directly.
+    origin_hosts: NoProxy,
     /// When the parent last refused the credentials.
     rejected_at: Mutex<Option<Instant>>,
     /// Whether the credentials have worked, and not been refused since.
@@ -115,10 +129,21 @@ impl ParentAuth {
         };
         Ok(Self {
             authenticator,
+            origin_hosts: credentials.origin_hosts.clone(),
             rejected_at: Mutex::new(None),
             verified: AtomicBool::new(false),
             gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The configured NTLM identity, if `host` is one of the origin servers it
+    /// also answers a direct challenge from. `None` for Negotiate, which has no
+    /// password to answer one with, and for any host not named.
+    pub(super) fn ntlm_for_origin(&self, host: &str) -> Option<&ntlm::Authenticator> {
+        match &self.authenticator {
+            Authenticator::Ntlm(ntlm) if self.origin_hosts.matches(host) => Some(ntlm),
+            _ => None,
+        }
     }
 
     fn rejected_at(&self) -> MutexGuard<'_, Option<Instant>> {
@@ -287,6 +312,32 @@ impl ParentAuth {
             }
         }
     }
+}
+
+/// The exchange with an origin server that asks for NTLM itself
+/// (`401`/`WWW-Authenticate`), reusing the configured identity: there is no
+/// ticket to ask the system for, so, unlike [`ParentAuth::negotiate`], there
+/// is only ever one scheme and one shape to this exchange.
+pub(super) async fn negotiate_origin(
+    ntlm: &ntlm::Authenticator,
+    sender: &mut SendRequest<Body>,
+    carrier: impl Fn() -> Request<Body>,
+    limit: Duration,
+) -> Result<Outcome, Failure> {
+    let mut first = carrier();
+    first.headers_mut().insert(AUTHORIZATION, ntlm.first()?);
+    let response = send(sender, first, limit).await?;
+    if response.status() != StatusCode::UNAUTHORIZED {
+        return Ok(Outcome::Answered(response));
+    }
+    let (parts, body) = response.into_parts();
+    let header = ntlm.respond(parts.headers.get_all(WWW_AUTHENTICATE))?;
+    if !reusable(body, sender, limit).await {
+        return Err(Failure::Parent(
+            "the origin server did not keep the connection open during authentication",
+        ));
+    }
+    Ok(Outcome::Proof { header, made: None })
 }
 
 /// Asks the system for the first Kerberos token for `service`, now that the
@@ -503,6 +554,22 @@ impl Admission<'_> {
                 self.auth.hold_off("the logged-on user");
                 Failure::SessionRejected { service }
             }
+        }
+    }
+
+    /// The origin server at `host` refused the proof: also a failed logon of
+    /// the same account, so it is held off the same way a parent's refusal
+    /// would be. Only ever called for an NTLM proof: [`ParentAuth::ntlm_for_origin`]
+    /// is what could have made one at all.
+    pub(super) fn refused_by_origin(self, host: &str) -> Failure {
+        let Authenticator::Ntlm(ntlm) = &self.auth.authenticator else {
+            unreachable!("origin auth needs the configured NTLM identity")
+        };
+        let user = ntlm.user().to_owned();
+        self.auth.hold_off(&user);
+        Failure::OriginCredentialsRejected {
+            user,
+            host: host.to_owned(),
         }
     }
 }

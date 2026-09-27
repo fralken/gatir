@@ -140,7 +140,13 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Run => {
             let source = Source::new(cli.config, cli.overrides)?;
             let config = load_config(&source)?;
-            if config.parents.is_empty() && config.pac.is_none() && config.credentials.is_some() {
+            if config.parents.is_empty()
+                && config.pac.is_none()
+                && config
+                    .credentials
+                    .as_ref()
+                    .is_some_and(|credentials| credentials.origin_hosts.entries().is_empty())
+            {
                 tracing::warn!(
                     "credentials are configured, but there is no parent proxy to authenticate to"
                 );

@@ -393,14 +393,14 @@ async fn echo(reader: &mut BufReader<TcpStream>) {
 
 /// A different challenge for every connection, so a proof made for one is
 /// useless on another.
-fn challenge_for(connection: usize) -> [u8; 8] {
+pub(crate) fn challenge_for(connection: usize) -> [u8; 8] {
     let mut challenge = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     challenge[0] = connection as u8;
     challenge
 }
 
 /// The bytes of an `NTLM <base64>` field value.
-fn ntlm_token(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn ntlm_token(value: &str) -> Option<Vec<u8>> {
     let (scheme, token) = value.trim().split_once(char::is_whitespace)?;
     if !scheme.eq_ignore_ascii_case("NTLM") {
         return None;
@@ -417,7 +417,7 @@ fn negotiate_token(value: &str) -> Option<Vec<u8>> {
     STANDARD_PAD_INDIFFERENT.decode(token.trim()).ok()
 }
 
-fn message_type(message: &[u8]) -> Option<u32> {
+pub(crate) fn message_type(message: &[u8]) -> Option<u32> {
     if message.len() < 12 || &message[..8] != b"NTLMSSP\0" {
         return None;
     }
@@ -436,61 +436,82 @@ impl Shared {
     }
 
     fn challenge_reply(&self, challenge: [u8; 8]) -> Vec<u8> {
-        let message = challenge_message(
-            &challenge,
-            &self.account.domain.to_uppercase(),
-            &self.target_info(),
-        );
+        let message = challenge_for_account(&self.account, &challenge, self.options.timestamp);
         let field = format!("NTLM {}", STANDARD.encode(message));
         reply_407(&[field], self.options.close_after_challenge)
     }
 
-    /// The AV pairs of the CHALLENGE message, which a client must copy into
-    /// its NTLMv2 blob unchanged.
-    fn target_info(&self) -> Vec<u8> {
-        let mut info = Vec::new();
-        av_pair(&mut info, 2, &utf16(&self.account.domain.to_uppercase()));
-        av_pair(&mut info, 1, &utf16("PROXY"));
-        av_pair(&mut info, 4, &utf16("corp.example.com"));
-        av_pair(&mut info, 3, &utf16("proxy.corp.example.com"));
-        if let Some(time) = self.options.timestamp {
-            av_pair(&mut info, 7, &time.to_le_bytes());
-        }
-        av_pair(&mut info, 0, &[]);
-        info
-    }
-
     /// Whether `message` is an AUTHENTICATE message answering `challenge`.
     fn accepts(&self, message: &[u8], challenge: &[u8; 8]) -> bool {
-        let Some(auth) = Authenticate::parse(message) else {
-            return false;
-        };
-        let unicode = auth.flags & UNICODE != 0;
-        let (user, domain) = (
-            auth.text(auth.user, unicode),
-            auth.text(auth.domain, unicode),
-        );
-        if !user.eq_ignore_ascii_case(&self.account.user)
-            || !domain.eq_ignore_ascii_case(&self.account.domain)
-        {
-            return false;
-        }
-        if !valid_response(&auth, &user, &domain, &self.account.password, challenge) {
-            return false;
-        }
-        // An NTLMv2 blob must carry the target info the server sent, and its
-        // clock when it sent one.
-        if auth.nt.len() > 24 {
-            let blob = &auth.nt[16..];
-            if blob.len() < 32 || blob[28..blob.len() - 4] != self.target_info()[..] {
-                return false;
-            }
-            if let Some(time) = self.options.timestamp {
-                return blob[8..16] == time.to_le_bytes();
-            }
-        }
-        true
+        accepts(&self.account, message, challenge, self.options.timestamp)
     }
+}
+
+/// The AV pairs of a CHALLENGE message for `account`, which a client must copy
+/// into its NTLMv2 blob unchanged.
+pub(crate) fn target_info(account: &Account, timestamp: Option<u64>) -> Vec<u8> {
+    let mut info = Vec::new();
+    av_pair(&mut info, 2, &utf16(&account.domain.to_uppercase()));
+    av_pair(&mut info, 1, &utf16("PROXY"));
+    av_pair(&mut info, 4, &utf16("corp.example.com"));
+    av_pair(&mut info, 3, &utf16("proxy.corp.example.com"));
+    if let Some(time) = timestamp {
+        av_pair(&mut info, 7, &time.to_le_bytes());
+    }
+    av_pair(&mut info, 0, &[]);
+    info
+}
+
+/// The CHALLENGE message (just the NTLM bytes, with no header around them)
+/// that answers `account`'s server would send for `challenge`.
+pub(crate) fn challenge_for_account(
+    account: &Account,
+    challenge: &[u8; 8],
+    timestamp: Option<u64>,
+) -> Vec<u8> {
+    challenge_message(
+        challenge,
+        &account.domain.to_uppercase(),
+        &target_info(account, timestamp),
+    )
+}
+
+/// Whether `message` is an AUTHENTICATE message proving knowledge of
+/// `account`'s password, answering `challenge`. `timestamp`, when the
+/// CHALLENGE carried one, must be the same value passed to it.
+pub(crate) fn accepts(
+    account: &Account,
+    message: &[u8],
+    challenge: &[u8; 8],
+    timestamp: Option<u64>,
+) -> bool {
+    let Some(auth) = Authenticate::parse(message) else {
+        return false;
+    };
+    let unicode = auth.flags & UNICODE != 0;
+    let (user, domain) = (
+        auth.text(auth.user, unicode),
+        auth.text(auth.domain, unicode),
+    );
+    if !user.eq_ignore_ascii_case(&account.user) || !domain.eq_ignore_ascii_case(&account.domain) {
+        return false;
+    }
+    if !valid_response(&auth, &user, &domain, &account.password, challenge) {
+        return false;
+    }
+    // An NTLMv2 blob must carry the target info the server sent, and its
+    // clock when it sent one.
+    if auth.nt.len() > 24 {
+        let blob = &auth.nt[16..];
+        let info = target_info(account, timestamp);
+        if blob.len() < 32 || blob[28..blob.len() - 4] != info[..] {
+            return false;
+        }
+        if let Some(time) = timestamp {
+            return blob[8..16] == time.to_le_bytes();
+        }
+    }
+    true
 }
 
 /// The cryptographic check of an AUTHENTICATE message: does its response

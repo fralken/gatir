@@ -516,13 +516,21 @@ impl Config {
                 } else {
                     format!("{}@{}", c.username, c.domain)
                 };
-                match &c.secret {
+                let base = match &c.secret {
                     Some(secret) => format!(
                         "{identity}, method {}, secret: {} (hidden)",
                         c.method.as_str(),
                         secret.kind()
                     ),
                     None => format!("logged-in identity, method {}", c.method.as_str()),
+                };
+                if c.origin_hosts.entries().is_empty() {
+                    base
+                } else {
+                    format!(
+                        "{base}, also to {} directly",
+                        join(c.origin_hosts.entries().iter())
+                    )
                 }
             }
         };
@@ -896,6 +904,28 @@ mod tests {
     }
 
     #[test]
+    fn origin_hosts_are_matched_like_no_proxy() {
+        let config = load(
+            "[credentials]\nusername = \"a\"\npassword = \"p\"\n\
+             origin_hosts = [\"intranet.example.com\", \"*.corp.example.com\"]",
+        )
+        .unwrap();
+        let creds = config.credentials.unwrap();
+        assert!(creds.origin_hosts.matches("intranet.example.com"));
+        assert!(creds.origin_hosts.matches("app.corp.example.com"));
+        assert!(!creds.origin_hosts.matches("example.com"));
+        assert_eq!(
+            load("[credentials]\nusername = \"a\"\npassword = \"p\"")
+                .unwrap()
+                .credentials
+                .unwrap()
+                .origin_hosts
+                .entries(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         for toml in [
             "listn = []",
@@ -977,6 +1007,14 @@ mod tests {
             (
                 "[credentials]\nmethod = \"negotiate\"\nspn = \"  \"",
                 "credentials.spn must not be empty",
+            ),
+            (
+                "[credentials]\nmethod = \"negotiate\"\norigin_hosts = [\"intranet.example.com\"]",
+                "credentials.origin_hosts needs an NTLM secret",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\npassword = \"p\"\norigin_hosts = [\"\"]",
+                "must not be empty",
             ),
         ];
         for (toml, expected) in cases {
@@ -1765,6 +1803,9 @@ mod tests {
             "[credentials]\nusername = \"alice\"\ndomain = \"OTHER\"\npassword = \"pw-one\"".to_owned(),
             "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\nmethod = \"nt\"".to_owned(),
             "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\nworkstation = \"PC\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\n\
+             origin_hosts = [\"intranet.example.com\"]"
+                .to_owned(),
             format!("[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\nnt_hash = \"{hash}\""),
         ] {
             assert!(!credentials(base).same_as(&credentials(&other)), "{other}");

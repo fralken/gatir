@@ -8,7 +8,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Incoming};
 use hyper::client::conn::http1;
-use hyper::header::{HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
+use hyper::header::{AUTHORIZATION, HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
 use hyper::http::Extensions;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent::{Admission, Outcome, ParentAuth, reusable};
+use super::parent::{Admission, Outcome, ParentAuth, negotiate_origin, reusable};
 use super::pool::{Lease, Pool};
 use super::server::{Context, Live};
 use super::upstream::{Hop, Opened};
@@ -152,9 +152,14 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         let attempt = response_within(limit, &mut sent, lease.sender.try_send_request(request));
         let mut failed = match attempt.await {
             None => return Err(Failure::ResponseTimeout(lease.hop.who())),
-            Some(Ok(response)) if demands_authentication(&response, &lease.hop, context) => {
+            Some(Ok(response))
+                if demands_authentication(&response, &lease.hop, context, &target.host) =>
+            {
                 if let Some(proof) = admission.take() {
-                    return Err(proof.refused());
+                    return Err(match &lease.hop {
+                        Hop::Parent(_) => proof.refused(),
+                        Hop::Direct => proof.refused_by_origin(&target.host),
+                    });
                 }
                 // No proof went out on this connection: it had been
                 // authenticated, and is not any more.
@@ -216,12 +221,27 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     ))
 }
 
-/// Whether the parent is asking for authentication, and has been given the
-/// means to provide it.
-fn demands_authentication(response: &Response<Incoming>, hop: &Hop, context: &Scope<'_>) -> bool {
-    hop.is_parent()
-        && context.auth.is_some()
-        && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+/// Whether the next hop is asking for authentication, and has been given the
+/// means to provide it: the parent's `407`, or, for a direct connection to a
+/// host named in `credentials.origin_hosts`, its own `401`.
+fn demands_authentication(
+    response: &Response<Incoming>,
+    hop: &Hop,
+    context: &Scope<'_>,
+    host: &str,
+) -> bool {
+    match hop {
+        Hop::Parent(_) => {
+            context.auth.is_some() && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        }
+        Hop::Direct => {
+            context
+                .auth
+                .as_deref()
+                .is_some_and(|auth| auth.ntlm_for_origin(host).is_some())
+                && response.status() == StatusCode::UNAUTHORIZED
+        }
+    }
 }
 
 /// What came of authenticating a new connection to a parent.
@@ -234,11 +254,12 @@ enum Authenticated<'a> {
     Ready,
 }
 
-/// Runs the first half of the NTLM exchange on a new connection to a parent.
+/// Runs the first half of the exchange on a new connection: to the parent, or,
+/// for a host named in `credentials.origin_hosts`, straight to the origin.
 ///
-/// A request without a body opens the exchange itself, so when the parent asks
-/// for nothing its answer is the real one. Otherwise a probe does: a `GET`,
-/// never the method of the request, so that nothing is done twice if the parent
+/// A request without a body opens the exchange itself, so when the other side
+/// asks for nothing its answer is the real one. Otherwise a probe does: a
+/// `GET`, never the method of the request, so that nothing is done twice if it
 /// answers it. That also goes for `HEAD`, which some proxies do not accept
 /// there, unless a first attempt has already gone wrong.
 async fn authenticate<'a>(
@@ -252,12 +273,6 @@ async fn authenticate<'a>(
 ) -> Result<Authenticated<'a>, Failure> {
     let admission = auth.admit().await?;
     let limit = context.timeouts.response;
-    let Hop::Parent(parent) = &lease.hop else {
-        return Err(Failure::Parent(
-            "a connection to an origin server was asked to authenticate as a parent",
-        ));
-    };
-    let pending = auth.begin(&parent.host);
     let real = head.filter(|head| lapsed || head.method != Method::HEAD);
     let is_real = real.is_some();
     let carrier = || match real {
@@ -266,12 +281,26 @@ async fn authenticate<'a>(
     };
 
     lease.needs_auth = false;
-    match auth
-        .negotiate(&mut lease.sender, carrier, pending, limit)
-        .await?
-    {
+    let (outcome, proof_goes_in) = match &lease.hop {
+        Hop::Parent(parent) => {
+            let pending = auth.begin(&parent.host);
+            let outcome = auth
+                .negotiate(&mut lease.sender, carrier, pending, limit)
+                .await?;
+            (outcome, PROXY_AUTHORIZATION)
+        }
+        Hop::Direct => {
+            let ntlm = auth.ntlm_for_origin(&target.host).expect(
+                "a direct connection needs authentication only when the host is one of \
+                 credentials.origin_hosts",
+            );
+            let outcome = negotiate_origin(ntlm, &mut lease.sender, carrier, limit).await?;
+            (outcome, AUTHORIZATION)
+        }
+    };
+    match outcome {
         Outcome::Proof { header, made } => {
-            request.headers_mut().insert(PROXY_AUTHORIZATION, header);
+            request.headers_mut().insert(proof_goes_in, header);
             Ok(Authenticated::Proof(admission.made_from(made)))
         }
         Outcome::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
@@ -330,7 +359,9 @@ async fn acquire(context: &Scope<'_>, hops: Vec<Hop>, target: &Target) -> Result
 /// Opens a new connection through `hop`.
 async fn connect(context: &Scope<'_>, hop: &Hop, target: &Target) -> Result<Lease, Failure> {
     // No point opening a connection that could not be authenticated.
-    if let (Hop::Parent(_), Some(auth)) = (hop, &context.auth) {
+    if let Some(auth) = &context.auth
+        && needs_auth(hop, auth, &target.host)
+    {
         auth.check()?;
     }
     let stream = context
@@ -338,6 +369,17 @@ async fn connect(context: &Scope<'_>, hop: &Hop, target: &Target) -> Result<Leas
         .connect_hop(hop, &target.address, context.timeouts.connect)
         .await?;
     new_lease(context, hop.clone(), stream, target).await
+}
+
+/// Whether a new connection through `hop` needs authenticating before its
+/// first real request: always for a parent, once credentials are configured;
+/// for a direct one, only when the destination is named in
+/// `credentials.origin_hosts`.
+fn needs_auth(hop: &Hop, auth: &ParentAuth, host: &str) -> bool {
+    match hop {
+        Hop::Parent(_) => true,
+        Hop::Direct => auth.ntlm_for_origin(host).is_some(),
+    }
 }
 
 async fn new_lease(
@@ -349,7 +391,10 @@ async fn new_lease(
     Ok(Lease {
         sender: handshake(stream).await?,
         key: hop.pool_key(&target.address),
-        needs_auth: hop.is_parent() && context.auth.is_some(),
+        needs_auth: context
+            .auth
+            .as_deref()
+            .is_some_and(|auth| needs_auth(&hop, auth, &target.host)),
         hop,
         reused: false,
         epoch: context.epoch,

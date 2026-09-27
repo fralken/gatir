@@ -113,9 +113,14 @@ async fn build_live(
         ),
         (None, _) => (None, None),
     };
-    // Credentials only matter when there is a parent proxy to give them to.
+    // Credentials matter when there is a parent proxy to give them to, or an
+    // origin server that also asks for them directly.
     let auth = match &config.credentials {
-        Some(credentials) if !config.parents.is_empty() || pac.is_some() => {
+        Some(credentials)
+            if !config.parents.is_empty()
+                || pac.is_some()
+                || !credentials.origin_hosts.entries().is_empty() =>
+        {
             let kept = previous.and_then(|live| {
                 let unchanged = live
                     .credentials
