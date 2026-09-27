@@ -268,7 +268,15 @@ mod tests {
         assert!(system_tokens().is_ok());
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    #[test]
+    fn the_system_tokens_are_available_on_windows() {
+        // SSPI is not touched until a token is asked for, so this succeeds
+        // whether or not the computer can actually get one.
+        assert!(system_tokens().is_ok());
+    }
+
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn the_system_tokens_are_not_available_elsewhere_yet() {
         assert!(matches!(
