@@ -127,3 +127,9 @@ on the strength of a broken script, or of a script that could not be fetched.
 of another engine, on a list of URLs, with fake name lookups so that only the
 script and the helpers are compared. It is run by hand on a file that is not part
 of the repository; the comments in the file say how.
+
+## The engine
+
+Scripts run under QuickJS, through the `rquickjs` crate: why, what was measured
+against the alternatives, and what it costs, are in
+[docs/pac-engine.md](pac-engine.md).

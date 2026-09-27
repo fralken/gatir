@@ -59,8 +59,8 @@ takes the place of the same setting in the file.
 
 - [Configuration](docs/configuration.md): where the file is, who may read it, reloading.
 - [Authentication](docs/authentication.md): NTLM, Negotiate (Kerberos, and SSPI on Windows), and how to find out why one fails.
-- [PAC scripts](docs/pac.md), [ports forwarded through the proxy](docs/tunnels.md),
-  [the SOCKS5 server](docs/socks5.md).
+- [PAC scripts](docs/pac.md) ([why its engine is QuickJS](docs/pac-engine.md)),
+  [ports forwarded through the proxy](docs/tunnels.md), [the SOCKS5 server](docs/socks5.md).
 - [Making a release](docs/release.md), and [the specifications gatir follows](docs/references.md).
 - [Notes for contributors](AGENTS.md).
 

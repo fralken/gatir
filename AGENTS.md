@@ -41,6 +41,18 @@ CNTLM.
 
 ## Commands
 
+A fresh checkout needs the Rust toolchain (`rustup`; `rust-toolchain.toml` then
+picks the version) and, before `cargo build` works:
+
+- **macOS**: the Xcode Command Line Tools (`xcode-select --install`).
+- **Linux**: a C compiler (`build-essential` on Debian and Ubuntu), `libssl-dev`
+  and `pkg-config`. Running the tests also needs the Kerberos library at run
+  time: `libgssapi-krb5-2` (Debian, Ubuntu) or `krb5-libs` (Fedora, RHEL).
+- **Windows**: the MSVC Build Tools (Visual Studio Installer, "Desktop
+  development with C++").
+
+Why each of these is needed is explained further down, where it is relevant.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings

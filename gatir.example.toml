@@ -5,8 +5,11 @@
 # remove the "# " to turn one on. See the files in docs/ for each part.
 
 # Where gatir listens for programs that use an HTTP proxy. Keep it on the
-# loopback: whoever connects is served with your identity.
+# loopback: whoever connects is served with your identity. Addresses are IP
+# only, never a name: "localhost" is not understood, and IPv4 and IPv6 are two
+# separate addresses to listen on, not one ("::1" alone leaves out IPv4 clients).
 listen = ["127.0.0.1:3128"]
+# listen = ["127.0.0.1:3128", "[::1]:3128"]
 
 # The corporate proxy, or several, tried in order. A PAC script (below) is the
 # other way of finding the proxy: use one of the two.
