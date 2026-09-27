@@ -266,7 +266,7 @@ async fn hops_from_script(source: &PacSource, url: &str, host: &str) -> Result<V
             other => skipped.push(other.to_string()),
         }
     }
-    tracing::debug!(%url, chosen = ?hops, ?skipped, "the PAC script chose");
+    tracing::debug!(%url, chosen = ?hops, ?skipped, "the PAC script answered");
     if hops.is_empty() {
         return Err(Failure::PacUnsupported(skipped.join("; ")));
     }
