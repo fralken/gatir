@@ -180,6 +180,8 @@ pub struct Overrides {
     pub tunnels: Vec<Tunnel>,
     /// Addresses for a SOCKS5 server. Replace those of the file.
     pub socks5: Vec<SocketAddr>,
+    /// Replaces the `no_proxy` entries of the file.
+    pub no_proxy: Vec<String>,
     pub log_level: Option<LogLevel>,
 }
 
@@ -731,8 +733,13 @@ impl RawConfig {
             })
             .unwrap_or_default();
 
-        let no_proxy = NoProxy::new(self.no_proxy.unwrap_or_default())
-            .map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let no_proxy_entries = if overrides.no_proxy.is_empty() {
+            self.no_proxy.unwrap_or_default()
+        } else {
+            overrides.no_proxy
+        };
+        let no_proxy =
+            NoProxy::new(no_proxy_entries).map_err(|err| ConfigError::invalid(err.to_string()))?;
 
         let request_headers = self
             .headers
@@ -1035,6 +1042,7 @@ mod tests {
             password: Some(SecretString::from("prompted".to_owned())),
             tunnels: Vec::new(),
             socks5: Vec::new(),
+            no_proxy: Vec::new(),
             log_level: Some(LogLevel::Trace),
         };
         let config = Config::from_toml_str(FULL, overrides).unwrap();
@@ -1209,6 +1217,26 @@ mod tests {
         let text = error_text(r#"no_proxy = ["localhost", "[unclosed"]"#);
         assert!(text.contains("[unclosed"), "{text}");
         assert!(error_text(r#"no_proxy = [""]"#).contains("must not be empty"));
+    }
+
+    #[test]
+    fn command_line_no_proxy_replaces_the_file() {
+        let config = Config::from_toml_str(
+            r#"no_proxy = ["file.example.com"]"#,
+            Overrides {
+                no_proxy: vec!["cli.example.com".to_owned()],
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert!(config.no_proxy.matches("cli.example.com"));
+        assert!(!config.no_proxy.matches("file.example.com"));
+
+        // Without any on the command line, the file's stay.
+        let config =
+            Config::from_toml_str(r#"no_proxy = ["file.example.com"]"#, Overrides::default())
+                .unwrap();
+        assert!(config.no_proxy.matches("file.example.com"));
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub struct OverrideArgs {
     #[arg(long = "parent", global = true, value_name = "HOST:PORT")]
     pub parents: Vec<HostPort>,
 
+    /// A destination reached directly instead of through a proxy: a host name
+    /// (with `*`/`?`), an IP address or a CIDR range; repeat for several
+    /// (replaces `no_proxy` from the file)
+    #[arg(long, global = true, value_name = "HOST")]
+    pub no_proxy: Vec<String>,
+
     /// User name for the parent proxy
     #[arg(short, long, global = true)]
     pub username: Option<String>,
@@ -142,6 +148,7 @@ impl OverrideArgs {
             password,
             tunnels: this.tunnels,
             socks5: this.socks5,
+            no_proxy: this.no_proxy,
             log_level: this.log_level,
         }
     }
