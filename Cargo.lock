@@ -548,6 +548,7 @@ dependencies = [
  "clap",
  "clap_mangen",
  "gatir",
+ "time",
 ]
 
 [[package]]

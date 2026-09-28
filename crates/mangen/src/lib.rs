@@ -52,6 +52,14 @@ Find out why single sign\-on does not work:
 \fBgatir negotiate \-\-service HTTP@proxy.example.com\fR
 .fi
 .RE
+.PP
+Find out what a real parent proxy actually offers, and whether the configured credentials work against it:
+.PP
+.RS 4
+.nf
+\fBgatir detect \-\-parent proxy.example.com:8080 \-\-url http://example.com/\fR
+.fi
+.RE
 .SH FILES
 .TP
 \fI$XDG_CONFIG_HOME/gatir/gatir.toml\fR, \fI~/.config/gatir/gatir.toml\fR, \fI/etc/gatir/gatir.toml\fR
@@ -87,29 +95,23 @@ Stopped by \fBSIGINT\fR or \fBSIGTERM\fR; or, for the other commands, done.
 \fB1\fR
 An error: the configuration is not valid, an address could not be used, or the command failed. The message says which.
 .SH SEE ALSO
-\fBgatir\-run\fR(1), \fBgatir\-hash\fR(1), \fBgatir\-config\fR(1), \fBgatir\-negotiate\fR(1)
+\fBgatir\-run\fR(1), \fBgatir\-hash\fR(1), \fBgatir\-config\fR(1), \fBgatir\-negotiate\fR(1), \fBgatir\-detect\fR(1)
 .PP
 The documents in \fI/usr/share/doc/gatir/docs/\fR: configuration, authentication, PAC scripts, ports forwarded through the proxy, the SOCKS5 server.
 "#;
 
 /// A day as `YYYY-MM-DD`, from seconds since the Unix epoch (UTC).
 fn date_of(seconds: u64) -> String {
-    // Civil date from a day count, as in Howard Hinnant's `civil_from_days`.
-    let days = i64::try_from(seconds / 86_400).unwrap_or(0) + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
+    let date =
+        time::OffsetDateTime::from_unix_timestamp(i64::try_from(seconds).unwrap_or(i64::MAX))
+            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+            .date();
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    )
 }
 
 /// The date of the pages: `SOURCE_DATE_EPOCH` when it is set, so that building
@@ -227,6 +229,7 @@ mod tests {
             "gatir-config.1",
             "gatir-config-check.1",
             "gatir-negotiate.1",
+            "gatir-detect.1",
         ] {
             assert!(names.contains(&expected), "{expected} in {names:?}");
         }
