@@ -36,39 +36,10 @@ pub fn dns_domain_levels(host: &str) -> usize {
 }
 
 /// Whether `text` matches the shell pattern, in which `*` stands for any run
-/// of characters and `?` for exactly one. Everything else is itself.
+/// of characters and `?` for exactly one. Everything else is itself: unlike a
+/// glob library, brackets are not a character class.
 pub fn sh_exp_match(text: &str, pattern: &str) -> bool {
-    let text: Vec<char> = text.chars().collect();
-    let pattern: Vec<char> = pattern.chars().collect();
-    let (mut t, mut p) = (0, 0);
-    // Where the last `*` was, and how much of the text it has taken so far.
-    let mut star: Option<(usize, usize)> = None;
-    while t < text.len() {
-        match pattern.get(p) {
-            Some('*') => {
-                star = Some((p, t));
-                p += 1;
-            }
-            Some('?') => {
-                t += 1;
-                p += 1;
-            }
-            Some(&c) if c == text[t] => {
-                t += 1;
-                p += 1;
-            }
-            _ => match star {
-                // Let the last `*` take one more character and try again.
-                Some((star_p, star_t)) => {
-                    star = Some((star_p, star_t + 1));
-                    p = star_p + 1;
-                    t = star_t + 1;
-                }
-                None => return false,
-            },
-        }
-    }
-    pattern[p..].iter().all(|c| *c == '*')
+    wildmatch::WildMatch::new(pattern).matches(text)
 }
 
 fn first_ipv4(resolver: &dyn Resolver, host: &str) -> Option<Ipv4Addr> {
