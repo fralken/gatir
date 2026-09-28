@@ -177,7 +177,7 @@ pub fn each_variant(seeds: &[&[u8]], rounds: usize, mut check: impl FnMut(&[u8])
             panic!(
                 "input number {tried} {complaint}\n  {} bytes, in hex: {}\n  as text: {:?}",
                 input.len(),
-                hex(input),
+                hex::encode(input),
                 String::from_utf8_lossy(input)
             );
         }
@@ -235,14 +235,6 @@ fn describe(payload: &(dyn std::any::Any + Send)) -> String {
                 .map(|text| (*text).to_owned())
         })
         .unwrap_or_else(|| "(no message)".to_owned())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut text, byte| {
-        let _ = write!(text, "{byte:02x}");
-        text
-    })
 }
 
 #[cfg(test)]

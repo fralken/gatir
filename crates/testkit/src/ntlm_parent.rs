@@ -732,19 +732,12 @@ mod tests {
     );
 
     fn valid(message: &str, password: &str, challenge: &[u8; 8]) -> bool {
-        let bytes = hex_decode(message);
+        let bytes = hex::decode(message).unwrap();
         let auth = Authenticate::parse(&bytes).expect("a well-formed message");
         let unicode = auth.flags & UNICODE != 0;
         let user = auth.text(auth.user, unicode);
         let domain = auth.text(auth.domain, unicode);
         valid_response(&auth, &user, &domain, password, challenge)
-    }
-
-    fn hex_decode(text: &str) -> Vec<u8> {
-        (0..text.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
-            .collect()
     }
 
     #[test]
@@ -774,7 +767,7 @@ mod tests {
 
     #[test]
     fn reads_the_names_out_of_a_message() {
-        let bytes = hex_decode(NTLMV2);
+        let bytes = hex::decode(NTLMV2).unwrap();
         let auth = Authenticate::parse(&bytes).unwrap();
         assert_eq!(auth.text(auth.user, true), "User");
         assert_eq!(auth.text(auth.domain, true), "Domain");
@@ -784,7 +777,7 @@ mod tests {
     fn messages_that_are_not_authenticate_messages_are_refused() {
         assert!(Authenticate::parse(&[]).is_none());
         assert!(Authenticate::parse(b"NTLMSSP\0\x01\0\0\0").is_none());
-        let mut truncated = hex_decode(NTLMV2);
+        let mut truncated = hex::decode(NTLMV2).unwrap();
         truncated.truncate(100);
         assert!(Authenticate::parse(&truncated).is_none());
     }
