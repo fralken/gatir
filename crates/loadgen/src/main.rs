@@ -9,13 +9,13 @@
 //!   proxy under test and fires sequential keep-alive `GET`s on each for a
 //!   fixed duration, reporting throughput and latency percentiles.
 
-use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use clap::{Parser, Subcommand};
 use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
 use gatir_testkit::origin::Reply;
 use http_body_util::{BodyExt, Empty};
@@ -26,23 +26,54 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+#[derive(Debug, Parser)]
+#[command(name = "gatir-loadgen")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Starts a real NTLM-challenging parent proxy to point the proxy under
+    /// test at
+    ServeParent(ServeParentArgs),
+    /// Opens persistent connections through a proxy and fires keep-alive
+    /// GETs on each for a fixed duration
+    Bench(BenchArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ServeParentArgs {
+    #[arg(long, default_value = "bench")]
+    user: String,
+    #[arg(long, default_value = "BENCH")]
+    domain: String,
+    #[arg(long, default_value = "change-me")]
+    password: String,
+}
+
+#[derive(Debug, clap::Args)]
+struct BenchArgs {
+    /// HOST:PORT of the proxy under test
+    proxy: String,
+    /// HOST:PORT of the origin `serve-parent` answers as
+    origin: String,
+    /// Persistent connections to open
+    connections: usize,
+    /// How long to run
+    seconds: u64,
+}
+
 fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
+    let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("cannot start the async runtime");
-    match args.next().as_deref() {
-        Some("serve-parent") => runtime.block_on(serve_parent(args)),
-        Some("bench") => runtime.block_on(bench(args)),
-        _ => {
-            eprintln!(
-                "usage:\n\
-                 \x20 gatir-loadgen serve-parent [--user U] [--domain D] [--password P]\n\
-                 \x20 gatir-loadgen bench <proxy-host:port> <origin-host:port> <connections> <seconds>"
-            );
-            ExitCode::from(2)
-        }
+    match cli.command {
+        Command::ServeParent(args) => runtime.block_on(serve_parent(args)),
+        Command::Bench(args) => runtime.block_on(bench(args)),
     }
 }
 
@@ -51,27 +82,12 @@ fn main() -> ExitCode {
 /// forwarding to a backend that never asks for anything. Prints the address
 /// it bound to (an ephemeral port) and the identity to configure, then serves
 /// until interrupted.
-async fn serve_parent(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let (mut user, mut domain, mut password) = (
-        "bench".to_owned(),
-        "BENCH".to_owned(),
-        "change-me".to_owned(),
-    );
-    while let Some(flag) = args.next() {
-        let Some(value) = args.next() else {
-            eprintln!("{flag} needs a value");
-            return ExitCode::from(2);
-        };
-        match flag.as_str() {
-            "--user" => user = value,
-            "--domain" => domain = value,
-            "--password" => password = value,
-            other => {
-                eprintln!("unknown option: {other}");
-                return ExitCode::from(2);
-            }
-        }
-    }
+async fn serve_parent(args: ServeParentArgs) -> ExitCode {
+    let ServeParentArgs {
+        user,
+        domain,
+        password,
+    } = args;
 
     let body = "x".repeat(512);
     // An explicit `Connection: keep-alive`, not just the absence of `close`:
@@ -104,23 +120,13 @@ async fn serve_parent(mut args: impl Iterator<Item = String>) -> ExitCode {
 /// drops (the proxy or parent closed it, or something went wrong) is simply
 /// reopened: what is measured is the proxy's throughput, not this tool's
 /// tolerance for a single dropped socket.
-async fn bench(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let (Some(proxy_addr), Some(origin_authority), Some(connections), Some(seconds)) =
-        (args.next(), args.next(), args.next(), args.next())
-    else {
-        eprintln!(
-            "usage: gatir-loadgen bench <proxy-host:port> <origin-host:port> <connections> <seconds>"
-        );
-        return ExitCode::from(2);
-    };
-    let Ok(connections) = connections.parse::<usize>() else {
-        eprintln!("connections must be a number: {connections}");
-        return ExitCode::from(2);
-    };
-    let Ok(seconds) = seconds.parse::<u64>() else {
-        eprintln!("seconds must be a number: {seconds}");
-        return ExitCode::from(2);
-    };
+async fn bench(args: BenchArgs) -> ExitCode {
+    let BenchArgs {
+        proxy: proxy_addr,
+        origin: origin_authority,
+        connections,
+        seconds,
+    } = args;
     let Ok(uri) = format!("http://{origin_authority}/").parse::<Uri>() else {
         eprintln!("not a valid host:port: {origin_authority}");
         return ExitCode::from(2);
