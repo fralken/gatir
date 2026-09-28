@@ -107,7 +107,7 @@ pub async fn reload(reloader: &Reloader, load: &Loader) {
     match reloader.apply(&config).await {
         Ok(pending) => {
             tracing::info!("configuration reloaded");
-            tracing::debug!("configuration reloaded\n{}", config.summary());
+            tracing::debug!("configuration summary\n{}", config.summary());
             if !pending.is_empty() {
                 tracing::warn!(
                     settings = %pending.join(", "),
