@@ -19,7 +19,9 @@ To the parent gatir authenticates with NTLM, using a password, or a hash of it, 
 The configuration is a TOML file. An option on the command line takes the place of the same setting in the file.
 "#;
 
-/// The sections after the options and the commands.
+/// The sections after the options and the commands, up to (not including)
+/// SEE ALSO: that one is generated, so that a new subcommand is never
+/// forgotten there.
 const SECTIONS: &str = r#".SH EXAMPLES
 Serve the programs of this computer through a proxy that wants NTLM, asking for the password once:
 .PP
@@ -94,8 +96,10 @@ Stopped by \fBSIGINT\fR or \fBSIGTERM\fR; or, for the other commands, done.
 .TP
 \fB1\fR
 An error: the configuration is not valid, an address could not be used, or the command failed. The message says which.
-.SH SEE ALSO
-\fBgatir\-run\fR(1), \fBgatir\-hash\fR(1), \fBgatir\-config\fR(1), \fBgatir\-negotiate\fR(1), \fBgatir\-detect\fR(1)
+"#;
+
+/// What SEE ALSO says once the subcommands it names have been listed.
+const SEE_ALSO_DOCS: &str = r#"
 .PP
 The documents in \fI/usr/share/doc/gatir/docs/\fR: configuration, authentication, PAC scripts, ports forwarded through the proxy, the SOCKS5 server.
 "#;
@@ -151,7 +155,7 @@ fn collect(
         .manual("gatir Manual");
     let mut text = Vec::new();
     if is_program {
-        program_page(&man, &mut text)?;
+        program_page(&man, command, &mut text)?;
     } else {
         man.render(&mut text)?;
     }
@@ -161,7 +165,7 @@ fn collect(
 }
 
 /// The page of the program itself: what the definition gives, and the rest.
-fn program_page(man: &Man, out: &mut Vec<u8>) -> io::Result<()> {
+fn program_page(man: &Man, command: &clap::Command, out: &mut Vec<u8>) -> io::Result<()> {
     man.render_title(out)?;
     man.render_name_section(out)?;
     man.render_synopsis_section(out)?;
@@ -170,7 +174,21 @@ fn program_page(man: &Man, out: &mut Vec<u8>) -> io::Result<()> {
     man.render_options_section(out)?;
     man.render_subcommands_section(out)?;
     out.extend_from_slice(SECTIONS.as_bytes());
+    out.extend_from_slice(see_also(command).as_bytes());
+    out.extend_from_slice(SEE_ALSO_DOCS.as_bytes());
     man.render_version_section(out)
+}
+
+/// `.SH SEE ALSO`, naming every subcommand's own page: generated from the
+/// command definition so that a new one is never forgotten here.
+fn see_also(command: &clap::Command) -> String {
+    let pages = command
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .map(|sub| format!("\\fBgatir\\-{}\\fR(1)", sub.get_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(".SH SEE ALSO\n{pages}")
 }
 
 #[cfg(test)]
@@ -259,6 +277,31 @@ mod tests {
         }
         // Each section once.
         assert_eq!(text.matches(".SH FILES").count(), 1);
+    }
+
+    #[test]
+    fn see_also_names_every_subcommand_and_nothing_else() {
+        // Same command as `pages()` builds: without this, clap adds its own
+        // "help" pseudo-subcommand, which `pages()` never sees.
+        let mut command = Cli::command().disable_help_subcommand(true);
+        command.build();
+        let pages = pages().unwrap();
+        let text = page(&pages, "gatir.1");
+        let see_also = text.split(".SH SEE ALSO\n").nth(1).unwrap_or_default();
+        let see_also = see_also.lines().next().unwrap_or_default();
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+            .map(clap::Command::get_name)
+            .collect();
+        assert!(!names.is_empty());
+        for name in &names {
+            let expected = format!("gatir\\-{name}");
+            assert!(see_also.contains(&expected), "{expected}\n{see_also}");
+        }
+        // Nothing beyond the subcommands themselves, so a stale, removed one
+        // would be noticed too.
+        assert_eq!(see_also.matches("\\fBgatir\\-").count(), names.len());
     }
 
     #[test]
