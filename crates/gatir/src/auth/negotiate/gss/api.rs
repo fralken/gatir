@@ -55,8 +55,15 @@ struct Oid {
     elements: *mut c_void,
 }
 
+// SAFETY: `elements` only ever points at bytes this crate owns as `'static`
+// data (see `Oid::of`'s callers) or at the loaded library's own global data
+// (macOS, see `Gss::resolve`), read-only either way, so sharing an `Oid` (or a
+// pointer to one) across threads is sound; needed for the `static`s below.
+unsafe impl Sync for Oid {}
+
+#[cfg(not(target_os = "macos"))]
 impl Oid {
-    fn of(bytes: &'static [u8]) -> Self {
+    const fn of(bytes: &'static [u8]) -> Self {
         Self {
             length: bytes.len() as Status,
             elements: bytes.as_ptr().cast_mut().cast(),
@@ -64,12 +71,31 @@ impl Oid {
     }
 }
 
+// On macOS, the well-known OIDs below are read from the library itself
+// instead (see `resolve()`): its GSS-API, for at least the host-based-service
+// and Kerberos-principal-name name types and the SPNEGO mechanism, appears to
+// compare the *pointer* it is given against its own copies of these for some
+// of what it does, not only their bytes, and one of our own, at a different
+// address, however byte-identical, took a path that corrupted memory (found
+// by comparing against another proxy's own working equivalent of this call,
+// which passes the library's own `GSS_C_NT_HOSTBASED_SERVICE`, and reproduced
+// with a minimal C program with no gatir or Rust code at all).
 /// 1.3.6.1.5.5.2, SPNEGO (RFC 4178).
+#[cfg(not(target_os = "macos"))]
 const SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 /// 1.2.840.113554.1.2.1.4, a name like `HTTP@host` (RFC 2743, 4.1).
+#[cfg(not(target_os = "macos"))]
 const HOSTBASED_SERVICE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x01, 0x04];
 /// 1.2.840.113554.1.2.2.1, a name like `HTTP/host@REALM` (RFC 4121, 2.1).
+#[cfg(not(target_os = "macos"))]
 const KRB5_PRINCIPAL: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02, 0x01];
+
+#[cfg(not(target_os = "macos"))]
+static SPNEGO_OID: Oid = Oid::of(SPNEGO);
+#[cfg(not(target_os = "macos"))]
+static HOSTBASED_SERVICE_OID: Oid = Oid::of(HOSTBASED_SERVICE);
+#[cfg(not(target_os = "macos"))]
+static KRB5_PRINCIPAL_OID: Oid = Oid::of(KRB5_PRINCIPAL);
 
 const STATUS_CONTINUE_NEEDED: Status = 1;
 /// The calling-error and routine-error fields of a major status: if either is
@@ -109,7 +135,21 @@ pub struct Gss {
     release_buffer: ReleaseBuffer,
     delete_sec_context: DeleteSecContext,
     display_status: DisplayStatus,
+    /// SPNEGO, the host-based-service and the Kerberos-principal name type,
+    /// as the library itself keeps them (see the comment above `Oid::of`'s
+    /// callers for why: on macOS these must be the library's own, not a copy
+    /// of the same bytes at a different address).
+    spnego_mechanism: *const Oid,
+    hostbased_service: *const Oid,
+    krb5_principal_name: *const Oid,
 }
+
+// SAFETY: the three OID pointers refer either to this crate's own `'static`
+// data (non-macOS) or to the loaded library's own global data (macOS, never
+// unloaded, see `resolve()`); either way it is read-only and outlives every
+// use of a `Gss`.
+unsafe impl Send for Gss {}
+unsafe impl Sync for Gss {}
 
 impl std::fmt::Debug for Gss {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -168,13 +208,43 @@ impl Gss {
                 }
             };
         }
+        let import_name = symbol!("gss_import_name" as ImportName);
+        let init_sec_context = symbol!("gss_init_sec_context" as InitSecContext);
+        let release_name = symbol!("gss_release_name" as ReleaseName);
+        let release_buffer = symbol!("gss_release_buffer" as ReleaseBuffer);
+        let delete_sec_context = symbol!("gss_delete_sec_context" as DeleteSecContext);
+        let display_status = symbol!("gss_display_status" as DisplayStatus);
+
+        // On macOS these are the library's own global `gss_OID_desc` values
+        // (Apple's <GSS/gssapi_oid.h> and <GSS/gssapi_spnego.h> give their
+        // names), read by address the same way the functions above are, so
+        // that what gatir passes is the library's own object, not a copy.
+        // Elsewhere, this crate's own encoding of the same OIDs is a `static`
+        // (so it too has one address for as long as the process runs), since
+        // no comparable library-identity behaviour is known to matter there.
+        #[cfg(target_os = "macos")]
+        let (spnego_mechanism, hostbased_service, krb5_principal_name) = (
+            symbol!("__gss_spnego_mechanism_oid_desc" as *const Oid),
+            symbol!("__gss_c_nt_hostbased_service_oid_desc" as *const Oid),
+            symbol!("__gss_krb5_nt_principal_name_oid_desc" as *const Oid),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (spnego_mechanism, hostbased_service, krb5_principal_name): (
+            *const Oid,
+            *const Oid,
+            *const Oid,
+        ) = (&SPNEGO_OID, &HOSTBASED_SERVICE_OID, &KRB5_PRINCIPAL_OID);
+
         let gss = Self {
-            import_name: symbol!("gss_import_name" as ImportName),
-            init_sec_context: symbol!("gss_init_sec_context" as InitSecContext),
-            release_name: symbol!("gss_release_name" as ReleaseName),
-            release_buffer: symbol!("gss_release_buffer" as ReleaseBuffer),
-            delete_sec_context: symbol!("gss_delete_sec_context" as DeleteSecContext),
-            display_status: symbol!("gss_display_status" as DisplayStatus),
+            import_name,
+            init_sec_context,
+            release_name,
+            release_buffer,
+            delete_sec_context,
+            display_status,
+            spnego_mechanism,
+            hostbased_service,
+            krb5_principal_name,
         };
         // The functions point into the library, which must stay where it is.
         std::mem::forget(library);
@@ -254,17 +324,18 @@ impl Name {
     /// Imports `service`: `HTTP@host`, or a Kerberos principal if `principal`.
     pub fn import(gss: &'static Gss, service: &str, principal: bool) -> Result<Self, String> {
         let mut input = Buffer::over(service.as_bytes());
-        let mut kind = Oid::of(if principal {
-            KRB5_PRINCIPAL
+        let kind = if principal {
+            gss.krb5_principal_name
         } else {
-            HOSTBASED_SERVICE
-        });
+            gss.hostbased_service
+        };
         let mut handle = null_mut();
         let mut minor = 0;
-        // SAFETY: `input` and `kind` describe bytes that live through the call,
-        // and the library copies what it keeps; `handle` and `minor` are
-        // places for the results.
-        let major = unsafe { (gss.import_name)(&mut minor, &mut input, &mut kind, &mut handle) };
+        // SAFETY: `input` describes bytes that live through the call, and the
+        // library copies what it keeps; `kind` is the library's own OID, read
+        // only; `handle` and `minor` are places for the results.
+        let major =
+            unsafe { (gss.import_name)(&mut minor, &mut input, kind.cast_mut(), &mut handle) };
         if major & STATUS_ERROR_MASK != 0 {
             return Err(gss.describe(major, minor));
         }
@@ -315,7 +386,7 @@ impl Context {
     /// sent, or `None` for the first. The token to send, if there is one.
     pub fn step(&mut self, from_parent: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
         let mut minor = 0;
-        let mut mechanism = Oid::of(SPNEGO);
+        let mechanism = self.gss.spnego_mechanism;
         let mut input = from_parent.map(Buffer::over);
         let mut output = Buffer::EMPTY;
         let (mut flags, mut valid_for) = (0, 0);
@@ -331,7 +402,7 @@ impl Context {
                 null_mut(),
                 &mut self.handle,
                 self.name.handle,
-                &mut mechanism,
+                mechanism.cast_mut(),
                 0,
                 0,
                 null_mut(),
