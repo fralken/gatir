@@ -59,6 +59,17 @@ class Gatir < Formula
     doc.install Dir["docs/*"]
   end
 
+  def caveats
+    <<~EOS
+      gatir needs a configuration file before it can run:
+        mkdir -p ~/.config/gatir
+        cp #{doc}/gatir.example.toml ~/.config/gatir/gatir.toml
+        chmod 600 ~/.config/gatir/gatir.toml
+      Edit it, then check it with:
+        gatir config check
+    EOS
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/gatir --version")
   end
