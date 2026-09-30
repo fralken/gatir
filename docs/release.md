@@ -131,11 +131,14 @@ shasum -a 256 --check --ignore-missing SHA256SUMS  # macOS
 in release mode, then writes the archive and its `.sha256` file to `dist/`.
 `scripts/package-linux.sh [TARGET]` then makes the `.deb` and the `.rpm` from it (it needs
 `dpkg-dev` and `rpm`), and `scripts/package-windows.sh [TARGET]` makes the `.msi` from a
-Windows one (it needs `wixl`, from msitools: `brew install msitools` on macOS,
-`apt-get install msitools` on Linux). None of the three needs Windows or a copy of WiX
-itself, so the `.msi` can be made, and tried (`msiinfo tables`, `msiextract`, from the
-same package), on any machine that builds gatir. The workflow calls all of them, so
-that what is tried here is what is released.
+Windows one (it needs `wixl`, `brew install msitools` on macOS). None of the three needs
+Windows or a copy of WiX itself, so the `.msi` can be made, and tried (`msiinfo tables`,
+`msiextract`, from the same formula) on any machine that builds gatir — except that
+Debian and Ubuntu's own `wixl` package (0.103 as of this writing) is too old for the
+`<Environment>` element the `.wxs` uses to put gatir on the `PATH`; use macOS for this
+one until a newer `wixl` reaches their repositories (this is also why the workflow's own
+`.msi` job runs on macOS, not Linux like the rest). The workflow calls all of these
+tools, so that what is tried here is what is released.
 
 The workflow is not run anywhere but on GitHub. What it depends on there (the
 names of the runners, the actions it uses) is the part to look at first if a release

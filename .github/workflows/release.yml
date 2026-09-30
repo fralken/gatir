@@ -79,7 +79,11 @@ jobs:
   msi:
     name: build (.msi)
     needs: build
-    runs-on: ubuntu-latest
+    # Debian and Ubuntu's own wixl (0.103 as of this writing) does not
+    # implement the <Environment> element the .wxs template uses to add
+    # gatir to the PATH; Homebrew's build (0.106) does. A macOS runner, not
+    # Linux, until a newer wixl reaches Debian/Ubuntu's own repositories.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
       - name: Download the Windows build
@@ -89,10 +93,10 @@ jobs:
           path: dist
       - name: Check the downloaded archive
         working-directory: dist
-        run: sha256sum -c gatir-*-x86_64-pc-windows-msvc.zip.sha256
+        run: shasum -a 256 -c gatir-*-x86_64-pc-windows-msvc.zip.sha256
       - name: Make the .msi
         run: |
-          sudo apt-get update && sudo apt-get install -y msitools
+          brew install msitools
           mkdir -p dist/stage
           unzip -q dist/gatir-*-x86_64-pc-windows-msvc.zip -d dist/stage
           scripts/package-windows.sh x86_64-pc-windows-msvc

@@ -11,9 +11,13 @@
 #                                          aarch64-pc-windows-msvc; the default
 #                                          is this machine's.
 #
-# It needs wixl, from msitools (`brew install msitools`, `apt-get install
-# msitools`): a build of the .msi format that does not need Windows or WiX
-# itself, so this runs wherever gatir is built. GATIR_MANUFACTURER sets the
+# It needs wixl, a build of the .msi format that does not need Windows or WiX
+# itself: `brew install msitools` on macOS. Debian and Ubuntu package wixl too
+# (msitools there is only the source package), but as of this writing their
+# build (0.103) is too old to have the <Environment> element the .wxs below
+# uses to add gatir to the PATH, and fails with "unhandled child Component
+# node Environment"; Homebrew's (0.106) has it. Use macOS until a newer wixl
+# reaches Debian/Ubuntu's own repositories. GATIR_MANUFACTURER sets the
 # manufacturer named in the package.
 set -euo pipefail
 
