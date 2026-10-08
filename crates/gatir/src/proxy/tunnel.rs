@@ -397,15 +397,31 @@ async fn relay<C, U>(
     tokio::select! {
         result = copy_bidirectional(&mut client, &mut upstream) => match result {
             Ok((from_client, from_upstream)) => {
-                tracing::debug!(%peer, %destination, from_client, from_upstream, "tunnel closed");
+                tracing::debug!(
+                    %peer, %destination, from_client, from_upstream,
+                    duration = %activity.elapsed(),
+                    "tunnel closed"
+                );
             }
-            Err(err) => tracing::debug!(%peer, %destination, %err, "tunnel ended with error"),
+            Err(err) => tracing::debug!(
+                %peer, %destination, %err,
+                duration = %activity.elapsed(),
+                "tunnel ended with error"
+            ),
         },
         () = wait_until_idle(&activity, idle) => {
-            tracing::debug!(%peer, %destination, "tunnel closed after being idle");
+            tracing::debug!(
+                %peer, %destination,
+                duration = %activity.elapsed(),
+                "tunnel closed after being idle"
+            );
         }
         () = force.cancelled() => {
-            tracing::debug!(%peer, %destination, "tunnel closed at shutdown");
+            tracing::debug!(
+                %peer, %destination,
+                duration = %activity.elapsed(),
+                "tunnel closed at shutdown"
+            );
         }
     }
 }
@@ -427,6 +443,13 @@ impl Activity {
     fn touch(&self) {
         let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// How long the tunnel has lived, for a log line: three decimals, so
+    /// millisecond precision in seconds (`3.200s`) instead of the nine that
+    /// `Duration`'s `Debug` prints by default.
+    fn elapsed(&self) -> String {
+        format!("{:.3?}", self.started.elapsed())
     }
 
     fn idle_for(&self) -> Duration {
