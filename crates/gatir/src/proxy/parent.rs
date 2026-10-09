@@ -258,7 +258,15 @@ impl ParentAuth {
         if let Some(opening) = opening {
             first.headers_mut().insert(PROXY_AUTHORIZATION, opening);
         }
-        let response = send(sender, first, limit).await?;
+        // A parent that ends the connection right here, with nothing said, may
+        // be given up on: nothing was proved to it, and the caller can try the
+        // next one. Past this point it has answered, so it is not that.
+        let response = send(sender, first, limit)
+            .await
+            .map_err(|failure| match failure {
+                Failure::Upstream(error) => Failure::first_answer(error),
+                other => other,
+            })?;
         if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
             return Ok(Outcome::Answered(response));
         }

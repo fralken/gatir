@@ -14,7 +14,9 @@ use hyper::client::conn::http1::SendRequest;
 use tokio::net::TcpStream;
 
 use super::body::Body;
-use super::failure::{ConnectError, Failure, ParentAttempt, connect_failure, try_connect};
+use super::failure::{
+    ConnectError, Failure, ParentAttempt, connect_failure, describe, try_connect,
+};
 use super::parent::ParentAuth;
 use super::pool::{Pool, PoolKey};
 use crate::config::HostPort;
@@ -134,7 +136,9 @@ impl Upstreams {
         good
     }
 
-    fn worked(&self, hop: &Hop) {
+    /// A parent answered, whatever it said (even a refusal): it is alive, so it
+    /// takes its place back, and requests start with it.
+    pub(super) fn worked(&self, hop: &Hop) {
         let Hop::Parent(parent) = hop else { return };
         self.unreachable().remove(&parent.to_string());
         if let Some(index) = self.parents.iter().position(|known| known == parent) {
@@ -149,8 +153,23 @@ impl Upstreams {
         }
     }
 
+    /// A parent accepted the connection and ended it before it answered. It is
+    /// left for last for a while, like one that could not be reached, and the
+    /// attempt is returned to be told to the client if no other parent works.
+    pub(super) fn no_answer(&self, hop: &Hop, error: &hyper::Error) -> ParentAttempt {
+        self.failed(hop);
+        let how = describe(error);
+        let address = hop_name(hop);
+        tracing::warn!(parent = %address, %how, "the parent proxy accepted the connection but closed it without answering");
+        ParentAttempt {
+            address,
+            error: ConnectError::NoAnswer(how),
+        }
+    }
+
     /// Opens a TCP connection to the destination `origin` (`host:port`) through
-    /// `hop`.
+    /// `hop`. A parent that accepts the connection is not known to work until
+    /// it answers: see [`Upstreams::worked`].
     pub(super) async fn connect_hop(
         &self,
         hop: &Hop,
@@ -162,10 +181,7 @@ impl Upstreams {
             Hop::Parent(parent) => try_connect(&parent.to_string(), limit).await,
         };
         match result {
-            Ok(stream) => {
-                self.worked(hop);
-                Ok(stream)
-            }
+            Ok(stream) => Ok(stream),
             Err(error) => {
                 tracing::warn!(hop = %hop_name(hop), %error, "cannot connect");
                 self.failed(hop);
@@ -399,6 +415,42 @@ mod tests {
         upstreams.failed(&hops[0]);
         upstreams.failed(&hops[1]);
         assert_eq!(upstreams.order(hops.clone()), hops);
+    }
+
+    #[tokio::test]
+    async fn a_parent_that_accepts_the_connection_is_not_known_to_work_yet() {
+        // Only what it answers says so: a listener with nothing behind it
+        // accepts connections just the same.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (accepting, other) = (hop(&address), hop("other.example.com:2"));
+        let upstreams = Upstreams::new(
+            vec![parent("other.example.com:2"), parent(&address)],
+            NoProxy::default(),
+            None,
+        );
+        upstreams.failed(&accepting);
+
+        upstreams
+            .connect_hop(&accepting, "origin.example.com:80", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Still left for last, and not the one requests start with.
+        assert_eq!(
+            upstreams.order(vec![accepting.clone(), other.clone()]),
+            [other.clone(), accepting.clone()]
+        );
+        assert_eq!(upstreams.hops("http://x/", "x").await.unwrap()[0], other);
+        upstreams.worked(&accepting);
+        assert_eq!(
+            upstreams.order(vec![accepting.clone(), other.clone()]),
+            [accepting.clone(), other]
+        );
+        assert_eq!(
+            upstreams.hops("http://x/", "x").await.unwrap()[0],
+            accepting
+        );
     }
 
     #[test]

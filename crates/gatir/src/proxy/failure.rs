@@ -19,6 +19,9 @@ use crate::pac::PacError;
 pub(super) enum ConnectError {
     Timeout,
     Io(io::Error),
+    /// The connection was accepted, then ended before a word was said: the
+    /// text is how it ended.
+    NoAnswer(String),
 }
 
 impl fmt::Display for ConnectError {
@@ -26,6 +29,7 @@ impl fmt::Display for ConnectError {
         match self {
             Self::Timeout => f.write_str("timed out"),
             Self::Io(err) => err.fmt(f),
+            Self::NoAnswer(how) => write!(f, "closed the connection without answering: {how}"),
         }
     }
 }
@@ -47,6 +51,10 @@ pub(super) enum Failure {
     },
     ParentsUnavailable(Vec<ParentAttempt>),
     Upstream(hyper::Error),
+    /// A parent proxy accepted the connection and ended it before answering
+    /// the first request. Another parent may be tried; if none is left, or the
+    /// request cannot be sent again, this is what the client is told.
+    NoAnswer(hyper::Error),
     /// The parent proxy did something unexpected; the text says what.
     Parent(&'static str),
     /// No response came in time from the named party.
@@ -91,6 +99,29 @@ impl From<AuthError> for Failure {
 }
 
 impl Failure {
+    /// What went wrong with the first exchange on a new connection to a parent:
+    /// a parent that ended the connection without answering is not the same as
+    /// one that answered something unintelligible.
+    pub(super) fn first_answer(error: hyper::Error) -> Self {
+        if ended_without_answer(&error) {
+            Self::NoAnswer(error)
+        } else {
+            Self::Upstream(error)
+        }
+    }
+
+    /// Puts the attempts that already failed in front of those of this failure,
+    /// when it too is about parents that could not be used.
+    pub(super) fn after(self, mut earlier: Vec<ParentAttempt>) -> Self {
+        match self {
+            Self::ParentsUnavailable(later) => {
+                earlier.extend(later);
+                Self::ParentsUnavailable(earlier)
+            }
+            other => other,
+        }
+    }
+
     /// The status an HTTP client is given, and what it is told.
     fn status_and_message(&self) -> (StatusCode, String) {
         let bad_gateway = |message: String| (StatusCode::BAD_GATEWAY, message);
@@ -122,6 +153,10 @@ impl Failure {
             Self::Upstream(err) => {
                 bad_gateway(format!("Invalid response from the upstream server: {err}"))
             }
+            Self::NoAnswer(err) => bad_gateway(format!(
+                "The parent proxy accepted the connection and closed it without answering: {}",
+                describe(err)
+            )),
             Self::Parent(message) => bad_gateway((*message).to_owned()),
             Self::ResponseTimeout(who) => (
                 StatusCode::GATEWAY_TIMEOUT,
@@ -195,6 +230,39 @@ impl Failure {
     }
 }
 
+/// Whether the peer ended the connection before saying anything: closed it, or
+/// reset it. That is what a proxy does that accepts connections it cannot
+/// serve. Anything it did say, even an error, is not this, and a timeout is
+/// not either.
+pub(super) fn ended_without_answer(error: &hyper::Error) -> bool {
+    if error.is_closed() || error.is_incomplete_message() || error.is_canceled() {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<io::Error>() {
+            return matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = cause.source();
+    }
+    false
+}
+
+/// How an upstream connection ended, as the innermost cause says it.
+pub(super) fn describe(error: &hyper::Error) -> String {
+    let mut cause: &dyn std::error::Error = error;
+    while let Some(inner) = cause.source() {
+        cause = inner;
+    }
+    cause.to_string()
+}
+
 /// Opens a TCP connection to `address` (`host:port`), giving up after `limit`.
 pub(super) async fn try_connect(address: &str, limit: Duration) -> Result<TcpStream, ConnectError> {
     let stream = match timeout(limit, TcpStream::connect(address)).await {
@@ -215,6 +283,12 @@ pub(super) fn connect_failure(address: &str, error: ConnectError) -> Failure {
         ConnectError::Io(source) => Failure::Connect {
             address: address.to_owned(),
             source,
+        },
+        // Only a parent proxy is ever blamed for this: a server reached
+        // directly that does this was connected to, not asked for a hop.
+        ConnectError::NoAnswer(how) => Failure::Connect {
+            address: address.to_owned(),
+            source: io::Error::new(io::ErrorKind::ConnectionReset, how),
         },
     }
 }

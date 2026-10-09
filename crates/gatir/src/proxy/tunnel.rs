@@ -166,15 +166,43 @@ pub(super) async fn reach(
     // The settings as they are now: what follows is done under them, even if a
     // reload happens meanwhile.
     let live = context.live();
-    let hops = live.upstreams.hops(&pac_url, host).await?;
-    let (hop, stream) = live
-        .upstreams
-        .connect(hops, &address, live.timeouts.connect, live.auth.as_deref())
-        .await?;
-    match hop {
-        Hop::Direct => Ok(Reached::Open(Upstream::Direct(stream))),
-        Hop::Parent(parent) => {
-            connect_through_parent(stream, &parent, &address, headers, extensions, &live).await
+    let mut hops = live.upstreams.hops(&pac_url, host).await?;
+    // The parents that accepted a connection and ended it without answering.
+    let mut tried = Vec::new();
+    loop {
+        let (hop, stream) = live
+            .upstreams
+            .connect(
+                hops.clone(),
+                &address,
+                live.timeouts.connect,
+                live.auth.as_deref(),
+            )
+            .await
+            .map_err(|failure| failure.after(std::mem::take(&mut tried)))?;
+        let Hop::Parent(parent) = &hop else {
+            return Ok(Reached::Open(Upstream::Direct(stream)));
+        };
+        match connect_through_parent(
+            stream,
+            parent,
+            &address,
+            headers.clone(),
+            extensions.clone(),
+            &live,
+        )
+        .await
+        {
+            // Nothing has been tunnelled yet, so the next parent is asked the
+            // same thing.
+            Err(Failure::NoAnswer(error)) => {
+                tried.push(live.upstreams.no_answer(&hop, &error));
+                hops.retain(|other| *other != hop);
+                if hops.is_empty() {
+                    return Err(Failure::ParentsUnavailable(tried));
+                }
+            }
+            other => return other,
         }
     }
 }
@@ -297,6 +325,7 @@ async fn connect_through_parent(
     };
 
     let mut sender = handshake_with_parent(stream).await?;
+    let hop = Hop::Parent(parent.clone());
 
     // Set once a proof has been sent, until the parent has said whether it
     // accepts it.
@@ -307,11 +336,10 @@ async fn connect_through_parent(
         None => answer_within(limit, sender.send_request(connect(None)))
             .await
             .ok_or(timed_out)?
-            .map_err(Failure::Upstream)?,
+            .map_err(Failure::first_answer)?,
         Some(auth) => {
             let admitted = auth.admit().await?;
             let pending = auth.begin(&parent.host);
-            let hop = Hop::Parent(parent.clone());
             match auth
                 .negotiate(
                     &mut sender,
@@ -342,6 +370,9 @@ async fn connect_through_parent(
             }
         }
     };
+
+    // Whatever it said, it said something.
+    live.upstreams.worked(&hop);
 
     if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         if let Some(sent) = admission {

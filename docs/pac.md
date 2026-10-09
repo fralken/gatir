@@ -72,8 +72,9 @@ answers of name lookups, is cached.
 ## What it may return
 
 `DIRECT`, `PROXY host:port` (also `HTTP`), and lists of them separated by
-semicolons. Entries are tried in order, and one that cannot be reached is tried
-last for a minute. `HTTPS`, `SOCKS`, `SOCKS4` and `SOCKS5` entries are read but
+semicolons. Entries are tried in order, and one that cannot be reached, or that
+ends the connection without answering, is tried last for a minute (see
+[a parent that does not work](failover.md)). `HTTPS`, `SOCKS`, `SOCKS4` and `SOCKS5` entries are read but
 not used yet: they are skipped, and if nothing else is left the client gets a
 502 that says so.
 

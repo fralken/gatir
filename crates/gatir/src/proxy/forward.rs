@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 use super::body::{Body, Sent, full, response_within, watch};
-use super::failure::Failure;
+use super::failure::{Failure, ParentAttempt, ended_without_answer};
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent::{Admission, Outcome, ParentAuth, negotiate_origin, reusable};
 use super::pool::{Lease, Pool};
@@ -83,22 +83,20 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     apply_rules(&mut parts.headers, &context.request_headers);
     parts.headers.insert(HOST, target.host_header.clone());
 
-    let hops = context
+    let mut hops = context
         .upstreams
         .hops(&target.pac_url(), &target.host)
         .await?;
-    let mut lease = acquire(context, hops, &target).await?;
-    // A proxy is addressed with the full URL, so it knows the destination.
-    let uri = match lease.hop {
-        Hop::Direct => target.origin_form.clone(),
-        Hop::Parent(_) => target.absolute.clone(),
-    };
+    // The parents that accepted a connection and ended it without answering.
+    let mut tried = Vec::new();
+    let mut lease = acquire(context, hops.clone(), &target).await?;
 
     // A request that never had a body can be built again: to send it after a
     // failed attempt, or to open the authentication with.
     let head = body.is_end_stream().then(|| Head {
         method: parts.method.clone(),
-        uri: uri.clone(),
+        absolute: target.absolute.clone(),
+        origin_form: target.origin_form.clone(),
         headers: parts.headers.clone(),
         extensions: parts.extensions.clone(),
     });
@@ -112,7 +110,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
 
     let mut request = Request::new(body);
     *request.method_mut() = parts.method.clone();
-    *request.uri_mut() = uri;
+    *request.uri_mut() = target.uri_for(&lease.hop);
     *request.headers_mut() = parts.headers;
     *request.version_mut() = Version::HTTP_11;
     // Carries the original capitalization of the header names (see the server
@@ -141,11 +139,21 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 &target,
                 lapsed,
             )
-            .await?
+            .await
             {
-                Authenticated::Answered(response) => break response,
-                Authenticated::Proof(proof) => admission = Some(proof),
-                Authenticated::Ready => {}
+                Ok(Authenticated::Answered(response)) => break response,
+                Ok(Authenticated::Proof(proof)) => admission = Some(proof),
+                Ok(Authenticated::Ready) => {}
+                // Nothing of the request was sent but its head, or a probe, so
+                // it is the same for the next parent.
+                Err(Failure::NoAnswer(error)) if lease.hop.is_parent() => {
+                    admission = None;
+                    lease =
+                        fail_over(context, &lease, &error, &mut hops, &mut tried, &target).await?;
+                    *request.uri_mut() = target.uri_for(&lease.hop);
+                    continue;
+                }
+                Err(failure) => return Err(failure),
             }
         }
 
@@ -155,6 +163,9 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             Some(Ok(response))
                 if demands_authentication(&response, &lease.hop, context, &target.host) =>
             {
+                if !lease.reused {
+                    context.upstreams.worked(&lease.hop);
+                }
                 if let Some(proof) = admission.take() {
                     return Err(match &lease.hop {
                         Hop::Parent(_) => proof.refused(),
@@ -168,13 +179,16 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 };
                 tracing::debug!("a connection lost its authentication, retrying on a new one");
                 lapsed = true;
-                request = head.request();
-                sent = Sent::already();
                 let hop = lease.hop.clone();
+                request = head.request(&hop);
+                sent = Sent::already();
                 lease = connect(context, &hop, &target).await?;
                 continue;
             }
             Some(Ok(response)) => {
+                if !lease.reused {
+                    context.upstreams.worked(&lease.hop);
+                }
                 if let Some(proof) = admission.take() {
                     proof.accepted();
                 }
@@ -184,6 +198,32 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         };
         let returned = failed.take_message();
         let error = failed.into_error();
+        // A new connection to a parent that wants no authentication, and that
+        // ended without a word: the next parent may do. (When there are
+        // credentials, the parent has answered by now: see `authenticate`.)
+        if !lease.reused
+            && lease.hop.is_parent()
+            && context.auth.is_none()
+            && ended_without_answer(&error)
+        {
+            let again = match (returned, head.as_ref()) {
+                (Some(returned), _) => Some(returned),
+                (None, Some(head)) => {
+                    sent = Sent::already();
+                    Some(head.request(&lease.hop))
+                }
+                // The body is gone, partly or all of it: it cannot be sent again.
+                (None, None) => None,
+            };
+            let Some(again) = again else {
+                context.upstreams.no_answer(&lease.hop, &error);
+                return Err(Failure::NoAnswer(error));
+            };
+            request = again;
+            lease = fail_over(context, &lease, &error, &mut hops, &mut tried, &target).await?;
+            *request.uri_mut() = target.uri_for(&lease.hop);
+            continue;
+        }
         // Only a pooled connection can have gone stale unnoticed. The request
         // may be sent again if hyper never sent it, or if it is safe to repeat.
         let repeatable = returned.is_some() || (replay.is_some() && is_stale(&error));
@@ -195,7 +235,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             (Some(returned), _) => returned,
             (None, Some(replay)) => {
                 sent = Sent::already();
-                replay.request()
+                replay.request(&lease.hop)
             }
             (None, None) => return Err(Failure::Upstream(error)),
         };
@@ -275,8 +315,9 @@ async fn authenticate<'a>(
     let limit = context.timeouts.response;
     let real = head.filter(|head| lapsed || head.method != Method::HEAD);
     let is_real = real.is_some();
+    let through = lease.hop.clone();
     let carrier = || match real {
-        Some(head) => head.request(),
+        Some(head) => head.request(&through),
         None => probe(target, &context.request_headers),
     };
 
@@ -307,6 +348,8 @@ async fn authenticate<'a>(
             (outcome, AUTHORIZATION)
         }
     };
+    // Whatever it said, it said something.
+    context.upstreams.worked(&lease.hop);
     match outcome {
         Outcome::Proof { header, made } => {
             request.headers_mut().insert(proof_goes_in, header);
@@ -325,6 +368,28 @@ async fn authenticate<'a>(
             Ok(Authenticated::Ready)
         }
     }
+}
+
+/// A parent accepted the connection and ended it before answering the first
+/// request on it. It is left for last for a while, and the connection is
+/// opened through the next of the `hops` that is left. If there is none, the
+/// client is told about every parent that was tried.
+async fn fail_over(
+    context: &Scope<'_>,
+    from: &Lease,
+    error: &hyper::Error,
+    hops: &mut Vec<Hop>,
+    tried: &mut Vec<ParentAttempt>,
+    target: &Target,
+) -> Result<Lease, Failure> {
+    tried.push(context.upstreams.no_answer(&from.hop, error));
+    hops.retain(|hop| *hop != from.hop);
+    if hops.is_empty() {
+        return Err(Failure::ParentsUnavailable(std::mem::take(tried)));
+    }
+    acquire(context, hops.clone(), target)
+        .await
+        .map_err(|failure| failure.after(std::mem::take(tried)))
 }
 
 /// A request that only serves to open the authentication.
@@ -441,16 +506,22 @@ fn is_stale(error: &hyper::Error) -> bool {
 /// What is needed to build the same body-less request again.
 struct Head {
     method: Method,
-    uri: Uri,
+    /// The two ways the target is written: to a proxy and to a server.
+    absolute: Uri,
+    origin_form: Uri,
     headers: HeaderMap,
     extensions: Extensions,
 }
 
 impl Head {
-    fn request(&self) -> Request<Body> {
+    /// The request as it is sent through `hop`.
+    fn request(&self, hop: &Hop) -> Request<Body> {
         let mut request = Request::new(full(Bytes::new()));
         *request.method_mut() = self.method.clone();
-        *request.uri_mut() = self.uri.clone();
+        *request.uri_mut() = match hop {
+            Hop::Direct => self.origin_form.clone(),
+            Hop::Parent(_) => self.absolute.clone(),
+        };
         *request.headers_mut() = self.headers.clone();
         *request.version_mut() = Version::HTTP_11;
         *request.extensions_mut() = self.extensions.clone();
@@ -471,6 +542,15 @@ struct Target {
 }
 
 impl Target {
+    /// How the target is written in a request sent through `hop`. A proxy is
+    /// addressed with the full URL, so it knows the destination.
+    fn uri_for(&self, hop: &Hop) -> Uri {
+        match hop {
+            Hop::Direct => self.origin_form.clone(),
+            Hop::Parent(_) => self.absolute.clone(),
+        }
+    }
+
     /// The URL as a PAC script gets it: the host in lower case, and no user
     /// information.
     fn pac_url(&self) -> String {
