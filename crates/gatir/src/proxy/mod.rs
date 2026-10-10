@@ -18,7 +18,7 @@ use std::io;
 use tokio_util::sync::CancellationToken;
 
 pub use detect::{Attempt, AttemptOutcome, Probe, Report, run as detect};
-pub use server::{Reloader, Server};
+pub use server::{Reloader, Server, Services};
 
 use crate::config::{Config, ConfigError};
 

@@ -474,7 +474,6 @@ impl Config {
         RawConfig::parse(source, "<string>")?.resolve(overrides, None)
     }
 
-    /// A multi-line description that never includes secret values.
     /// What a running server cannot change without being started again.
     pub fn fixed(&self) -> Fixed {
         Fixed {
@@ -502,6 +501,7 @@ impl Config {
             || !self.request_headers.is_empty()
     }
 
+    /// A multi-line description that never includes secret values.
     pub fn summary(&self) -> String {
         let listen = join(self.listen.iter());
         let parents = match (&self.pac, self.parents.is_empty()) {

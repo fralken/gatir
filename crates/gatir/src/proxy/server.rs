@@ -65,6 +65,25 @@ pub(super) struct Live {
 
 type LiveCell = Arc<RwLock<Arc<Live>>>;
 
+/// What a server takes from the operating system, and a test replaces: the
+/// Kerberos tickets it makes Negotiate tokens from, and the certificate
+/// authorities an `https://` PAC address may chain to.
+#[derive(Clone)]
+pub struct Services {
+    /// Where Negotiate tokens come from; `None` is the system's tickets.
+    pub tokens: Option<Arc<dyn TokenSource>>,
+    pub trust: Trust,
+}
+
+impl Default for Services {
+    fn default() -> Self {
+        Self {
+            tokens: None,
+            trust: Trust::system(),
+        }
+    }
+}
+
 /// State shared by every connection of a running server.
 pub(super) struct Context {
     live: LiveCell,
@@ -96,8 +115,7 @@ impl Context {
 async fn build_live(
     config: &Config,
     previous: Option<&Live>,
-    tokens: &Option<Arc<dyn TokenSource>>,
-    trust: &Trust,
+    services: &Services,
 ) -> io::Result<(Live, Option<Arc<PacSource>>)> {
     // A PAC file that is missing or wrong is found here, not on the first request.
     let (pac, kept_script) = match (&config.pac, previous.and_then(|live| live.pac.as_ref())) {
@@ -108,7 +126,7 @@ async fn build_live(
         (Some(settings), _) => (
             Some((
                 settings.clone(),
-                PacSource::start_with(settings, trust.clone()).await?,
+                PacSource::start_with(settings, services.trust.clone()).await?,
             )),
             None,
         ),
@@ -132,7 +150,7 @@ async fn build_live(
             match kept {
                 Some(auth) => Some(auth),
                 None => Some(Arc::new(
-                    ParentAuth::new(credentials, tokens.clone()).map_err(|err| {
+                    ParentAuth::new(credentials, services.tokens.clone()).map_err(|err| {
                         io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
                     })?,
                 )),
@@ -168,8 +186,7 @@ async fn build_live(
 #[derive(Clone)]
 pub struct Reloader {
     live: LiveCell,
-    tokens: Option<Arc<dyn TokenSource>>,
-    trust: Trust,
+    services: Services,
     /// What the server was started with, and no reload can change.
     fixed: Fixed,
     /// A reload at a time.
@@ -191,8 +208,7 @@ impl Reloader {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let (live, kept_script) =
-            build_live(config, Some(&previous), &self.tokens, &self.trust).await?;
+        let (live, kept_script) = build_live(config, Some(&previous), &self.services).await?;
 
         // The new settings come with a pool of their own: connections opened
         // under the old ones may have authenticated as someone else, or lead to
@@ -221,59 +237,24 @@ pub struct Server {
 impl Server {
     /// Binds every `listen` address of the configuration.
     pub async fn bind(config: &Config) -> io::Result<Self> {
-        Self::bind_with(config, None, Trust::system()).await
+        Self::bind_with(config, Services::default()).await
     }
 
-    /// Like [`Server::bind`], taking the Negotiate tokens from `tokens`
-    /// instead of the system's Kerberos tickets. For tests, which have none.
-    pub async fn bind_with_tokens(
-        config: &Config,
-        tokens: Arc<dyn TokenSource>,
-    ) -> io::Result<Self> {
-        Self::bind_with(config, Some(tokens), Trust::system()).await
-    }
-
-    /// Like [`Server::bind`], with `trust` deciding which certificate
-    /// authorities an `https://` PAC address may chain to. For tests, which
-    /// run an authority of their own.
-    pub async fn bind_with_trust(config: &Config, trust: Trust) -> io::Result<Self> {
-        Self::bind_with(config, None, trust).await
-    }
-
-    async fn bind_with(
-        config: &Config,
-        tokens: Option<Arc<dyn TokenSource>>,
-        trust: Trust,
-    ) -> io::Result<Self> {
-        let (live, _) = build_live(config, None, &tokens, &trust).await?;
+    /// Like [`Server::bind`], with `services` in place of the system's.
+    pub async fn bind_with(config: &Config, services: Services) -> io::Result<Self> {
+        let (live, _) = build_live(config, None, &services).await?;
         let mut listeners = Vec::with_capacity(config.listen.len());
         for addr in &config.listen {
-            let listener = TcpListener::bind(addr).await.map_err(|err| {
-                io::Error::new(err.kind(), format!("cannot listen on {addr}: {err}"))
-            })?;
-            listeners.push(listener);
+            listeners.push(listen_on(addr, "").await?);
         }
         let mut tunnels = Vec::with_capacity(config.tunnels.len());
         for tunnel in &config.tunnels {
-            let listener = TcpListener::bind(tunnel.listen).await.map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("cannot listen on {} for a tunnel: {err}", tunnel.listen),
-                )
-            })?;
+            let listener = listen_on(&tunnel.listen, " for a tunnel").await?;
             tunnels.push((listener, tunnel.target.clone()));
         }
         let mut socks5 = Vec::new();
-        if let Some(config) = &config.socks5 {
-            for addr in &config.listen {
-                let listener = TcpListener::bind(addr).await.map_err(|err| {
-                    io::Error::new(
-                        err.kind(),
-                        format!("cannot listen on {addr} for SOCKS5: {err}"),
-                    )
-                })?;
-                socks5.push(listener);
-            }
+        for addr in config.socks5.iter().flat_map(|socks5| &socks5.listen) {
+            socks5.push(listen_on(addr, " for SOCKS5").await?);
         }
         let live: LiveCell = Arc::new(RwLock::new(Arc::new(live)));
         Ok(Self {
@@ -282,8 +263,7 @@ impl Server {
             socks5,
             reloader: Reloader {
                 live: live.clone(),
-                tokens,
-                trust,
+                services,
                 fixed: config.fixed(),
                 turn: Arc::new(tokio::sync::Mutex::new(())),
             },
@@ -335,17 +315,19 @@ impl Server {
             force: force.clone(),
         });
         for listener in self.listeners {
-            context
-                .tracker
-                .spawn(accept(listener, context.clone(), serve_connection, deny));
+            context.tracker.spawn(accept(
+                listener,
+                context.clone(),
+                serve_connection,
+                Denial::Http,
+            ));
         }
         for listener in self.socks5 {
             context.tracker.spawn(accept(
                 listener,
                 context.clone(),
                 socks5::serve,
-                // Nothing to say in a protocol that has no words for it.
-                |_stream| async {},
+                Denial::Silent,
             ));
         }
         for (listener, target) in self.tunnels {
@@ -353,8 +335,7 @@ impl Server {
                 listener,
                 context.clone(),
                 move |stream, peer, context| portfwd::serve(stream, peer, target.clone(), context),
-                // Nothing to say in a protocol that has no words for it.
-                |_stream| async {},
+                Denial::Silent,
             ));
         }
 
@@ -381,19 +362,37 @@ impl Server {
     }
 }
 
+/// Binds `addr`. `purpose` goes after the address in the error: what it was
+/// wanted for, if that is not the proxy itself.
+async fn listen_on(addr: &SocketAddr, purpose: &str) -> io::Result<TcpListener> {
+    TcpListener::bind(addr).await.map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot listen on {addr}{purpose}: {err}"),
+        )
+    })
+}
+
+/// What a client that the access rules reject is told.
+#[derive(Clone, Copy)]
+pub(super) enum Denial {
+    /// An HTTP client gets a `403`.
+    Http,
+    /// A protocol with no words for it: the connection is closed.
+    Silent,
+}
+
 /// Accepts clients on `listener` until shutdown. Each one the access rules
 /// allow is handed to `serve`, in a task the shutdown waits for; each one they
-/// reject is handed to `denied`.
-pub(super) async fn accept<S, SF, D, DF>(
+/// reject is told so as `denial` says.
+pub(super) async fn accept<S, SF>(
     listener: TcpListener,
     context: Arc<Context>,
     serve: S,
-    denied: D,
+    denial: Denial,
 ) where
     S: Fn(TcpStream, SocketAddr, Arc<Context>) -> SF,
     SF: Future<Output = ()> + Send + 'static,
-    D: Fn(TcpStream) -> DF,
-    DF: Future<Output = ()> + Send + 'static,
 {
     loop {
         let accepted = tokio::select! {
@@ -412,7 +411,9 @@ pub(super) async fn accept<S, SF, D, DF>(
 
         if context.live().access.check(peer.ip()) == Action::Deny {
             tracing::info!(peer = %peer.ip(), "connection denied by the access rules");
-            context.tracker.spawn(denied(stream));
+            if let Denial::Http = denial {
+                context.tracker.spawn(deny(stream));
+            }
             continue;
         }
         context.tracker.spawn(serve(stream, peer, context.clone()));
