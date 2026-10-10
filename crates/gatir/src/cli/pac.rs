@@ -9,14 +9,105 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use clap::{Args, Subcommand};
 use hyper::Uri;
 
-use crate::cli::GenerateArgs;
-use crate::config::{PacLocation, pac_dir};
+use super::Source;
+use crate::config::{Overrides, PacLocation, pac_dir};
 use crate::pac::{
     Fetched, PacEnv, Route, Rule, SystemResolver, Trust, Validators, check, fetch, load_script,
     read_script_file, tool_limits, wrap,
 };
+
+#[derive(Debug, Subcommand)]
+pub enum PacCommand {
+    /// Make a copy of a PAC script that sends some hosts to other proxies
+    ///
+    /// The hosts you name go to the proxies you name, and every other host is
+    /// left to the original script, which is kept as it is. It is for giving a
+    /// few destinations to another proxy without losing the rest of a script
+    /// that belongs to somebody else. The copy is a plain file: add hosts to it
+    /// by hand afterwards.
+    Generate(GenerateArgs),
+
+    /// Say which proxies a PAC script gives for some URLs
+    ///
+    /// With several --script they are shown side by side, which is how to see
+    /// what a copy changes. The names a script looks up are looked up for real.
+    Test(TestArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GenerateArgs {
+    /// The script to start from: a file, or an http:// or https:// address
+    #[arg(long, value_name = "FILE|URL")]
+    pub from: PacLocation,
+
+    /// A host that goes to the proxy list, repeated or separated by commas. A
+    /// name covers its sub-domains; * and ? match any text
+    #[arg(
+        long = "host",
+        required = true,
+        value_delimiter = ',',
+        value_name = "HOST"
+    )]
+    pub hosts: Vec<String>,
+
+    /// What those hosts get: DIRECT, or PROXY host:port, several separated by
+    /// semicolons, tried in order
+    #[arg(long, value_name = "LIST")]
+    pub proxy: String,
+
+    /// Where to write the copy: a file name alone goes in the `pac` folder next
+    /// to the configuration file, anything with a folder in it is the path as
+    /// written
+    #[arg(long, value_name = "NAME|PATH")]
+    pub output: PathBuf,
+
+    /// Replace the file if it exists (the old one is kept as NAME.prev)
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TestArgs {
+    /// What to ask the script about: a URL, or a host name, which is taken as
+    /// https://HOST/, the way gatir asks for a tunnel
+    #[arg(required = true, value_name = "URL")]
+    pub urls: Vec<String>,
+
+    /// A script to ask: a file, or an address. A file name alone is looked for
+    /// in the `pac` folder. Repeat it to compare. Without it, the script of the
+    /// configuration
+    #[arg(long = "script", value_name = "FILE|URL")]
+    pub scripts: Vec<PacLocation>,
+}
+
+pub(super) fn run(
+    command: PacCommand,
+    config: Option<PathBuf>,
+    overrides: Overrides,
+    password_prompt: bool,
+) -> anyhow::Result<()> {
+    match command {
+        PacCommand::Generate(args) => generate(&args, config.as_deref()),
+        PacCommand::Test(args) => {
+            let scripts = if args.scripts.is_empty() {
+                // Read, not started: this is a tool, with nothing to log.
+                let source = Source::new(config.clone(), overrides, password_prompt)?;
+                match source.read()?.pac {
+                    Some(pac) => vec![pac.location],
+                    None => {
+                        bail!("the configuration has no PAC script to ask: name one with --script")
+                    }
+                }
+            } else {
+                args.scripts.clone()
+            };
+            test(&args.urls, scripts, config.as_deref())
+        }
+    }
+}
 
 /// How long a script may take to be fetched from an address.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -117,7 +208,7 @@ fn toml_string(text: &str) -> String {
     }
 }
 
-pub fn generate(args: &GenerateArgs, config: Option<&Path>) -> anyhow::Result<()> {
+fn generate(args: &GenerateArgs, config: Option<&Path>) -> anyhow::Result<()> {
     let rule = Rule::new(&args.hosts, &args.proxy)?;
     let output = in_pac_dir(&args.output, config)?;
     if output.is_dir() {
@@ -311,11 +402,7 @@ fn labels(scripts: &[PacLocation]) -> Vec<String> {
         .collect()
 }
 
-pub fn test(
-    urls: &[String],
-    scripts: Vec<PacLocation>,
-    config: Option<&Path>,
-) -> anyhow::Result<()> {
+fn test(urls: &[String], scripts: Vec<PacLocation>, config: Option<&Path>) -> anyhow::Result<()> {
     let targets = urls
         .iter()
         .map(|text| target(text))
