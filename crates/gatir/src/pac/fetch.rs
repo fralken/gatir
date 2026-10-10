@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_native_tls::{TlsConnector, native_tls};
 
 use super::MAX_SCRIPT_BYTES;
+use crate::config::PacLocation;
 
 /// Redirects followed before giving up.
 const MAX_REDIRECTS: usize = 5;
@@ -182,13 +183,9 @@ fn bad_redirect_text(location: &str) -> String {
         .to_owned()
 }
 
-/// An address gatir may connect to: http or https, a host, no credentials.
+/// An address gatir may connect to; `original` is what is shown if it is not.
 fn check(uri: Uri, original: &str) -> Result<Uri, FetchError> {
-    let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
-    let authority_ok = uri
-        .authority()
-        .is_some_and(|authority| !authority.host().is_empty() && !authority.as_str().contains('@'));
-    if scheme_ok && authority_ok {
+    if PacLocation::is_fetchable(&uri) {
         Ok(uri)
     } else {
         Err(bad_redirect(original))

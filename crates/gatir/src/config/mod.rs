@@ -258,15 +258,22 @@ impl PacLocation {
             )
         };
         let uri: hyper::Uri = text.parse().map_err(|_| invalid())?;
-        let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
-        let authority_ok = uri.authority().is_some_and(|authority| {
-            !authority.as_str().contains('@') && !authority.host().is_empty()
-        });
-        if scheme_ok && authority_ok {
+        if Self::is_fetchable(&uri) {
             Ok(Self::Url(text.to_owned()))
         } else {
             Err(invalid())
         }
+    }
+
+    /// Whether gatir may fetch a script from `uri`: `http` or `https`, a host,
+    /// and no user name or password. It is the rule for the address in the
+    /// configuration and for every redirect that leads away from it.
+    pub fn is_fetchable(uri: &hyper::Uri) -> bool {
+        let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+        let authority_ok = uri.authority().is_some_and(|authority| {
+            !authority.as_str().contains('@') && !authority.host().is_empty()
+        });
+        scheme_ok && authority_ok
     }
 }
 
