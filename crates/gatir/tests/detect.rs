@@ -6,14 +6,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gatir::auth::{AuthError, TokenSource};
-use gatir::config::{Config, Credentials, HostPort, Overrides};
+use gatir::auth::{AuthError, SecurityContext, TokenSource, single_token};
+use gatir::config::{Config, Credentials, HostPort, Overrides, Timeouts};
 use gatir::proxy::{AttemptOutcome, detect};
 use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
 use gatir_testkit::origin::{MockOrigin, Reply};
 use hyper::Uri;
 
 const LIMIT: Duration = Duration::from_secs(5);
+
+fn timeouts() -> Timeouts {
+    Timeouts {
+        connect: LIMIT,
+        response: LIMIT,
+        ..Timeouts::default()
+    }
+}
 
 fn url() -> Uri {
     "http://example.com/".parse().unwrap()
@@ -67,8 +75,8 @@ fn reply(request: &gatir_testkit::http::Request) -> Reply {
 struct Tickets;
 
 impl TokenSource for Tickets {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-        Ok(format!("ticket for {service}").into_bytes())
+    fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
+        Ok(single_token(format!("ticket for {service}").into_bytes()))
     }
 }
 
@@ -77,7 +85,7 @@ impl TokenSource for Tickets {
 struct NoTickets;
 
 impl TokenSource for NoTickets {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
+    fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         Err(AuthError::NoTicket {
             service: service.to_owned(),
             reason: "No Kerberos credentials available".to_owned(),
@@ -88,7 +96,7 @@ impl TokenSource for NoTickets {
 #[tokio::test]
 async fn a_parent_that_needs_no_authentication_is_reported_as_such() {
     let origin = MockOrigin::start(|_request| Reply::ok("hello")).await;
-    let report = detect(&addr_of_origin(&origin), &url(), None, LIMIT, LIMIT, None)
+    let report = detect(&addr_of_origin(&origin), &url(), None, &timeouts(), None)
         .await
         .unwrap();
     assert_eq!(report.probe.status, 200);
@@ -114,8 +122,7 @@ async fn a_parent_that_offers_only_basic_is_reported_and_nothing_is_tried() {
         &addr_of(&parent),
         &url(),
         Some(&credentials),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         None,
     )
     .await
@@ -131,7 +138,7 @@ async fn no_credentials_configured_only_probes() {
     let (account, options) = well_behaved_parent();
     let parent = MockNtlmParent::start(account, options, reply).await;
 
-    let report = detect(&addr_of(&parent), &url(), None, LIMIT, LIMIT, None)
+    let report = detect(&addr_of(&parent), &url(), None, &timeouts(), None)
         .await
         .unwrap();
 
@@ -150,8 +157,7 @@ async fn the_right_dialect_is_found_and_the_rest_are_not_tried() {
         &addr_of(&parent),
         &url(),
         Some(&credentials),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         None,
     )
     .await
@@ -175,8 +181,7 @@ async fn a_wrong_password_is_rejected_for_every_dialect() {
         &addr_of(&parent),
         &url(),
         Some(&credentials),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         None,
     )
     .await
@@ -216,8 +221,7 @@ async fn a_kerberos_ticket_the_parent_accepts_is_reported() {
         &addr_of(&parent),
         &url(),
         Some(&negotiate_credentials_for(SERVICE)),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         Some(Arc::new(Tickets)),
     )
     .await
@@ -249,8 +253,7 @@ async fn a_kerberos_ticket_the_parent_refuses_is_reported() {
         &addr_of(&parent),
         &url(),
         Some(&negotiate_credentials()),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         Some(Arc::new(Tickets)),
     )
     .await
@@ -280,8 +283,7 @@ async fn no_kerberos_ticket_is_reported_as_a_failed_attempt() {
         &addr_of(&parent),
         &url(),
         Some(&negotiate_credentials()),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         Some(Arc::new(NoTickets)),
     )
     .await
@@ -303,8 +305,7 @@ async fn negotiate_configured_against_a_parent_offering_only_ntlm_tries_nothing(
         &addr_of(&parent),
         &url(),
         Some(&negotiate_credentials()),
-        LIMIT,
-        LIMIT,
+        &timeouts(),
         Some(Arc::new(Tickets)),
     )
     .await

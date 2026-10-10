@@ -25,21 +25,12 @@ pub struct Socks5 {
     pub credentials: Option<Socks5Credentials>,
 }
 
-#[derive(Debug)]
+/// A copy is another `secrecy` box: the password stays wrapped and is wiped
+/// when it is dropped.
+#[derive(Debug, Clone)]
 pub struct Socks5Credentials {
     pub username: String,
     password: SecretString,
-}
-
-/// A copy is another `secrecy` box: the password stays wrapped and is wiped
-/// when it is dropped.
-impl Clone for Socks5Credentials {
-    fn clone(&self) -> Self {
-        Self {
-            username: self.username.clone(),
-            password: SecretString::from(self.password.expose_secret().to_owned()),
-        }
-    }
 }
 
 impl Socks5Credentials {

@@ -162,26 +162,58 @@ impl Fixed {
     }
 }
 
-/// Values that take precedence over the config file.
-#[derive(Debug, Default)]
+/// Values that take precedence over the config file: the command-line options
+/// that say the same as a setting of the file.
+#[derive(Debug, Clone, Default, clap::Args)]
 pub struct Overrides {
+    /// Address to listen on; repeat for several (replaces `listen` from the file)
+    #[arg(long, global = true, value_name = "ADDR")]
     pub listen: Vec<SocketAddr>,
-    pub parents: Vec<HostPort>,
-    /// A PAC file or address. Like `parents`, it is a way of finding the proxy,
-    /// so it replaces the other one in the file.
+
+    /// PAC file or http(s) address that chooses the proxy for each request (replaces `parents` from the file)
+    // Like `parents`, it is a way of finding the proxy, so it replaces the
+    // other one in the file.
+    #[arg(long, global = true, value_name = "FILE|URL")]
     pub pac: Option<PacLocation>,
-    pub username: Option<String>,
-    pub domain: Option<String>,
-    pub method: Option<AuthMethod>,
-    /// A password supplied interactively. Replaces any password or hash
-    /// from the config file.
-    pub password: Option<SecretString>,
-    /// Replaces the tunnels of the file.
-    pub tunnels: Vec<Tunnel>,
-    /// Addresses for a SOCKS5 server. Replace those of the file.
-    pub socks5: Vec<SocketAddr>,
-    /// Replaces the `no_proxy` entries of the file.
+
+    /// Parent proxy as HOST:PORT; repeat for several (replaces `parents` or `[pac]` from the file)
+    #[arg(long = "parent", global = true, value_name = "HOST:PORT")]
+    pub parents: Vec<HostPort>,
+
+    /// A destination reached directly instead of through a proxy: a host name
+    /// (with `*`/`?`), an IP address or a CIDR range; repeat for several
+    /// (replaces `no_proxy` from the file)
+    #[arg(long, global = true, value_name = "HOST")]
     pub no_proxy: Vec<String>,
+
+    /// User name for the parent proxy
+    #[arg(short, long, global = true)]
+    pub username: Option<String>,
+
+    /// Domain of the user
+    #[arg(short, long, global = true)]
+    pub domain: Option<String>,
+
+    /// Authentication method
+    #[arg(short, long, global = true, value_enum)]
+    pub method: Option<AuthMethod>,
+
+    // A password supplied interactively (`--password-prompt`), never a
+    // command-line value. Replaces any password or hash from the config file.
+    #[arg(skip)]
+    pub password: Option<SecretString>,
+
+    /// Forward a local port to a destination through the proxy, as in OpenSSH: [BIND:]PORT:HOST:HOSTPORT;
+    /// repeat for several (replaces `[[tunnels]]` from the file)
+    #[arg(short = 'L', long = "tunnel", global = true, value_name = "SPEC")]
+    pub tunnels: Vec<Tunnel>,
+
+    /// Address for a SOCKS5 server; repeat for several (replaces `[socks5] listen` from the file)
+    #[arg(long, global = true, value_name = "ADDR")]
+    pub socks5: Vec<SocketAddr>,
+
+    /// Log verbosity (the RUST_LOG environment variable takes precedence)
+    #[arg(long, global = true, value_enum)]
     pub log_level: Option<LogLevel>,
 }
 

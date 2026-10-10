@@ -1,6 +1,5 @@
 //! Command-line interface.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use std::io::BufRead;
@@ -8,12 +7,12 @@ use std::io::BufRead;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use hyper::Uri;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use zeroize::Zeroizing;
 
 use crate::auth::ntlm::NtHash;
 
-use crate::config::{AuthMethod, Config, HostPort, LogLevel, Overrides, Tunnel};
+use crate::config::{Config, Overrides};
 use crate::logging;
 use crate::proxy::AttemptOutcome;
 
@@ -25,61 +24,14 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     #[command(flatten)]
-    pub overrides: OverrideArgs,
-
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-/// Options that take precedence over the configuration file.
-#[derive(Debug, Clone, Args)]
-pub struct OverrideArgs {
-    /// Address to listen on; repeat for several (replaces `listen` from the file)
-    #[arg(long, global = true, value_name = "ADDR")]
-    pub listen: Vec<SocketAddr>,
-
-    /// PAC file or http(s) address that chooses the proxy for each request (replaces `parents` from the file)
-    #[arg(long, global = true, value_name = "FILE|URL")]
-    pub pac: Option<crate::config::PacLocation>,
-
-    /// Parent proxy as HOST:PORT; repeat for several (replaces `parents` or `[pac]` from the file)
-    #[arg(long = "parent", global = true, value_name = "HOST:PORT")]
-    pub parents: Vec<HostPort>,
-
-    /// A destination reached directly instead of through a proxy: a host name
-    /// (with `*`/`?`), an IP address or a CIDR range; repeat for several
-    /// (replaces `no_proxy` from the file)
-    #[arg(long, global = true, value_name = "HOST")]
-    pub no_proxy: Vec<String>,
-
-    /// User name for the parent proxy
-    #[arg(short, long, global = true)]
-    pub username: Option<String>,
-
-    /// Domain of the user
-    #[arg(short, long, global = true)]
-    pub domain: Option<String>,
-
-    /// Authentication method
-    #[arg(short, long, global = true, value_enum)]
-    pub method: Option<AuthMethod>,
-
-    /// Forward a local port to a destination through the proxy, as in OpenSSH: [BIND:]PORT:HOST:HOSTPORT;
-    /// repeat for several (replaces `[[tunnels]]` from the file)
-    #[arg(short = 'L', long = "tunnel", global = true, value_name = "SPEC")]
-    pub tunnels: Vec<Tunnel>,
-
-    /// Address for a SOCKS5 server; repeat for several (replaces `[socks5] listen` from the file)
-    #[arg(long, global = true, value_name = "ADDR")]
-    pub socks5: Vec<SocketAddr>,
+    pub overrides: Overrides,
 
     /// Ask for the password on the terminal (replaces any password or hash from the file)
     #[arg(long, global = true)]
     pub password_prompt: bool,
 
-    /// Log verbosity (the RUST_LOG environment variable takes precedence)
-    #[arg(long, global = true, value_enum)]
-    pub log_level: Option<LogLevel>,
+    #[command(subcommand)]
+    pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,34 +83,11 @@ pub enum ConfigCommand {
     Check,
 }
 
-impl OverrideArgs {
-    /// The overrides for reading the configuration. `password` is copied: they
-    /// are made again at every reload.
-    fn to_overrides(&self, password: Option<&SecretString>) -> Overrides {
-        let password =
-            password.map(|password| SecretString::from(password.expose_secret().to_owned()));
-        let this = self.clone();
-        Overrides {
-            listen: this.listen,
-            parents: this.parents,
-            pac: this.pac,
-            username: this.username,
-            domain: this.domain,
-            method: this.method,
-            password,
-            tunnels: this.tunnels,
-            socks5: this.socks5,
-            no_proxy: this.no_proxy,
-            log_level: this.log_level,
-        }
-    }
-}
-
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Hash(args) => hash_password(&args),
         Command::Run => {
-            let source = Source::new(cli.config, cli.overrides)?;
+            let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
             let config = load_config(&source)?;
             if config.parents.is_empty()
                 && config.pac.is_none()
@@ -182,7 +111,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Negotiate(args) => negotiate_check(&args),
         Command::Detect(args) => {
-            let source = Source::new(cli.config, cli.overrides)?;
+            let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
             let config = load_config(&source)?;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -191,7 +120,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 .block_on(detect_check(&config, &args))
         }
         Command::Config(ConfigCommand::Check) => {
-            let source = Source::new(cli.config, cli.overrides)?;
+            let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
             let config = load_config(&source)?;
             println!("configuration OK");
             match &source.file {
@@ -253,8 +182,7 @@ async fn detect_check(config: &Config, args: &DetectArgs) -> anyhow::Result<()> 
         parent,
         &args.url,
         config.credentials.as_ref(),
-        config.timeouts.connect,
-        config.timeouts.response,
+        &config.timeouts,
         None,
     )
     .await
@@ -322,30 +250,28 @@ struct Source {
     /// The file named, or else the first that is found in the usual places;
     /// `None` if there is none, and the defaults apply.
     file: Option<PathBuf>,
-    overrides: OverrideArgs,
-    /// A password typed at the start, which the command line cannot carry.
-    password: Option<SecretString>,
+    /// The command line, with the password typed at the start, which the
+    /// command line cannot carry.
+    overrides: Overrides,
 }
 
 impl Source {
-    fn new(path: Option<PathBuf>, overrides: OverrideArgs) -> anyhow::Result<Self> {
-        let password = if overrides.password_prompt {
-            Some(prompt_password()?)
-        } else {
-            None
-        };
+    fn new(
+        path: Option<PathBuf>,
+        mut overrides: Overrides,
+        password_prompt: bool,
+    ) -> anyhow::Result<Self> {
+        if password_prompt {
+            overrides.password = Some(prompt_password()?);
+        }
         Ok(Self {
             file: path.or_else(crate::config::default_path),
             overrides,
-            password,
         })
     }
 
     fn read(&self) -> Result<Config, crate::config::ConfigError> {
-        Config::load(
-            self.file.as_deref(),
-            self.overrides.to_overrides(self.password.as_ref()),
-        )
+        Config::load(self.file.as_deref(), self.overrides.clone())
     }
 }
 
@@ -420,6 +346,7 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+    use crate::config::AuthMethod;
 
     #[test]
     fn cli_definition_is_consistent() {
@@ -458,7 +385,7 @@ mod tests {
         assert!(Cli::try_parse_from(["gatir", "config", "check", "-p", "x"]).is_err());
 
         let cli = Cli::try_parse_from(["gatir", "config", "check", "--password-prompt"]).unwrap();
-        assert!(cli.overrides.password_prompt);
+        assert!(cli.password_prompt);
     }
 
     #[test]

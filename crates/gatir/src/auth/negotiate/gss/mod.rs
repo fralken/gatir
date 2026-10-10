@@ -19,16 +19,6 @@ pub(super) fn tokens() -> Result<Arc<dyn TokenSource>, AuthError> {
 struct Gss(&'static api::Gss);
 
 impl TokenSource for Gss {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-        self.start(service)?
-            .step(None)?
-            .token
-            .ok_or_else(|| AuthError::NoTicket {
-                service: service.to_owned(),
-                reason: "the system produced no token".to_owned(),
-            })
-    }
-
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         let name = api::Name::import(self.0, service, service.contains('/')).map_err(|reason| {
             AuthError::NoTicket {

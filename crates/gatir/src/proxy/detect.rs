@@ -25,7 +25,7 @@ use super::failure::{Failure, connect_failure, try_connect};
 use super::parent::{Outcome, ParentAuth, send};
 use super::upstream::handshake;
 use crate::auth::{TokenSource, offered_schemes};
-use crate::config::{AuthMethod, Credentials, HostPort};
+use crate::config::{AuthMethod, Credentials, HostPort, Timeouts};
 
 /// The NTLM dialects gatir can answer a challenge with, tried in this order:
 /// the strongest first, stopping at the first the parent accepts.
@@ -75,11 +75,10 @@ pub async fn run(
     parent: &HostPort,
     url: &Uri,
     credentials: Option<&Credentials>,
-    connect_limit: Duration,
-    response_limit: Duration,
+    timeouts: &Timeouts,
     tokens: Option<Arc<dyn TokenSource>>,
 ) -> Result<Report, String> {
-    let probe = bare_probe(parent, url, connect_limit, response_limit)
+    let probe = bare_probe(parent, url, timeouts)
         .await
         .map_err(|failure| failure.message())?;
     let mentions = |scheme: &str| {
@@ -89,52 +88,29 @@ pub async fn run(
             .any(|offer| offer.eq_ignore_ascii_case(scheme))
     };
 
-    let attempts = if probe.status != StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
-        Vec::new()
-    } else {
+    let mut attempts = Vec::new();
+    if probe.status == StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
         match credentials {
             Some(credentials) if credentials.method == AuthMethod::Negotiate => {
                 if mentions("Negotiate") {
-                    vec![
-                        try_one(
-                            parent,
-                            url,
-                            credentials,
-                            connect_limit,
-                            response_limit,
-                            tokens,
-                        )
-                        .await,
-                    ]
-                } else {
-                    Vec::new()
+                    attempts.push(try_one(parent, url, credentials, timeouts, tokens).await);
                 }
             }
             Some(credentials) if mentions("NTLM") => {
-                let mut attempts = Vec::new();
                 for method in NTLM_DIALECTS {
                     let mut dialect = credentials.clone();
                     dialect.method = method;
-                    let attempt = try_one(
-                        parent,
-                        url,
-                        &dialect,
-                        connect_limit,
-                        response_limit,
-                        tokens.clone(),
-                    )
-                    .await;
+                    let attempt = try_one(parent, url, &dialect, timeouts, tokens.clone()).await;
                     let accepted = matches!(attempt.outcome, AttemptOutcome::Accepted);
                     attempts.push(attempt);
                     if accepted {
                         break;
                     }
                 }
-                attempts
             }
-            _ => Vec::new(),
+            _ => {}
         }
-    };
+    }
 
     Ok(Report { probe, attempts })
 }
@@ -142,14 +118,9 @@ pub async fn run(
 /// A single, bare, unauthenticated request: what it comes back with says
 /// whether the parent needs authentication for this URL at all, and, if it
 /// does, what it offers.
-async fn bare_probe(
-    parent: &HostPort,
-    url: &Uri,
-    connect_limit: Duration,
-    response_limit: Duration,
-) -> Result<Probe, Failure> {
-    let mut sender = connect(parent, connect_limit).await?;
-    let response = send(&mut sender, request(url, None)?, response_limit).await?;
+async fn bare_probe(parent: &HostPort, url: &Uri, timeouts: &Timeouts) -> Result<Probe, Failure> {
+    let mut sender = connect(parent, timeouts.connect).await?;
+    let response = send(&mut sender, request(url, None)?, timeouts.response).await?;
     let status = response.status().as_u16();
     let offers = offered_schemes(response.headers().get_all(PROXY_AUTHENTICATE));
     Ok(Probe { status, offers })
@@ -162,67 +133,58 @@ async fn try_one(
     parent: &HostPort,
     url: &Uri,
     credentials: &Credentials,
-    connect_limit: Duration,
-    response_limit: Duration,
+    timeouts: &Timeouts,
     tokens: Option<Arc<dyn TokenSource>>,
 ) -> Attempt {
-    let method = credentials.method.as_str();
-    let outcome = try_one_outcome(
-        parent,
-        url,
-        credentials,
-        connect_limit,
-        response_limit,
-        tokens,
-    )
-    .await;
-    Attempt { method, outcome }
-}
-
-async fn try_one_outcome(
-    parent: &HostPort,
-    url: &Uri,
-    credentials: &Credentials,
-    connect_limit: Duration,
-    response_limit: Duration,
-    tokens: Option<Arc<dyn TokenSource>>,
-) -> AttemptOutcome {
-    let auth = match ParentAuth::new(credentials, tokens) {
-        Ok(auth) => auth,
-        Err(err) => return AttemptOutcome::Failed(err.to_string()),
-    };
-    let mut sender = match connect(parent, connect_limit).await {
-        Ok(sender) => sender,
-        Err(failure) => return AttemptOutcome::Failed(failure.message()),
-    };
-    let carrier = || request(url, None).expect("a URL already used for the probe");
-    match auth
-        .negotiate(&mut sender, carrier, &parent.host, response_limit, || {
-            Box::pin(connect(parent, connect_limit))
-        })
-        .await
-    {
-        // A Negotiate ticket (or its NTLM-inside-Negotiate fallback) that the
-        // parent turns down outright is an error from `negotiate` itself,
-        // unlike NTLM, which always gets a proof to try on a second request.
-        Err(Failure::TicketRejected { .. } | Failure::SessionRejected { .. }) => {
-            AttemptOutcome::Rejected
-        }
-        Err(failure) => AttemptOutcome::Failed(failure.message()),
-        Ok(Outcome::Answered(_)) => AttemptOutcome::Accepted,
-        Ok(Outcome::Proof { header, .. }) => {
-            let proven = match request(url, Some(header)) {
-                Ok(proven) => proven,
-                Err(failure) => return AttemptOutcome::Failed(failure.message()),
-            };
-            match send(&mut sender, proven, response_limit).await {
-                Err(failure) => AttemptOutcome::Failed(failure.message()),
-                Ok(response) if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
-                    AttemptOutcome::Rejected
+    let outcome = 'outcome: {
+        let auth = match ParentAuth::new(credentials, tokens) {
+            Ok(auth) => auth,
+            Err(err) => break 'outcome AttemptOutcome::Failed(err.to_string()),
+        };
+        let mut sender = match connect(parent, timeouts.connect).await {
+            Ok(sender) => sender,
+            Err(failure) => break 'outcome AttemptOutcome::Failed(failure.message()),
+        };
+        let carrier = || request(url, None).expect("a URL already used for the probe");
+        let negotiated = auth
+            .negotiate(
+                &mut sender,
+                carrier,
+                &parent.host,
+                timeouts.response,
+                || Box::pin(connect(parent, timeouts.connect)),
+            )
+            .await;
+        match negotiated {
+            // A Negotiate ticket (or its NTLM-inside-Negotiate fallback) that
+            // the parent turns down outright is an error from `negotiate`
+            // itself, unlike NTLM, which always gets a proof to try on a
+            // second request.
+            Err(Failure::TicketRejected { .. } | Failure::SessionRejected { .. }) => {
+                AttemptOutcome::Rejected
+            }
+            Err(failure) => AttemptOutcome::Failed(failure.message()),
+            Ok(Outcome::Answered(_)) => AttemptOutcome::Accepted,
+            Ok(Outcome::Proof { header, .. }) => {
+                let proven = match request(url, Some(header)) {
+                    Ok(proven) => proven,
+                    Err(failure) => break 'outcome AttemptOutcome::Failed(failure.message()),
+                };
+                match send(&mut sender, proven, timeouts.response).await {
+                    Err(failure) => AttemptOutcome::Failed(failure.message()),
+                    Ok(response)
+                        if response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED =>
+                    {
+                        AttemptOutcome::Rejected
+                    }
+                    Ok(_) => AttemptOutcome::Accepted,
                 }
-                Ok(_) => AttemptOutcome::Accepted,
             }
         }
+    };
+    Attempt {
+        method: credentials.method.as_str(),
+        outcome,
     }
 }
 

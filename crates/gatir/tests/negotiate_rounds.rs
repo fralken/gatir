@@ -33,10 +33,6 @@ struct Round {
 }
 
 impl TokenSource for TwoRounds {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-        Ok(format!("first for {service}").into_bytes())
-    }
-
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         Ok(Box::new(Round {
             service: service.to_owned(),

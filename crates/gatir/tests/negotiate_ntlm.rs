@@ -38,10 +38,6 @@ impl System {
 }
 
 impl TokenSource for System {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-        Ok(format!("ticket for {service}").into_bytes())
-    }
-
     /// Like SSPI, which does not call an exchange done after the first token.
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         Ok(Box::new(Opening(service.to_owned())))

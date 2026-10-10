@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
-use gatir::auth::{AuthError, TokenSource};
+use gatir::auth::{AuthError, SecurityContext, TokenSource, single_token};
 use gatir_testkit::http::{RawClient, Response};
 use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
 use gatir_testkit::origin::{MockOrigin, Reply};
@@ -18,8 +18,8 @@ use gatir_testkit::origin::{MockOrigin, Reply};
 struct Tickets;
 
 impl TokenSource for Tickets {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-        Ok(format!("ticket for {service}").into_bytes())
+    fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
+        Ok(single_token(format!("ticket for {service}").into_bytes()))
     }
 }
 
@@ -28,7 +28,7 @@ impl TokenSource for Tickets {
 struct NoTickets;
 
 impl TokenSource for NoTickets {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
+    fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         Err(AuthError::NoTicket {
             service: service.to_owned(),
             reason: "No Kerberos credentials available".to_owned(),
@@ -41,9 +41,9 @@ impl TokenSource for NoTickets {
 struct SlowKdc;
 
 impl TokenSource for SlowKdc {
-    fn token(&self, _service: &str) -> Result<Vec<u8>, AuthError> {
+    fn start(&self, _service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         std::thread::sleep(Duration::from_secs(4));
-        Ok(b"too late".to_vec())
+        Ok(single_token(b"too late".to_vec()))
     }
 }
 

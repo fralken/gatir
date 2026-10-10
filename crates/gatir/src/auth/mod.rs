@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 pub use negotiate::{
     Diagnosis, Refusal, SecurityContext, Step, TokenSource, challenge, diagnose,
-    header as negotiate_header, refusal, system_tokens,
+    header as negotiate_header, refusal, single_token, system_tokens,
 };
 
 use crate::config::{AuthMethod, Credentials};

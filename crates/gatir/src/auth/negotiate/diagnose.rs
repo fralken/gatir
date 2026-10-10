@@ -71,6 +71,7 @@ fn mechanisms(token: &[u8]) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{SecurityContext, single_token};
     use super::*;
 
     #[test]
@@ -143,8 +144,8 @@ mod tests {
         #[derive(Debug)]
         struct Says(&'static [u8]);
         impl TokenSource for Says {
-            fn token(&self, _service: &str) -> Result<Vec<u8>, AuthError> {
-                Ok(self.0.to_vec())
+            fn start(&self, _service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
+                Ok(single_token(self.0.to_vec()))
             }
         }
         let diagnosis = diagnose(&Says(b"NTLMSSP\0\x01\0\0\0"), "HTTP@proxy").unwrap();
@@ -159,7 +160,7 @@ mod tests {
         #[derive(Debug)]
         struct Fails;
         impl TokenSource for Fails {
-            fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
+            fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
                 Err(AuthError::NoTicket {
                     service: service.to_owned(),
                     reason: "no ticket".to_owned(),

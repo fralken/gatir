@@ -34,16 +34,6 @@ pub fn tokens() -> Arc<dyn TokenSource> {
 struct Sspi;
 
 impl TokenSource for Sspi {
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-        self.start(service)?
-            .step(None)?
-            .token
-            .ok_or_else(|| AuthError::NoTicket {
-                service: service.to_owned(),
-                reason: "Windows produced no token".to_owned(),
-            })
-    }
-
     fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
         Ok(Box::new(Context::new(service, "Negotiate")?))
     }

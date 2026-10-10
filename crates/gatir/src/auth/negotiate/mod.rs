@@ -53,20 +53,13 @@ pub trait SecurityContext: Send + fmt::Debug {
 
 /// Makes the tokens that prove who the user is to a service.
 pub trait TokenSource: Send + Sync + fmt::Debug {
-    /// The token that opens a security context with `service`, made from the
-    /// ticket of the logged-in user. It may block: the ticket for a new
-    /// service is fetched from the KDC.
+    /// Starts an exchange with `service`, with the ticket of the logged-in
+    /// user. It may block: the ticket for a new service is fetched from the
+    /// KDC.
     ///
     /// `service` is `HTTP@host`, or a Kerberos principal like
     /// `HTTP/host@REALM` when it holds a `/`.
-    fn token(&self, service: &str) -> Result<Vec<u8>, AuthError>;
-
-    /// Starts an exchange with `service`. The default is one round: the token,
-    /// and nothing to expect from the parent. A source that can go on (the
-    /// system's) says so by overriding this.
-    fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
-        Ok(Box::new(OneRound(Some(self.token(service)?))))
-    }
+    fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError>;
 
     /// Starts an exchange with `service` in NTLM alone, with the identity of
     /// the logged-on user: for a parent that offers NTLM and not Negotiate.
@@ -78,7 +71,12 @@ pub trait TokenSource: Send + Sync + fmt::Debug {
     }
 }
 
-/// The exchange of a source that has one token and no more.
+/// The exchange of a source that has one token and no more: what a Kerberos
+/// ticket needs, and what a source made up for a test gives.
+pub fn single_token(token: Vec<u8>) -> Box<dyn SecurityContext> {
+    Box::new(OneRound(Some(token)))
+}
+
 #[derive(Debug)]
 struct OneRound(Option<Vec<u8>>);
 
@@ -198,8 +196,8 @@ mod tests {
     struct Fixed;
 
     impl TokenSource for Fixed {
-        fn token(&self, service: &str) -> Result<Vec<u8>, AuthError> {
-            Ok(format!("ticket for {service}").into_bytes())
+        fn start(&self, service: &str) -> Result<Box<dyn SecurityContext>, AuthError> {
+            Ok(single_token(format!("ticket for {service}").into_bytes()))
         }
     }
 

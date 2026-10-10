@@ -24,7 +24,13 @@ fn the_system_makes_a_spnego_token_from_the_ticket_of_the_user() {
     };
 
     let tokens = system_tokens().expect("the system has Kerberos");
-    let token = tokens.token(&service).expect("a token for the service");
+    let token = tokens
+        .start(&service)
+        .expect("a security context for the service")
+        .step(None)
+        .expect("a first step")
+        .token
+        .expect("a token for the service");
 
     // A GSS-API token starts with the application tag, and a SPNEGO one names
     // its mechanism.
