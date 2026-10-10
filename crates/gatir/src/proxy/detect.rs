@@ -16,14 +16,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use hyper::client::conn::http1::{self, SendRequest};
+use hyper::client::conn::http1::SendRequest;
 use hyper::header::{HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use hyper::{Method, Request, StatusCode, Uri, Version};
-use hyper_util::rt::TokioIo;
 
 use super::body::{Body, full};
 use super::failure::{Failure, connect_failure, try_connect};
 use super::parent::{Outcome, ParentAuth, send};
+use super::upstream::handshake;
 use crate::auth::{TokenSource, offered_schemes};
 use crate::config::{AuthMethod, Credentials, HostPort};
 
@@ -195,10 +195,9 @@ async fn try_one_outcome(
         Ok(sender) => sender,
         Err(failure) => return AttemptOutcome::Failed(failure.message()),
     };
-    let pending = auth.begin(&parent.host);
     let carrier = || request(url, None).expect("a URL already used for the probe");
     match auth
-        .negotiate(&mut sender, carrier, pending, response_limit, || {
+        .negotiate(&mut sender, carrier, &parent.host, response_limit, || {
             Box::pin(connect(parent, connect_limit))
         })
         .await
@@ -233,17 +232,7 @@ async fn connect(parent: &HostPort, limit: Duration) -> Result<SendRequest<Body>
     let stream = try_connect(&address, limit)
         .await
         .map_err(|err| connect_failure(&address, err))?;
-    let (sender, connection) = http1::Builder::new()
-        .preserve_header_case(true)
-        .handshake(TokioIo::new(stream))
-        .await
-        .map_err(Failure::Upstream)?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::debug!(%err, "parent proxy connection ended with error");
-        }
-    });
-    Ok(sender)
+    handshake(stream).await
 }
 
 /// A `GET` for `url`, in absolute form, as a real proxied request would send

@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::client::conn::http1;
 use hyper::header::{HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
 use hyper::http::Extensions;
 use hyper::upgrade::{OnUpgrade, Upgraded};
@@ -26,7 +25,7 @@ use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent::Outcome;
 use super::server::{Context, Live};
-use super::upstream::Hop;
+use super::upstream::{Hop, handshake};
 use crate::config::HostPort;
 
 pub(super) async fn handle(
@@ -267,22 +266,6 @@ fn spawn_tunnel<U>(
     });
 }
 
-/// Starts the HTTP/1 client driver on a connection to a parent proxy, ready to
-/// be upgraded into a tunnel.
-async fn handshake_with_parent(stream: TcpStream) -> Result<http1::SendRequest<Body>, Failure> {
-    let (sender, connection) = http1::Builder::new()
-        .preserve_header_case(true)
-        .handshake::<_, Body>(TokioIo::new(stream))
-        .await
-        .map_err(Failure::Upstream)?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.with_upgrades().await {
-            tracing::debug!(%err, "parent proxy connection ended with error");
-        }
-    });
-    Ok(sender)
-}
-
 /// Asks a parent proxy, over `stream`, to open a tunnel to `address`. The
 /// client's own header fields (User-Agent and the like), if it has any, go
 /// along, minus the hop-by-hop ones and its proxy credentials.
@@ -324,7 +307,7 @@ async fn connect_through_parent(
         request
     };
 
-    let mut sender = handshake_with_parent(stream).await?;
+    let mut sender = handshake(stream).await?;
     let hop = Hop::Parent(parent.clone());
 
     // Set once a proof has been sent, until the parent has said whether it
@@ -339,12 +322,11 @@ async fn connect_through_parent(
             .map_err(Failure::first_answer)?,
         Some(auth) => {
             let admitted = auth.admit().await?;
-            let pending = auth.begin(&parent.host);
             match auth
                 .negotiate(
                     &mut sender,
                     || connect(None),
-                    pending,
+                    &parent.host,
                     limit,
                     || {
                         Box::pin(async {
@@ -352,7 +334,7 @@ async fn connect_through_parent(
                                 .upstreams
                                 .connect_hop(&hop, address, live.timeouts.connect)
                                 .await?;
-                            handshake_with_parent(stream).await
+                            handshake(stream).await
                         })
                     },
                 )

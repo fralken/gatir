@@ -7,11 +7,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Incoming};
-use hyper::client::conn::http1;
 use hyper::header::{AUTHORIZATION, HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
 use hyper::http::Extensions;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
-use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 use super::body::{Body, Sent, full, response_within, watch};
@@ -20,7 +18,7 @@ use super::headers::{apply_rules, strip_hop_by_hop};
 use super::parent::{Admission, Outcome, ParentAuth, negotiate_origin, reusable};
 use super::pool::{Lease, Pool};
 use super::server::{Context, Live};
-use super::upstream::{Hop, Opened};
+use super::upstream::{Hop, Opened, handshake};
 use crate::config::HeaderRule;
 
 pub(super) async fn handle(
@@ -324,10 +322,9 @@ async fn authenticate<'a>(
     lease.needs_auth = false;
     let (outcome, proof_goes_in) = match &lease.hop {
         Hop::Parent(parent) => {
-            let pending = auth.begin(&parent.host);
             let hop = lease.hop.clone();
             let outcome = auth
-                .negotiate(&mut lease.sender, carrier, pending, limit, || {
+                .negotiate(&mut lease.sender, carrier, &parent.host, limit, || {
                     Box::pin(async {
                         let stream = context
                             .upstreams
@@ -473,21 +470,6 @@ async fn new_lease(
         reused: false,
         epoch: context.epoch,
     })
-}
-
-/// Starts the HTTP/1 client driver on a connected stream.
-async fn handshake(stream: TcpStream) -> Result<http1::SendRequest<Body>, Failure> {
-    let (sender, connection) = http1::Builder::new()
-        .preserve_header_case(true)
-        .handshake(TokioIo::new(stream))
-        .await
-        .map_err(Failure::Upstream)?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            tracing::debug!(%err, "upstream connection ended with error");
-        }
-    });
-    Ok(sender)
 }
 
 /// Methods that RFC 9110 defines as idempotent: repeating them is harmless.

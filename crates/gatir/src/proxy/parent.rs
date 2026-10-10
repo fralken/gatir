@@ -112,17 +112,6 @@ pub(super) enum Outcome {
     },
 }
 
-/// What is tried on a new connection, decided from the configured method
-/// alone: nothing here has touched the system or the network yet.
-pub(super) enum Pending {
-    Ntlm,
-    /// The service to ask a Kerberos ticket for, once the parent's first
-    /// answer says it wants one.
-    Negotiate {
-        service: String,
-    },
-}
-
 /// Permission to try to authenticate, held until the parent has said whether
 /// it accepts the proof.
 pub(super) struct Admission<'a> {
@@ -214,18 +203,9 @@ impl ParentAuth {
         })
     }
 
-    /// Decides what to try on a new connection to the parent at `parent_host`,
-    /// from the configured method alone: nothing is asked of the system yet.
-    pub(super) fn begin(&self, parent_host: &str) -> Pending {
-        match &self.authenticator {
-            Authenticator::Ntlm(_) => Pending::Ntlm,
-            Authenticator::Negotiate(negotiate) => Pending::Negotiate {
-                service: negotiate.service_for(parent_host),
-            },
-        }
-    }
-
-    /// Runs the exchange on a new connection, and reads the parent's answer.
+    /// Runs the exchange on a new connection to the parent at `parent_host`,
+    /// and reads the parent's answer.
+    ///
     /// `carrier` makes a fresh copy of what is sent each time it is called (a
     /// probe, or the real request when it is safe to repeat): the exchange may
     /// need it more than once. `reconnect` opens a fresh connection to the
@@ -235,116 +215,138 @@ impl ParentAuth {
         &self,
         sender: &mut SendRequest<Body>,
         carrier: impl Fn() -> Request<Body>,
-        pending: Pending,
+        parent_host: &str,
         limit: Duration,
-        mut reconnect: impl FnMut() -> Reconnect<'r>,
+        reconnect: impl FnMut() -> Reconnect<'r>,
     ) -> Result<Outcome, Failure> {
-        // NTLM has nothing to lose by opening with its own message: making one
-        // costs nothing, and a parent that never asks for it just ignores it.
-        // Negotiate may have to ask the system for a Kerberos ticket, a real
-        // request to the KDC, so it asks for nothing until the parent does.
-        let opening = match &pending {
-            Pending::Ntlm => {
-                let Authenticator::Ntlm(ntlm) = &self.authenticator else {
-                    return Err(Failure::Parent(
-                        "an exchange was started for a scheme that is not the configured one",
-                    ));
-                };
-                Some(ntlm.first()?)
-            }
-            Pending::Negotiate { .. } => None,
-        };
-        let mut first = carrier();
-        if let Some(opening) = opening {
-            first.headers_mut().insert(PROXY_AUTHORIZATION, opening);
-        }
-        // A parent that ends the connection right here, with nothing said, may
-        // be given up on: nothing was proved to it, and the caller can try the
-        // next one. Past this point it has answered, so it is not that.
-        let response = send(sender, first, limit)
-            .await
-            .map_err(|failure| match failure {
-                Failure::Upstream(error) => Failure::first_answer(error),
-                other => other,
-            })?;
-        if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-            return Ok(Outcome::Answered(response));
-        }
-        let (parts, body) = response.into_parts();
-
-        match pending {
-            Pending::Ntlm => {
-                let Authenticator::Ntlm(ntlm) = &self.authenticator else {
-                    unreachable!("matched above");
-                };
-                let header = ntlm.respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
-                if !reusable(body, sender, limit).await {
-                    return Err(Failure::Parent(
-                        "the parent proxy did not keep the connection open during authentication",
-                    ));
-                }
-                Ok(Outcome::Proof { header, made: None })
-            }
-            Pending::Negotiate { service } => {
-                let Authenticator::Negotiate(negotiate) = &self.authenticator else {
-                    unreachable!("matched above");
-                };
-                if offers_only_ntlm(&parts.headers) {
-                    let Some((context, opening)) =
-                        start_system_ntlm(negotiate.tokens(), &service, limit).await?
-                    else {
-                        return Err(Failure::Authentication(AuthError::NegotiateNotOffered {
-                            offered: offered_schemes(&parts.headers),
-                        }));
-                    };
-                    let exchange = SystemNtlm {
-                        context,
-                        opening,
-                        service,
-                    };
-                    return ntlm_from_system(sender, carrier, exchange, body, limit).await;
-                }
-
-                // Negotiate is offered: only now does the system make a ticket.
-                tracing::debug!(%service, "the parent proxy offers Negotiate: asking the system for a ticket");
-                let (context, header) =
-                    first_ticket(negotiate.tokens(), service.clone(), limit).await?;
-                if !reusable(body, sender, limit).await {
-                    // Some proxies close the connection right after refusing a
-                    // request that carried no credential at all, before
-                    // Negotiate ever gets to prove anything on it (seen in
-                    // practice: a bare `407` with `Connection: close`). A
-                    // Kerberos ticket, unlike an NTLM challenge, answers no
-                    // challenge from this connection in particular, so a fresh
-                    // one still carries it fine; nothing was spent asking for
-                    // it that a new connection would waste.
-                    *sender = reconnect().await?;
-                }
-
-                let mut second = carrier();
-                second.headers_mut().insert(PROXY_AUTHORIZATION, header);
-                let response = send(sender, second, limit).await?;
-                if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-                    return Ok(Outcome::Answered(response));
-                }
-                let (parts, body) = response.into_parts();
-                // The parent answered the ticket with a token of its own: the
-                // system needs another round to go on (NTLM inside Negotiate).
-                let header =
-                    answer_challenge(context, service.clone(), &parts.headers, limit).await?;
-                if !reusable(body, sender, limit).await {
-                    // The token this answers does not depend on the connection
-                    // either: it was made from what the parent's own token
-                    // held, not from anything tied to this specific socket.
-                    *sender = reconnect().await?;
-                }
-                Ok(Outcome::Proof {
-                    header,
-                    made: Some(service),
-                })
+        match &self.authenticator {
+            Authenticator::Ntlm(ntlm) => negotiate_ntlm(ntlm, sender, carrier, limit).await,
+            Authenticator::Negotiate(negotiate) => {
+                let service = negotiate.service_for(parent_host);
+                negotiate_ticket(
+                    negotiate.tokens(),
+                    service,
+                    sender,
+                    carrier,
+                    limit,
+                    reconnect,
+                )
+                .await
             }
         }
     }
+}
+
+/// Sends the request that opens an exchange.
+///
+/// A parent that ends the connection right here, with nothing said, may be
+/// given up on: nothing was proved to it, and the caller can try the next one.
+/// Past this point it has answered, so it is not that.
+async fn send_first(
+    sender: &mut SendRequest<Body>,
+    request: Request<Body>,
+    limit: Duration,
+) -> Result<Response<Incoming>, Failure> {
+    send(sender, request, limit)
+        .await
+        .map_err(|failure| match failure {
+            Failure::Upstream(error) => Failure::first_answer(error),
+            other => other,
+        })
+}
+
+/// NTLM has nothing to lose by opening with its own message: making one costs
+/// nothing, and a parent that never asks for it just ignores it. The parent's
+/// answer says whether more is needed.
+async fn negotiate_ntlm(
+    ntlm: &ntlm::Authenticator,
+    sender: &mut SendRequest<Body>,
+    carrier: impl Fn() -> Request<Body>,
+    limit: Duration,
+) -> Result<Outcome, Failure> {
+    let mut first = carrier();
+    first
+        .headers_mut()
+        .insert(PROXY_AUTHORIZATION, ntlm.first()?);
+    let response = send_first(sender, first, limit).await?;
+    if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        return Ok(Outcome::Answered(response));
+    }
+    let (parts, body) = response.into_parts();
+    let header = ntlm.respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
+    if !reusable(body, sender, limit).await {
+        return Err(Failure::Parent(
+            "the parent proxy did not keep the connection open during authentication",
+        ));
+    }
+    Ok(Outcome::Proof { header, made: None })
+}
+
+/// Negotiate may have to ask the system for a Kerberos ticket, a real request
+/// to the KDC, so it asks for nothing until the parent does: the first request
+/// goes out bare.
+async fn negotiate_ticket<'r>(
+    tokens: Arc<dyn TokenSource>,
+    service: String,
+    sender: &mut SendRequest<Body>,
+    carrier: impl Fn() -> Request<Body>,
+    limit: Duration,
+    mut reconnect: impl FnMut() -> Reconnect<'r>,
+) -> Result<Outcome, Failure> {
+    let response = send_first(sender, carrier(), limit).await?;
+    if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        return Ok(Outcome::Answered(response));
+    }
+    let (parts, body) = response.into_parts();
+
+    if offers_only_ntlm(&parts.headers) {
+        let Some((context, opening)) = start_system_ntlm(tokens, &service, limit).await? else {
+            return Err(Failure::Authentication(AuthError::NegotiateNotOffered {
+                offered: offered_schemes(&parts.headers),
+            }));
+        };
+        let exchange = SystemNtlm {
+            context,
+            opening,
+            service,
+        };
+        return ntlm_from_system(sender, carrier, exchange, body, limit).await;
+    }
+
+    // Negotiate is offered: only now does the system make a ticket.
+    tracing::debug!(%service, "the parent proxy offers Negotiate: asking the system for a ticket");
+    let (context, header) = first_ticket(tokens, service.clone(), limit).await?;
+    if !reusable(body, sender, limit).await {
+        // Some proxies close the connection right after refusing a request
+        // that carried no credential at all, before Negotiate ever gets to
+        // prove anything on it (seen in practice: a bare `407` with
+        // `Connection: close`). A Kerberos ticket, unlike an NTLM challenge,
+        // answers no challenge from this connection in particular, so a fresh
+        // one still carries it fine; nothing was spent asking for it that a new
+        // connection would waste.
+        *sender = reconnect().await?;
+    }
+
+    let mut second = carrier();
+    second.headers_mut().insert(PROXY_AUTHORIZATION, header);
+    let response = send(sender, second, limit).await?;
+    if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        return Ok(Outcome::Answered(response));
+    }
+    let (parts, body) = response.into_parts();
+    // The parent answered the ticket with a token of its own: the system needs
+    // another round to go on (NTLM inside Negotiate).
+    let header = answer_challenge(context, service.clone(), &parts.headers, limit).await?;
+    if !reusable(body, sender, limit).await {
+        // The token this answers does not depend on the connection either: it
+        // was made from what the parent's own token held, not from anything
+        // tied to this specific socket.
+        *sender = reconnect().await?;
+    }
+    Ok(Outcome::Proof {
+        header,
+        made: Some(service),
+    })
 }
 
 /// The exchange with an origin server that asks for NTLM itself
@@ -373,6 +375,23 @@ pub(super) async fn negotiate_origin(
     Ok(Outcome::Proof { header, made: None })
 }
 
+/// Runs `work`, which may block (a ticket is fetched from the KDC), off the
+/// async threads and for no longer than `limit`. `waiting_for` names what was
+/// being waited for if the time runs out, and `panicked` says what could not
+/// be done if `work` panicked.
+async fn blocking<T: Send + 'static>(
+    limit: Duration,
+    waiting_for: &'static str,
+    panicked: &'static str,
+    work: impl FnOnce() -> Result<T, AuthError> + Send + 'static,
+) -> Result<T, Failure> {
+    timeout(limit, tokio::task::spawn_blocking(work))
+        .await
+        .map_err(|_| Failure::ResponseTimeout(waiting_for))?
+        .map_err(|_| Failure::Parent(panicked))?
+        .map_err(Failure::from)
+}
+
 /// Asks the system for the first Kerberos token for `service`, now that the
 /// parent has said it wants Negotiate: the security context, to answer a
 /// second round with, and the header the token goes in.
@@ -382,17 +401,17 @@ async fn first_ticket(
     limit: Duration,
 ) -> Result<(Box<dyn SecurityContext>, HeaderValue), Failure> {
     let asked = service.clone();
-    let (context, step) = timeout(
+    let (context, step) = blocking(
         limit,
-        tokio::task::spawn_blocking(move || {
+        "the Kerberos server",
+        "the Kerberos ticket could not be requested",
+        move || {
             let mut context = tokens.start(&asked)?;
             let step = context.step(None)?;
-            Ok::<_, AuthError>((context, step))
-        }),
+            Ok((context, step))
+        },
     )
-    .await
-    .map_err(|_| Failure::ResponseTimeout("the Kerberos server"))?
-    .map_err(|_| Failure::Parent("the Kerberos ticket could not be requested"))??;
+    .await?;
     let token = step.token.ok_or_else(|| AuthError::NoTicket {
         service,
         reason: "the system produced no token".to_owned(),
@@ -449,9 +468,11 @@ async fn start_system_ntlm(
     limit: Duration,
 ) -> Result<Option<(Box<dyn SecurityContext>, Vec<u8>)>, Failure> {
     let asked = service.to_owned();
-    let started = timeout(
+    blocking(
         limit,
-        tokio::task::spawn_blocking(move || {
+        "the system's NTLM",
+        "the NTLM message could not be made",
+        move || {
             let Some(mut context) = tokens.start_ntlm(&asked)? else {
                 return Ok(None);
             };
@@ -462,13 +483,10 @@ async fn start_system_ntlm(
                     service: asked,
                     reason: "the system produced no NTLM message".to_owned(),
                 })?;
-            Ok::<_, AuthError>(Some((context, opening)))
-        }),
+            Ok(Some((context, opening)))
+        },
     )
     .await
-    .map_err(|_| Failure::ResponseTimeout("the system's NTLM"))?
-    .map_err(|_| Failure::Parent("the NTLM message could not be made"))??;
-    Ok(started)
 }
 
 /// Carries out an NTLM exchange with the parent that the system has begun, on
@@ -508,13 +526,13 @@ async fn ntlm_from_system(
     let (parts, body) = response.into_parts();
     let from_parent = ntlm::challenge(parts.headers.get_all(PROXY_AUTHENTICATE))?;
     let asked = service.clone();
-    let step = timeout(
+    let step = blocking(
         limit,
-        tokio::task::spawn_blocking(move || context.step(Some(&from_parent))),
+        "the system's NTLM",
+        "the answer to the NTLM challenge could not be made",
+        move || context.step(Some(&from_parent)),
     )
-    .await
-    .map_err(|_| Failure::ResponseTimeout("the system's NTLM"))?
-    .map_err(|_| Failure::Parent("the answer to the NTLM challenge could not be made"))??;
+    .await?;
     let token = step.token.ok_or(AuthError::Exchange {
         service: asked,
         reason: "the system had nothing to answer the NTLM challenge with".to_owned(),
@@ -545,13 +563,13 @@ async fn answer_challenge(
             Refusal::AnotherRound | Refusal::Rejected => Failure::TicketRejected { service },
         });
     };
-    let step = timeout(
+    let step = blocking(
         limit,
-        tokio::task::spawn_blocking(move || context.step(Some(&from_parent))),
+        "the Kerberos server",
+        "the answer to the parent's token could not be made",
+        move || context.step(Some(&from_parent)),
     )
-    .await
-    .map_err(|_| Failure::ResponseTimeout("the Kerberos server"))?
-    .map_err(|_| Failure::Parent("the answer to the parent's token could not be made"))??;
+    .await?;
     let token = step.token.ok_or(AuthError::Exchange {
         service,
         reason: "the system had nothing to answer the parent's token with".to_owned(),

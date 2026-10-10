@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use hyper::client::conn::http1::SendRequest;
+use hyper::client::conn::http1::{self, SendRequest};
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 use super::body::Body;
@@ -264,6 +265,24 @@ impl Upstreams {
         }
         Err(held_off.unwrap_or(Failure::Parent("there is nowhere to send the request")))
     }
+}
+
+/// Starts the HTTP/1 client driver on a connection to a parent proxy or an
+/// origin server. The driver also carries an upgrade, which is how a `CONNECT`
+/// answered with a success becomes a tunnel; for any other request it changes
+/// nothing.
+pub(super) async fn handshake(stream: TcpStream) -> Result<SendRequest<Body>, Failure> {
+    let (sender, connection) = http1::Builder::new()
+        .preserve_header_case(true)
+        .handshake(TokioIo::new(stream))
+        .await
+        .map_err(Failure::Upstream)?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.with_upgrades().await {
+            tracing::debug!(%err, "upstream connection ended with error");
+        }
+    });
+    Ok(sender)
 }
 
 /// The hops a PAC script chose, skipping the kinds gatir cannot use.
