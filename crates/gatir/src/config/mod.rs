@@ -27,7 +27,7 @@ pub use addr::{HostPort, HostPortError};
 pub use credentials::{AuthMethod, Credentials, NT_HASH_LEN, Secret};
 use credentials::{RawCredentials, SecretValue};
 pub use headers::HeaderRule;
-pub use location::{default_path, exposure};
+pub use location::{default_path, exposure, pac_dir};
 pub use socks5::{Socks5, Socks5Credentials};
 pub use tunnel::{Tunnel, TunnelError};
 

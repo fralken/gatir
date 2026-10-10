@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::ntlm::NtHash;
 
-use crate::config::{Config, Overrides};
+use crate::config::{Config, Overrides, PacLocation};
 use crate::logging;
 use crate::proxy::AttemptOutcome;
 
@@ -53,6 +53,74 @@ pub enum Command {
     /// Probe a real parent proxy for what it offers, and, if credentials are
     /// configured, which one it accepts: unlike `negotiate`, this contacts it
     Detect(DetectArgs),
+
+    /// Make a PAC script copy with local routes, and see what a script answers
+    #[command(subcommand)]
+    Pac(PacCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PacCommand {
+    /// Make a copy of a PAC script that sends some hosts to other proxies
+    ///
+    /// The hosts you name go to the proxies you name, and every other host is
+    /// left to the original script, which is kept as it is. It is for giving a
+    /// few destinations to another proxy without losing the rest of a script
+    /// that belongs to somebody else. The copy is a plain file: add hosts to it
+    /// by hand afterwards.
+    Generate(GenerateArgs),
+
+    /// Say which proxies a PAC script gives for some URLs
+    ///
+    /// With several --script they are shown side by side, which is how to see
+    /// what a copy changes. The names a script looks up are looked up for real.
+    Test(TestArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GenerateArgs {
+    /// The script to start from: a file, or an http:// or https:// address
+    #[arg(long, value_name = "FILE|URL")]
+    pub from: PacLocation,
+
+    /// A host that goes to the proxy list, repeated or separated by commas. A
+    /// name covers its sub-domains; * and ? match any text
+    #[arg(
+        long = "host",
+        required = true,
+        value_delimiter = ',',
+        value_name = "HOST"
+    )]
+    pub hosts: Vec<String>,
+
+    /// What those hosts get: DIRECT, or PROXY host:port, several separated by
+    /// semicolons, tried in order
+    #[arg(long, value_name = "LIST")]
+    pub proxy: String,
+
+    /// Where to write the copy: a file name alone goes in the `pac` folder next
+    /// to the configuration file, anything with a folder in it is the path as
+    /// written
+    #[arg(long, value_name = "NAME|PATH")]
+    pub output: PathBuf,
+
+    /// Replace the file if it exists (the old one is kept as NAME.prev)
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TestArgs {
+    /// What to ask the script about: a URL, or a host name, which is taken as
+    /// https://HOST/, the way gatir asks for a tunnel
+    #[arg(required = true, value_name = "URL")]
+    pub urls: Vec<String>,
+
+    /// A script to ask: a file, or an address. A file name alone is looked for
+    /// in the `pac` folder. Repeat it to compare. Without it, the script of the
+    /// configuration
+    #[arg(long = "script", value_name = "FILE|URL")]
+    pub scripts: Vec<PacLocation>,
 }
 
 #[derive(Debug, Args)]
@@ -110,6 +178,26 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Negotiate(args) => negotiate_check(&args),
+        Command::Pac(PacCommand::Generate(args)) => {
+            crate::pac_command::generate(&args, cli.config.as_deref())
+        }
+        Command::Pac(PacCommand::Test(args)) => {
+            let named = cli.config.clone();
+            let scripts = if args.scripts.is_empty() {
+                // Read, not started: this is a tool, with nothing to log.
+                let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
+                let config = source.read()?;
+                match config.pac {
+                    Some(pac) => vec![pac.location],
+                    None => anyhow::bail!(
+                        "the configuration has no PAC script to ask: name one with --script"
+                    ),
+                }
+            } else {
+                args.scripts.clone()
+            };
+            crate::pac_command::test(&args.urls, scripts, named.as_deref())
+        }
         Command::Detect(args) => {
             let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
             let config = load_config(&source)?;

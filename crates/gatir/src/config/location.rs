@@ -14,6 +14,14 @@ const SYSTEM_FILE: &str = "/etc/gatir/gatir.toml";
 
 /// The places to look, in order.
 fn candidates(config_home: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    let mut places = user_files(config_home, home);
+    #[cfg(unix)]
+    places.push(PathBuf::from(SYSTEM_FILE));
+    places
+}
+
+/// The user's own file, where it would be: in the places that are the user's.
+fn user_files(config_home: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
     let mut places = Vec::new();
     // A relative `XDG_CONFIG_HOME` is not to be honored (the XDG specification).
     let config_home = config_home
@@ -30,9 +38,29 @@ fn candidates(config_home: Option<OsString>, home: Option<OsString>) -> Vec<Path
     if let Some(dir) = std::env::var_os("APPDATA").filter(|dir| !dir.is_empty()) {
         places.push(PathBuf::from(dir).join(USER_FILE));
     }
-    #[cfg(unix)]
-    places.push(PathBuf::from(SYSTEM_FILE));
     places
+}
+
+/// The folder for PAC scripts that gatir writes, and that a script named by its
+/// file name alone is looked for in: `pac`, next to the configuration file that
+/// is named, or else next to the user's own (`~/.config/gatir`, or
+/// `%APPDATA%\gatir` on Windows). `None` if there is no telling where that is.
+pub fn pac_dir(config: Option<&Path>) -> Option<PathBuf> {
+    pac_dir_for(
+        config,
+        user_files(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        ),
+    )
+}
+
+fn pac_dir_for(config: Option<&Path>, user_files: Vec<PathBuf>) -> Option<PathBuf> {
+    let file = match config {
+        Some(file) => file.to_path_buf(),
+        None => user_files.into_iter().next()?,
+    };
+    Some(file.parent()?.join("pac"))
 }
 
 /// The first of `places` for which `is_file` says yes.
@@ -177,5 +205,35 @@ mod tests {
         let folder = dir.path().join("folder.toml");
         std::fs::create_dir(&folder).unwrap();
         assert_eq!(first_that_exists(vec![folder], Path::is_file), None);
+    }
+
+    #[test]
+    fn the_pac_folder_is_next_to_the_file_that_is_named_or_else_the_users() {
+        let user = vec![PathBuf::from("/home/u/.config/gatir/gatir.toml")];
+        assert_eq!(
+            pac_dir_for(Some(Path::new("/srv/x/gatir.toml")), user.clone()),
+            Some(PathBuf::from("/srv/x/pac"))
+        );
+        assert_eq!(
+            pac_dir_for(None, user),
+            Some(PathBuf::from("/home/u/.config/gatir/pac"))
+        );
+        // The file of the machine is not the user's to write in.
+        assert_eq!(pac_dir_for(None, Vec::new()), None);
+        // A file named without a folder is in the current one.
+        assert_eq!(
+            pac_dir_for(Some(Path::new("gatir.toml")), Vec::new()),
+            Some(PathBuf::from("pac"))
+        );
+    }
+
+    #[test]
+    fn the_user_files_leave_out_the_one_of_the_machine() {
+        let places = user_files(os("/home/u/.config"), None);
+        assert_eq!(
+            places.first(),
+            Some(&PathBuf::from("/home/u/.config/gatir/gatir.toml"))
+        );
+        assert!(!places.contains(&PathBuf::from("/etc/gatir/gatir.toml")));
     }
 }

@@ -62,10 +62,22 @@ Find out what a real parent proxy actually offers, and whether the configured cr
 \fBgatir detect \-\-parent proxy.example.com:8080 \-\-url http://example.com/\fR
 .fi
 .RE
+.PP
+Make a copy of a PAC script in which a few hosts go to other proxies, and see what it changes:
+.PP
+.RS 4
+.nf
+\fBgatir pac generate \-\-from https://pac.example.com/proxy.pac \-\-host ghcr.io \-\-proxy "PROXY a.example.com:80; PROXY b.example.com:80" \-\-output local.pac\fR
+\fBgatir pac test \-\-script ./original.pac \-\-script local.pac ghcr.io www.example.com\fR
+.fi
+.RE
 .SH FILES
 .TP
 \fI$XDG_CONFIG_HOME/gatir/gatir.toml\fR, \fI~/.config/gatir/gatir.toml\fR, \fI/etc/gatir/gatir.toml\fR
 The configuration file, when \fB\-\-config\fR is not given: the first of them that exists is read. On Windows, \fI%APPDATA%\\gatir\\gatir.toml\fR takes the place of the first two. The file may hold a password, so gatir warns when other users can read it, and when they can change it.
+.TP
+\fI$XDG_CONFIG_HOME/gatir/pac/\fR, \fI~/.config/gatir/pac/\fR
+Where \fBgatir pac generate\fR writes a copy of a script when it is given a file name alone, and where \fBgatir pac\fR looks for one named that way. It is the \fIpac\fR folder next to the configuration file named with \fB\-\-config\fR, if there is one. On Windows, \fI%APPDATA%\\gatir\\pac\fR.
 .TP
 \fI/usr/share/doc/gatir/\fR
 An example configuration (\fIexamples/gatir.example.toml\fR) and the documentation.
@@ -248,6 +260,9 @@ mod tests {
             "gatir-config-check.1",
             "gatir-negotiate.1",
             "gatir-detect.1",
+            "gatir-pac.1",
+            "gatir-pac-generate.1",
+            "gatir-pac-test.1",
         ] {
             assert!(names.contains(&expected), "{expected} in {names:?}");
         }

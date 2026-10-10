@@ -194,7 +194,7 @@ impl PacSource {
             (state.validators.clone(), state.bytes.clone())
         };
         let (bytes, validators) = match &self.settings.location {
-            PacLocation::File(path) => (read_file(path).await?, Validators::default()),
+            PacLocation::File(path) => (read_script_file(path).await?, Validators::default()),
             PacLocation::Url(address) => {
                 match fetch(address, self.settings.fetch_timeout, &known, &self.trust)
                     .await
@@ -224,7 +224,8 @@ impl PacSource {
     }
 }
 
-async fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+/// Reads a script from a file, up to the size a script may have.
+pub async fn read_script_file(path: &Path) -> Result<Vec<u8>, String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut bytes = Vec::new();
