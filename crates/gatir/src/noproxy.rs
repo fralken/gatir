@@ -1,13 +1,13 @@
 //! Destinations that bypass the parent proxy and are contacted directly.
 //!
 //! Each entry is either an IP address or CIDR range, matched against IP
-//! literals, or a case-insensitive glob (`*` any run of characters, `?` one
+//! literals, or a case-insensitive pattern (`*` any run of characters, `?` one
 //! character) matched against the host name. Ports are never part of the match.
 
 use std::net::IpAddr;
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ipnet::IpNet;
+use wildmatch::WildMatch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NoProxyError {
@@ -17,21 +17,12 @@ pub enum NoProxyError {
     Pattern { pattern: String, reason: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NoProxy {
     entries: Vec<String>,
     nets: Vec<IpNet>,
-    globs: GlobSet,
-}
-
-impl Default for NoProxy {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            nets: Vec::new(),
-            globs: GlobSet::empty(),
-        }
-    }
+    /// Lower-case, to be matched against a lower-cased host.
+    patterns: Vec<WildMatch>,
 }
 
 impl NoProxy {
@@ -42,38 +33,39 @@ impl NoProxy {
     {
         let mut kept = Vec::new();
         let mut nets = Vec::new();
-        let mut globs = GlobSetBuilder::new();
+        let mut patterns = Vec::new();
 
         for entry in entries {
             let entry = entry.as_ref().trim();
             if entry.is_empty() {
                 return Err(NoProxyError::Empty);
             }
-            if let Ok(ip) = entry.parse::<IpAddr>() {
+            // An IPv6 address may be written in brackets, as in a URL.
+            let unbracketed = entry
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or(entry);
+            if let Ok(ip) = unbracketed.parse::<IpAddr>() {
                 nets.push(IpNet::from(ip));
             } else if let Ok(net) = entry.parse::<IpNet>() {
                 nets.push(net.trunc());
+            } else if let Some(character) = entry.chars().find(|c| "[]{}".contains(*c)) {
+                // A class or an alternative in a glob library: not here, where
+                // only `*` and `?` mean anything, and a typo should be told.
+                return Err(NoProxyError::Pattern {
+                    pattern: entry.to_owned(),
+                    reason: format!("{character:?} is not supported: only * and ? are wildcards"),
+                });
             } else {
-                let glob = GlobBuilder::new(entry)
-                    .case_insensitive(true)
-                    .build()
-                    .map_err(|err| NoProxyError::Pattern {
-                        pattern: entry.to_owned(),
-                        reason: err.kind().to_string(),
-                    })?;
-                globs.add(glob);
+                patterns.push(WildMatch::new(&entry.to_ascii_lowercase()));
             }
             kept.push(entry.to_owned());
         }
 
-        let globs = globs.build().map_err(|err| NoProxyError::Pattern {
-            pattern: kept.join(", "),
-            reason: err.to_string(),
-        })?;
         Ok(Self {
             entries: kept,
             nets,
-            globs,
+            patterns,
         })
     }
 
@@ -102,7 +94,8 @@ impl NoProxy {
             }
         }
         // Also applied to IP literals so that patterns such as `10.*` work.
-        self.globs.is_match(host)
+        let host = host.to_ascii_lowercase();
+        self.patterns.iter().any(|pattern| pattern.matches(&host))
     }
 }
 
@@ -169,7 +162,7 @@ mod tests {
 
     #[test]
     fn cidr_entries_match_ip_literals() {
-        let list = no_proxy(&["172.16.0.0/12", "192.0.2.7", "fe80::/10", "::1"]);
+        let list = no_proxy(&["172.16.0.0/12", "192.0.2.7", "fe80::/10", "[::1]"]);
         for (host, expected) in [
             ("172.16.0.1", true),
             ("172.31.255.255", true),
@@ -206,7 +199,9 @@ mod tests {
     fn rejects_empty_and_malformed_entries() {
         assert!(matches!(NoProxy::new([""]), Err(NoProxyError::Empty)));
         assert!(matches!(NoProxy::new(["  "]), Err(NoProxyError::Empty)));
-        let err = NoProxy::new(["ok.example.com", "[unclosed"]).unwrap_err();
-        assert!(err.to_string().contains("[unclosed"), "{err}");
+        for entry in ["[unclosed", "[ab].example.com", "{a,b}.example.com"] {
+            let err = NoProxy::new(["ok.example.com", entry]).unwrap_err();
+            assert!(err.to_string().contains(entry), "{err}");
+        }
     }
 }
