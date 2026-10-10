@@ -308,7 +308,7 @@ pub(super) async fn serve(mut client: TcpStream, peer: SocketAddr, context: Arc<
     .await;
     let code = match reached {
         Ok(Reached::Open(upstream)) => {
-            let bound = upstream.local_addr().unwrap_or(NO_ADDRESS);
+            let bound = tunnel::local_addr(&upstream).unwrap_or(NO_ADDRESS);
             if send_reply(&mut client, REPLY_SUCCEEDED, bound)
                 .await
                 .is_err()

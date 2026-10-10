@@ -6,19 +6,16 @@
 //! peer ended or announced it would close, and [`Pool::take`] skips those.
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
+use hyper::body::{Body as HttpBody, Incoming};
 use hyper::client::conn::http1::SendRequest;
 use tokio::time::timeout;
 
-use super::body::Body;
+use super::body::{Body, OnEnd};
 use super::upstream::Hop;
 
 /// How long an idle connection may wait to be reused. Servers commonly close
@@ -137,79 +134,15 @@ pub(super) struct Lease {
 
 impl Lease {
     /// Wraps the response body so that the connection returns to `pool` once
-    /// the whole body has been relayed.
+    /// the whole body has been relayed. If the body fails or is dropped first,
+    /// the connection is simply closed.
     pub(super) fn attach(self, pool: &Arc<Pool>, body: Incoming) -> Body {
-        let release = Release {
-            pool: pool.clone(),
-            key: self.key,
-            sender: self.sender,
-            epoch: self.epoch,
-        };
+        let pool = pool.clone();
+        let give_back = move || pool.put(self.key, self.sender, self.epoch);
         if body.is_end_stream() {
-            release.give_back();
+            give_back();
             return body.boxed_unsync();
         }
-        PooledBody {
-            inner: body,
-            release: Some(release),
-        }
-        .boxed_unsync()
-    }
-}
-
-struct Release {
-    pool: Arc<Pool>,
-    key: PoolKey,
-    sender: SendRequest<Body>,
-    epoch: u64,
-}
-
-impl Release {
-    fn give_back(self) {
-        self.pool.put(self.key, self.sender, self.epoch);
-    }
-}
-
-/// A response body that hands its connection back to the pool when it ends.
-/// If it is dropped or fails first, the connection is simply closed.
-struct PooledBody {
-    inner: Incoming,
-    release: Option<Release>,
-}
-
-impl HttpBody for PooledBody {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
-        let poll = Pin::new(&mut self.inner).poll_frame(cx);
-        match &poll {
-            Poll::Ready(None) => self.give_back(),
-            // A body with a known length is complete after its last frame, and
-            // hyper may never poll it again.
-            Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => self.give_back(),
-            Poll::Ready(Some(Err(_))) => self.release = None,
-            _ => {}
-        }
-        poll
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl PooledBody {
-    fn give_back(&mut self) {
-        if let Some(release) = self.release.take() {
-            release.give_back();
-        }
+        OnEnd::new(body, give_back).boxed_unsync()
     }
 }

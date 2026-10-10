@@ -1,6 +1,5 @@
 //! CONNECT tunnels: an opaque byte pipe between the client and a destination.
 
-use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional};
 use tokio::net::TcpStream;
+use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 
 use super::body::{Body, answer_within, full};
@@ -78,62 +78,16 @@ async fn open(
     Ok(Response::new(full(Bytes::new())))
 }
 
-/// A connection that carries bytes to a destination.
-pub(super) enum Upstream {
-    /// Straight to the destination.
-    Direct(TcpStream),
-    /// A parent proxy agreed to open a tunnel: the connection is now a pipe to
-    /// the destination.
-    Tunnel(TokioIo<Upgraded>),
-}
+/// A connection that carries bytes to a destination: straight to it, or, once
+/// a parent proxy has agreed to open a tunnel, the connection to the parent
+/// that is now a pipe to the destination.
+pub(super) type Upstream = Either<TcpStream, TokioIo<Upgraded>>;
 
-impl Upstream {
-    /// The local address of a direct connection.
-    pub(super) fn local_addr(&self) -> Option<SocketAddr> {
-        match self {
-            Self::Direct(stream) => stream.local_addr().ok(),
-            Self::Tunnel(_) => None,
-        }
-    }
-}
-
-impl AsyncRead for Upstream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Direct(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for Upstream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Direct(stream) => Pin::new(stream).poll_write(cx, data),
-            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_write(cx, data),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Direct(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Direct(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tunnel(upgraded) => Pin::new(upgraded).poll_shutdown(cx),
-        }
+/// The local address of a direct connection.
+pub(super) fn local_addr(upstream: &Upstream) -> Option<SocketAddr> {
+    match upstream {
+        Either::Left(stream) => stream.local_addr().ok(),
+        Either::Right(_) => None,
     }
 }
 
@@ -180,7 +134,7 @@ pub(super) async fn reach(
             .await
             .map_err(|failure| failure.after(std::mem::take(&mut tried)))?;
         let Hop::Parent(parent) = &hop else {
-            return Ok(Reached::Open(Upstream::Direct(stream)));
+            return Ok(Reached::Open(Either::Left(stream)));
         };
         match connect_through_parent(
             stream,
@@ -372,7 +326,7 @@ async fn connect_through_parent(
         let upgraded = hyper::upgrade::on(response)
             .await
             .map_err(Failure::Upstream)?;
-        return Ok(Reached::Open(Upstream::Tunnel(TokioIo::new(upgraded))));
+        return Ok(Reached::Open(Either::Right(TokioIo::new(upgraded))));
     }
 
     let (mut parts, body) = response.into_parts();

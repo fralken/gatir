@@ -71,27 +71,32 @@ pub(super) fn watch(body: Body) -> (Body, Sent) {
         return (body, Sent::already());
     }
     let (sender, receiver) = oneshot::channel();
-    let watched = Watched {
-        inner: body,
-        sender: Some(sender),
-    };
+    let watched = OnEnd::new(body, move || {
+        let _ = sender.send(());
+    });
     (watched.boxed_unsync(), Sent(Some(receiver)))
 }
 
-struct Watched {
-    inner: Body,
-    sender: Option<oneshot::Sender<()>>,
+/// A body that runs `done` once, when the whole of it has been read. If it
+/// fails or is dropped first, `done` is dropped without running.
+pub(super) struct OnEnd<B> {
+    inner: B,
+    done: Option<Box<dyn FnOnce() + Send>>,
 }
 
-impl Watched {
-    fn finish(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(());
+impl<B> OnEnd<B> {
+    pub(super) fn new(inner: B, done: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            done: Some(Box::new(done)),
         }
     }
 }
 
-impl HttpBody for Watched {
+impl<B> HttpBody for OnEnd<B>
+where
+    B: HttpBody<Data = Bytes, Error = hyper::Error> + Unpin,
+{
     type Data = Bytes;
     type Error = hyper::Error;
 
@@ -101,10 +106,11 @@ impl HttpBody for Watched {
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let poll = Pin::new(&mut self.inner).poll_frame(cx);
         match &poll {
+            // A body with a known length is complete after its last frame, and
+            // hyper may never poll it again.
             Poll::Ready(None) => self.finish(),
-            // A body with a known length is complete after its last frame,
-            // and hyper may never poll it again.
             Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => self.finish(),
+            Poll::Ready(Some(Err(_))) => self.done = None,
             _ => {}
         }
         poll
@@ -116,6 +122,14 @@ impl HttpBody for Watched {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+impl<B> OnEnd<B> {
+    fn finish(&mut self) {
+        if let Some(done) = self.done.take() {
+            done();
+        }
     }
 }
 
