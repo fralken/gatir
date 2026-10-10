@@ -55,7 +55,7 @@ The cost is C code in the process. It is Fabrice Bellard's QuickJS (MIT), widely
 used, and it is kept behind `pac::engine`: nothing else in gatir calls into it.
 What limits the damage a bad script can do:
 
-- time, memory and stack limits on every evaluation, configurable;
+- time, memory and stack limits on every evaluation;
 - the one runaway the engine cannot interrupt is caught from outside: the worker
   is given up on and replaced, and after too many, the script is declared broken
   and requests get an error that says so;

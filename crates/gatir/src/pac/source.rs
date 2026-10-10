@@ -16,6 +16,11 @@ use super::fetch::{Fetched, Trust, Validators, fetch};
 use super::{MAX_SCRIPT_BYTES, Pac, PacEnv, PacError, PacLimits, SystemResolver};
 use crate::config::{PacConfig, PacLocation};
 
+/// How long a script waits for a name lookup.
+const DNS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long an answer to a name lookup is remembered.
+const DNS_TTL: Duration = Duration::from_secs(60);
+
 /// The wait after a first failure. It doubles with every one that follows,
 /// up to the refresh interval.
 const FIRST_RETRY: Duration = Duration::from_secs(5);
@@ -57,14 +62,9 @@ impl PacSource {
     /// Like [`PacSource::start`], with `trust` deciding which certificate
     /// authorities an `https://` address may chain to.
     pub async fn start_with(settings: &PacConfig, trust: Trust) -> io::Result<Arc<Self>> {
-        let resolver = Arc::new(SystemResolver::new(settings.dns_timeout, settings.dns_ttl));
+        let resolver = Arc::new(SystemResolver::new(DNS_TIMEOUT, DNS_TTL));
         let source = Arc::new(Self {
-            limits: PacLimits {
-                time: settings.time_limit,
-                memory: settings.memory_limit,
-                workers: settings.workers,
-                ..PacLimits::default()
-            },
+            limits: PacLimits::default(),
             env: PacEnv::system(resolver),
             trust,
             settings: settings.clone(),

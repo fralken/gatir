@@ -43,6 +43,9 @@ const MAX_HEADERS: usize = 100;
 /// how. Every request, tunnel and SOCKS5 client works on the one it found when
 /// it began, so a reload never changes what is under it.
 pub(super) struct Live {
+    /// Idle connections to origin servers and parents. Each set of settings has
+    /// its own: see [`Pool`].
+    pub pool: Arc<Pool>,
     pub access: Acl,
     pub timeouts: Timeouts,
     pub upstreams: Upstreams,
@@ -65,8 +68,6 @@ type LiveCell = Arc<RwLock<Arc<Live>>>;
 /// State shared by every connection of a running server.
 pub(super) struct Context {
     live: LiveCell,
-    /// Idle connections to origin servers and parents, shared by all clients.
-    pub pool: Arc<Pool>,
     /// Every task serving a client, so shutdown can wait for them.
     pub tracker: TaskTracker,
     /// Cancelled to begin a graceful shutdown: stop accepting, finish what is
@@ -145,6 +146,7 @@ async fn build_live(
         pac.as_ref().map(|(_, source)| source.clone()),
     );
     let live = Live {
+        pool: Arc::new(Pool::default()),
         access: config.access.clone(),
         timeouts: config.timeouts.clone(),
         upstreams,
@@ -166,7 +168,6 @@ async fn build_live(
 #[derive(Clone)]
 pub struct Reloader {
     live: LiveCell,
-    pool: Arc<Pool>,
     tokens: Option<Arc<dyn TokenSource>>,
     trust: Trust,
     /// What the server was started with, and no reload can change.
@@ -193,12 +194,10 @@ impl Reloader {
         let (live, kept_script) =
             build_live(config, Some(&previous), &self.tokens, &self.trust).await?;
 
-        // First the settings, then the pool: a request reads them the other way
-        // round, so a connection is never taken for newer than it is.
+        // The new settings come with a pool of their own: connections opened
+        // under the old ones may have authenticated as someone else, or lead to
+        // another parent, so none is reused.
         *self.live.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(live);
-        // Connections opened under the old settings may have authenticated as
-        // someone else, or lead to another parent: none is reused.
-        self.pool.clear();
         // A script that stayed is looked at now: reloading is also how a person
         // says that it changed.
         if let Some(script) = kept_script {
@@ -216,7 +215,6 @@ pub struct Server {
     /// SOCKS5 listeners.
     socks5: Vec<TcpListener>,
     live: LiveCell,
-    pool: Arc<Pool>,
     reloader: Reloader,
 }
 
@@ -278,21 +276,18 @@ impl Server {
             }
         }
         let live: LiveCell = Arc::new(RwLock::new(Arc::new(live)));
-        let pool = Arc::new(Pool::default());
         Ok(Self {
             listeners,
             tunnels,
             socks5,
             reloader: Reloader {
                 live: live.clone(),
-                pool: pool.clone(),
                 tokens,
                 trust,
                 fixed: config.fixed(),
                 turn: Arc::new(tokio::sync::Mutex::new(())),
             },
             live,
-            pool,
         })
     }
 
@@ -335,7 +330,6 @@ impl Server {
     pub async fn run(self, shutdown: CancellationToken, force: CancellationToken) {
         let context = Arc::new(Context {
             live: self.live,
-            pool: self.pool,
             tracker: TaskTracker::new(),
             shutdown: shutdown.clone(),
             force: force.clone(),

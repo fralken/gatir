@@ -302,7 +302,9 @@ impl std::fmt::Debug for PacLocation {
     }
 }
 
-/// Where the PAC script comes from, its limits, and its name lookups.
+/// Where the PAC script comes from, and how often it is looked at. What the
+/// script may use (time, memory, name lookups) is not configurable: see
+/// `pac::PacLimits`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacConfig {
     pub location: PacLocation,
@@ -310,16 +312,6 @@ pub struct PacConfig {
     pub refresh: Duration,
     /// How long to wait for a PAC script to be fetched from an address.
     pub fetch_timeout: Duration,
-    /// How long one evaluation may take.
-    pub time_limit: Duration,
-    /// Memory one script engine may use, in bytes.
-    pub memory_limit: usize,
-    /// Script engines, so that this many evaluations can run at once.
-    pub workers: usize,
-    /// How long a script waits for a name lookup.
-    pub dns_timeout: Duration,
-    /// How long an answer to a name lookup is remembered.
-    pub dns_ttl: Duration,
 }
 
 impl PacConfig {
@@ -333,11 +325,6 @@ impl PacConfig {
             location,
             refresh,
             fetch_timeout: Duration::from_secs(15),
-            time_limit: Duration::from_secs(5),
-            memory_limit: 64 * 1024 * 1024,
-            workers: 4,
-            dns_timeout: Duration::from_secs(2),
-            dns_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -349,11 +336,6 @@ struct RawPac {
     url: Option<String>,
     refresh_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
-    time_limit_ms: Option<u64>,
-    memory_limit_mb: Option<u64>,
-    workers: Option<u64>,
-    dns_timeout_ms: Option<u64>,
-    dns_ttl_secs: Option<u64>,
 }
 
 fn within(name: &str, value: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
@@ -405,21 +387,6 @@ impl RawPac {
         }
         if let Some(secs) = self.fetch_timeout_secs {
             pac.fetch_timeout = Duration::from_secs(within("fetch_timeout_secs", secs, 1, 300)?);
-        }
-        if let Some(ms) = self.time_limit_ms {
-            pac.time_limit = Duration::from_millis(within("time_limit_ms", ms, 10, 60_000)?);
-        }
-        if let Some(mb) = self.memory_limit_mb {
-            pac.memory_limit = within("memory_limit_mb", mb, 4, 1024)? as usize * 1024 * 1024;
-        }
-        if let Some(workers) = self.workers {
-            pac.workers = within("workers", workers, 1, 32)? as usize;
-        }
-        if let Some(ms) = self.dns_timeout_ms {
-            pac.dns_timeout = Duration::from_millis(within("dns_timeout_ms", ms, 10, 30_000)?);
-        }
-        if let Some(secs) = self.dns_ttl_secs {
-            pac.dns_ttl = Duration::from_secs(within("dns_ttl_secs", secs, 1, 86_400)?);
         }
         Ok(pac)
     }
@@ -1437,21 +1404,6 @@ mod tests {
     }
 
     #[test]
-    fn the_limits_of_a_pac_script_can_be_set() {
-        let config = load(
-            "[pac]\nfile = \"p.pac\"\ntime_limit_ms = 750\nmemory_limit_mb = 16\nworkers = 2\n\
-             dns_timeout_ms = 300\ndns_ttl_secs = 5",
-        )
-        .unwrap();
-        let pac = config.pac.unwrap();
-        assert_eq!(pac.time_limit, Duration::from_millis(750));
-        assert_eq!(pac.memory_limit, 16 * 1024 * 1024);
-        assert_eq!(pac.workers, 2);
-        assert_eq!(pac.dns_timeout, Duration::from_millis(300));
-        assert_eq!(pac.dns_ttl, Duration::from_secs(5));
-    }
-
-    #[test]
     fn rejects_a_pac_table_that_makes_no_sense() {
         for (toml, expected) in [
             ("[pac]", "pac.file or pac.url is required"),
@@ -1474,26 +1426,7 @@ mod tests {
                 "pac.fetch_timeout_secs must be between",
             ),
             ("[pac]\nfile = \"\"", "pac.file must not be empty"),
-            (
-                "[pac]\nfile = \"p\"\ntime_limit_ms = 1",
-                "pac.time_limit_ms must be between",
-            ),
-            (
-                "[pac]\nfile = \"p\"\nmemory_limit_mb = 0",
-                "pac.memory_limit_mb must be between",
-            ),
-            (
-                "[pac]\nfile = \"p\"\nworkers = 0",
-                "pac.workers must be between",
-            ),
-            (
-                "[pac]\nfile = \"p\"\nworkers = 999",
-                "pac.workers must be between",
-            ),
-            (
-                "[pac]\nfile = \"p\"\ndns_ttl_secs = 0",
-                "pac.dns_ttl_secs must be between",
-            ),
+            ("[pac]\nfile = \"p\"\nworkers = 2", "unknown field"),
             ("[pac]\nfile = \"p\"\nspeed = 1", "unknown field"),
             (
                 "parents = [\"a.example.com:1\"]\n[pac]\nfile = \"p\"",
@@ -1534,9 +1467,9 @@ mod tests {
         assert!(config.parents.is_empty());
         assert_eq!(config.pac.unwrap().location, file_location("cli.pac"));
 
-        // A script named on the command line keeps the limits set in the file.
+        // A script named on the command line keeps the settings of the file.
         let config = Config::from_toml_str(
-            "[pac]\nfile = \"file.pac\"\nworkers = 2",
+            "[pac]\nfile = \"file.pac\"\nrefresh_secs = 7",
             Overrides {
                 pac: Some(file_location("cli.pac")),
                 ..Overrides::default()
@@ -1544,7 +1477,10 @@ mod tests {
         )
         .unwrap();
         let pac = config.pac.unwrap();
-        assert_eq!((pac.location, pac.workers), (file_location("cli.pac"), 2));
+        assert_eq!(
+            (pac.location, pac.refresh),
+            (file_location("cli.pac"), Duration::from_secs(7))
+        );
 
         // An address on the command line takes the place of a file in the file.
         let config = Config::from_toml_str(

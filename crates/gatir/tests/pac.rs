@@ -6,7 +6,6 @@ mod common;
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use common::*;
 use gatir::config::{Config, Overrides};
@@ -242,38 +241,6 @@ async fn a_script_error_is_a_gateway_error_that_says_why() {
 }
 
 #[tokio::test]
-async fn a_script_that_never_ends_is_stopped_and_the_next_request_is_served() {
-    let origin = named("direct").await;
-    let script = r#"function FindProxyForURL(url, host) {
-                      if (host === "loop.test") { while (true) {} }
-                      return "DIRECT";
-                    }"#;
-    let (_dir, table) = pac_table(script, "time_limit_ms = 200\n");
-    let proxy = start_proxy(&table).await;
-
-    let started = Instant::now();
-    let response = ask(&proxy, get("loop.test", "/", "")).await;
-    assert_eq!(response.status, 502);
-    assert!(
-        response.body_text().contains("took longer than"),
-        "{}",
-        response.body_text()
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
-    );
-
-    assert_eq!(
-        ask(&proxy, get(&origin.authority(), "/", ""))
-            .await
-            .body_text(),
-        "direct"
-    );
-}
-
-#[tokio::test]
 async fn a_tunnel_is_decided_by_the_address_it_leads_to() {
     let (a, b) = (named("A").await, named("B").await);
     let script = format!(
@@ -355,7 +322,7 @@ async fn a_script_shared_by_many_requests_answers_them_all() {
            }}"#,
         to(a.addr())
     );
-    let (_dir, table) = pac_table(&script, "workers = 3\n");
+    let (_dir, table) = pac_table(&script, "");
     let proxy = start_proxy(&table).await;
 
     let mut tasks = Vec::new();

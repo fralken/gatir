@@ -100,20 +100,13 @@ on its last day.
 
 ## Limits, and what happens when they are hit
 
-```toml
-[pac]
-file = "proxy.pac"
-time_limit_ms = 5000      # one evaluation, name lookups included
-memory_limit_mb = 64      # per script engine
-workers = 4               # evaluations that can run at once
-dns_timeout_ms = 2000     # how long a lookup is waited for
-dns_ttl_secs = 60         # how long an answer is remembered
-```
-
 A script that loops for ever, recurses without end, eats memory or runs a
-pathological regular expression is stopped. A loop inside a built-in function
-cannot be interrupted from inside; its worker is given up on and replaced, and
-after four of them the script is declared broken.
+pathological regular expression is stopped. The limits are fixed: one
+evaluation may take 5 seconds (name lookups included) and 64 MB, and four
+evaluations can run at once. A name lookup is waited for 2 seconds, and its
+answer is remembered for 60. A loop inside a built-in function cannot be
+interrupted from inside; its worker is given up on and replaced, and after four
+of them the script is declared broken.
 
 What is wrong with a file is found at start-up: gatir does not start if the
 file is missing, too large (over 16 MB), has a syntax error or does not define
