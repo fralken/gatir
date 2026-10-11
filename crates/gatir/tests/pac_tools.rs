@@ -385,7 +385,8 @@ fn a_file_name_alone_that_is_not_in_the_pac_folder_says_where_it_looked() {
         .assert()
         .failure()
         .stdout(
-            predicate::str::contains("pac/original.pac")
+            predicate::str::contains("original.pac")
+                .and(predicate::str::contains("pac folder"))
                 .and(predicate::str::contains("write ./NAME")),
         );
 }

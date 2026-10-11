@@ -14,6 +14,8 @@ const SYSTEM_FILE: &str = "/etc/gatir/gatir.toml";
 
 /// The places to look, in order.
 fn candidates(config_home: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    // The machine's own file is only on Unix, so only there is it added.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut places = user_files(config_home, home);
     #[cfg(unix)]
     places.push(PathBuf::from(SYSTEM_FILE));
@@ -212,11 +214,11 @@ mod tests {
         let user = vec![PathBuf::from("/home/u/.config/gatir/gatir.toml")];
         assert_eq!(
             pac_dir_for(Some(Path::new("/srv/x/gatir.toml")), user.clone()),
-            Some(PathBuf::from("/srv/x/pac"))
+            Some(Path::new("/srv/x").join("pac"))
         );
         assert_eq!(
             pac_dir_for(None, user),
-            Some(PathBuf::from("/home/u/.config/gatir/pac"))
+            Some(Path::new("/home/u/.config/gatir").join("pac"))
         );
         // The file of the machine is not the user's to write in.
         assert_eq!(pac_dir_for(None, Vec::new()), None);
@@ -227,6 +229,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_user_files_leave_out_the_one_of_the_machine() {
         let places = user_files(os("/home/u/.config"), None);

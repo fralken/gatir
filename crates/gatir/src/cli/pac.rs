@@ -501,7 +501,7 @@ mod tests {
         let config = Path::new("/srv/gatir/gatir.toml");
         assert_eq!(
             in_pac_dir(Path::new("a.pac"), Some(config)).unwrap(),
-            PathBuf::from("/srv/gatir/pac/a.pac")
+            Path::new("/srv/gatir").join("pac").join("a.pac")
         );
         assert_eq!(
             in_pac_dir(Path::new("/tmp/a.pac"), Some(config)).unwrap(),
