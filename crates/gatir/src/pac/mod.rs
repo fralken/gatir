@@ -15,6 +15,7 @@ mod overrides;
 mod resolver;
 mod route;
 mod source;
+mod system;
 
 pub use engine::{Pac, PacEnv, PacError, PacLimits};
 pub use fetch::{FetchError, Fetched, Trust, Validators, fetch};
@@ -22,6 +23,9 @@ pub use overrides::{OverrideError, PacOverride, check, load_script, tool_limits,
 pub use resolver::{Resolver, SystemResolver, system_local_addresses};
 pub use route::{Parsed, ProxyAddr, Route, parse};
 pub use source::{PacSource, read_script_file};
+pub use system::{
+    OperatingSystem, SystemPac, SystemPacError, is_supported as system_pac_is_supported,
+};
 
 /// The most a PAC script may weigh.
 const MAX_SCRIPT_BYTES: usize = 16 * 1024 * 1024;

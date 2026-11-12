@@ -9,6 +9,8 @@ or through which proxies. gatir runs it in place of a fixed list of parents.
 file = "proxy.pac"        # relative to this file, or absolute
 # or, instead of a file:
 url = "http://wpad.example.com/proxy.pac"
+# or, on macOS, the address the system is set to use:
+system = true
 ```
 
 or `gatir run --pac proxy.pac`, where anything that starts with `http://` or
@@ -26,9 +28,34 @@ The script is read when gatir starts and again at a fixed interval:
 ```toml
 [pac]
 url = "http://wpad.example.com/proxy.pac"
-refresh_secs = 3600       # how often to look again (60 for a file)
+refresh_secs = 3600       # how often to look again (60 for a file, and for the system's)
 fetch_timeout_secs = 15   # for the whole fetch, redirects included
 ```
+
+### The script of the system (macOS)
+
+`system = true` takes the address from the "Automatic Proxy Configuration" of
+the network settings (System Settings, Network, Proxies), which gatir asks of
+the system, so that the address does not have to be copied into the
+configuration. It is asked again at every look at the script, and a script that
+the company's tools serve from an address that changes (a name with a hash in
+it, say) is followed: the next look fetches the new one, and what the old
+address said about its script (its `ETag`) is not sent to the new. The
+interval is the one of a file, 60 seconds, because asking the system costs
+nothing and a script that has not changed is not fetched again.
+
+`system` is one of `file`, `url` and `system`: naming two is refused. If the
+system is not set to use a script, or gives no address, or one that is not
+`http://` or `https://`, gatir says so in the log and in the 502 it answers
+while it has no script, and keeps the last script that worked. Starting gatir
+before the setting is made is not an error. The overrides work as with any
+script, and `gatir pac test` and `gatir pac export` use the address the system
+gives at that moment (`export` says which in its `from:` line).
+
+Other systems are not supported yet: a Linux desktop has no one place for the
+setting (it depends on the desktop), and for Windows it is to come. There
+`system = true` is refused when the configuration is read, which says to name
+the script with `file` or `url`.
 
 A version of the script that cannot be read, or does not load, never replaces
 the one in use. The problem is logged, the last version that worked stays in

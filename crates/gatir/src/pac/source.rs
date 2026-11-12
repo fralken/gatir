@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use super::fetch::{Fetched, Trust, Validators, fetch};
+use super::system::{OperatingSystem, SystemPac};
 use super::{
     MAX_SCRIPT_BYTES, Pac, PacEnv, PacError, PacLimits, PacOverride, SystemResolver, load_script,
     wrap,
@@ -41,6 +42,9 @@ struct State {
     bytes: Vec<u8>,
     /// What is added to the script when it is loaded.
     overrides: Vec<PacOverride>,
+    /// Where the script was read from the last time, when the system says where
+    /// it is: what the validators belong to.
+    resolved: Option<PacLocation>,
     validators: Validators,
     /// Why the latest attempt failed, if it did.
     failed: Option<String>,
@@ -53,6 +57,8 @@ pub struct PacSource {
     limits: PacLimits,
     env: PacEnv,
     trust: Trust,
+    /// Where the system says the script is, for `PacLocation::System`.
+    system: Arc<dyn SystemPac>,
     state: Mutex<State>,
     /// Held while the script is looked at, so that two looks never overlap.
     looking: tokio::sync::Mutex<()>,
@@ -64,19 +70,26 @@ impl PacSource {
     /// A file that cannot be used is an error, so that a wrong path or a typo
     /// shows up when gatir starts. An address that cannot be used is not: the
     /// network may simply not be there yet, and gatir keeps trying while
-    /// requests are told why nothing is chosen.
+    /// requests are told why nothing is chosen. Nor is a system that is not
+    /// set to use a script yet.
     pub async fn start(settings: &PacConfig) -> io::Result<Arc<Self>> {
-        Self::start_with(settings, Trust::system()).await
+        Self::start_with(settings, Trust::system(), Arc::new(OperatingSystem)).await
     }
 
     /// Like [`PacSource::start`], with `trust` deciding which certificate
-    /// authorities an `https://` address may chain to.
-    pub async fn start_with(settings: &PacConfig, trust: Trust) -> io::Result<Arc<Self>> {
+    /// authorities an `https://` address may chain to, and `system` saying
+    /// where the script of the system is.
+    pub async fn start_with(
+        settings: &PacConfig,
+        trust: Trust,
+        system: Arc<dyn SystemPac>,
+    ) -> io::Result<Arc<Self>> {
         let resolver = Arc::new(SystemResolver::new(DNS_TIMEOUT, DNS_TTL));
         let source = Arc::new(Self {
             limits: PacLimits::default(),
             env: PacEnv::system(resolver),
             trust,
+            system,
             settings: settings.clone(),
             state: Mutex::new(State {
                 overrides: settings.overrides.clone(),
@@ -92,7 +105,7 @@ impl PacSource {
                         format!("cannot use the PAC file {}: {reason}", settings.location),
                     ));
                 }
-                PacLocation::Url(_) => tracing::warn!(
+                PacLocation::Url(_) | PacLocation::System => tracing::warn!(
                     pac = %settings.location,
                     %reason,
                     "cannot load the PAC script yet, trying again in the background"
@@ -135,9 +148,12 @@ impl PacSource {
     /// Looks at the script now, and says in the log what came of it.
     async fn refresh_and_report(&self) {
         if let Err(reason) = self.refresh().await {
-            let kept = self.lock().pac.is_some();
+            let (kept, pac) = {
+                let state = self.lock();
+                (state.pac.is_some(), self.shown(&state))
+            };
             tracing::warn!(
-                pac = %self.settings.location,
+                pac = %pac,
                 %reason,
                 retry_in_secs = self.next_wait().as_secs(),
                 "cannot refresh the PAC script{}",
@@ -146,11 +162,30 @@ impl PacSource {
         }
     }
 
+    /// Where the system says the script is now.
+    async fn system_location(&self) -> Result<PacLocation, String> {
+        let system = self.system.clone();
+        tokio::task::spawn_blocking(move || system.location())
+            .await
+            .map_err(|err| format!("the settings of the system could not be read: {err}"))?
+            .map_err(|err| err.to_string())
+    }
+
     /// Looks at the script now instead of at the next time, in the
     /// background. What it finds, or why it found nothing, goes to the log.
     pub fn refresh_soon(self: &Arc<Self>) {
         let source = self.clone();
         tokio::spawn(async move { source.refresh_and_report().await });
+    }
+
+    /// Where the script comes from, for the log and for the comment in the
+    /// block of overrides: the address the system gave, when it is the system
+    /// that says.
+    fn shown(&self, state: &State) -> String {
+        match (&self.settings.location, &state.resolved) {
+            (PacLocation::System, Some(resolved)) => resolved.to_string(),
+            (location, _) => location.to_string(),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -181,7 +216,7 @@ impl PacSource {
                 if let Some((pac, bytes, validators)) = update {
                     let first = state.pac.is_none();
                     tracing::info!(
-                        pac = %self.settings.location,
+                        pac = %self.shown(&state),
                         size = bytes.len(),
                         overrides = state.overrides.len(),
                         "PAC script {}",
@@ -203,7 +238,8 @@ impl PacSource {
 
     /// Loads `script` with `overrides` added to it, as it would be used.
     async fn load(&self, script: &[u8], overrides: &[PacOverride]) -> Result<Pac, String> {
-        let wrapped = wrap(script, overrides, &self.settings.location.to_string());
+        let from = self.shown(&self.lock());
+        let wrapped = wrap(script, overrides, &from);
         // Scripts written years ago are not always UTF-8: `load_script` reads
         // them as well as it can.
         load_script(&wrapped, self.limits.clone(), self.env.clone())
@@ -237,7 +273,7 @@ impl PacSource {
         if loaded.is_some() {
             state.pac = loaded;
             tracing::info!(
-                pac = %self.settings.location,
+                pac = %self.shown(&state),
                 overrides = overrides.len(),
                 "PAC script loaded again with new overrides"
             );
@@ -247,11 +283,25 @@ impl PacSource {
 
     /// The script to switch to, if what was read is not the one in use.
     async fn read_and_load(&self) -> Result<Option<(Pac, Vec<u8>, Validators)>, String> {
+        let system = self.settings.location == PacLocation::System;
+        let location = if system {
+            self.system_location().await?
+        } else {
+            self.settings.location.clone()
+        };
         let (known, current) = {
-            let state = self.lock();
+            let mut state = self.lock();
+            // Validators are those of an address: the system may have pointed
+            // somewhere else since.
+            if system {
+                if state.resolved.as_ref() != Some(&location) {
+                    state.validators = Validators::default();
+                }
+                state.resolved = Some(location.clone());
+            }
             (state.validators.clone(), state.bytes.clone())
         };
-        let (bytes, validators) = match &self.settings.location {
+        let (bytes, validators) = match &location {
             PacLocation::File(path) => (read_script_file(path).await?, Validators::default()),
             PacLocation::Url(address) => {
                 match fetch(address, self.settings.fetch_timeout, &known, &self.trust)
@@ -262,6 +312,7 @@ impl PacSource {
                     Fetched::Script { bytes, validators } => (bytes, validators),
                 }
             }
+            PacLocation::System => return Err("the system did not say where the script is".into()),
         };
         if bytes == current {
             // Same script, possibly with new validators: nothing to load.

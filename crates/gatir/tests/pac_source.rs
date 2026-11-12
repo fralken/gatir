@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::*;
-use gatir::pac::{FetchError, Fetched, Trust, Validators, fetch};
+use gatir::config::{PacConfig, PacLocation};
+use gatir::pac::{
+    FetchError, Fetched, PacSource, SystemPac, SystemPacError, Trust, Validators, fetch,
+};
 use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
 
@@ -269,6 +272,106 @@ async fn a_new_version_of_the_script_keeps_the_overrides() {
     })
     .await;
     assert_eq!(through(&proxy).await, "B");
+}
+
+// ---- the script of the system ----
+
+/// A system that says what it is told to, and can change its mind.
+struct FakeSystem(Mutex<Result<PacLocation, SystemPacError>>);
+
+impl FakeSystem {
+    fn new(now: Result<PacLocation, SystemPacError>) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(now)))
+    }
+
+    fn pointing_at(pac: &PacServer) -> Arc<Self> {
+        Self::new(Ok(PacLocation::Url(pac.url())))
+    }
+
+    fn set(&self, now: Result<PacLocation, SystemPacError>) {
+        *self.0.lock().unwrap() = now;
+    }
+}
+
+impl SystemPac for FakeSystem {
+    fn location(&self) -> Result<PacLocation, SystemPacError> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A source of the script of the system, looked at every second.
+async fn system_source(system: &Arc<FakeSystem>) -> Arc<PacSource> {
+    let mut settings = PacConfig::with_defaults(PacLocation::System);
+    settings.refresh = Duration::from_secs(1);
+    PacSource::start_with(&settings, Trust::system(), system.clone())
+        .await
+        .expect("start")
+}
+
+/// What the script in use says for `site.test`, or why there is none.
+async fn chosen(source: &PacSource) -> Result<String, String> {
+    let pac = source.current().map_err(|err| err.to_string())?;
+    let routes = pac
+        .find("http://site.test/", "site.test")
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(routes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
+#[tokio::test]
+async fn the_script_the_system_points_to_is_used() {
+    let a = named("A").await;
+    let pac = PacServer::start(Serve::Script(choosing(a.addr()))).await;
+    let source = system_source(&FakeSystem::pointing_at(&pac)).await;
+    assert_eq!(chosen(&source).await, Ok(format!("PROXY {}", a.addr())));
+}
+
+#[tokio::test]
+async fn a_new_address_of_the_system_is_followed_at_the_next_look() {
+    let (a, b) = (named("A").await, named("B").await);
+    let (first, second) = (
+        PacServer::start(Serve::Script(choosing(a.addr()))).await,
+        PacServer::start(Serve::Script(choosing(b.addr()))).await,
+    );
+    let system = FakeSystem::pointing_at(&first);
+    let source = system_source(&system).await;
+    assert_eq!(chosen(&source).await, Ok(format!("PROXY {}", a.addr())));
+
+    system.set(Ok(PacLocation::Url(second.url())));
+    eventually("the script of the new address", || async {
+        chosen(&source).await == Ok(format!("PROXY {}", b.addr()))
+    })
+    .await;
+
+    // What the first one said about its script (an `ETag`) is not for another.
+    let requests = second.origin.requests();
+    assert!(!requests[0].headers.contains("if-none-match"));
+}
+
+#[tokio::test]
+async fn a_system_that_has_no_script_is_followed_when_it_has_one_and_never_loses_it() {
+    let a = named("A").await;
+    let pac = PacServer::start(Serve::Script(choosing(a.addr()))).await;
+    let system = FakeSystem::new(Err(SystemPacError::NotSet));
+    // Not an error at the start: the setting may be made later.
+    let source = system_source(&system).await;
+    let reason = chosen(&source).await.unwrap_err();
+    assert!(
+        reason.contains("not set to use an automatic proxy"),
+        "{reason}"
+    );
+
+    system.set(Ok(PacLocation::Url(pac.url())));
+    eventually("the script", || async { chosen(&source).await.is_ok() }).await;
+
+    // The setting is taken away: the script that worked stays.
+    system.set(Err(SystemPacError::NotSet));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(chosen(&source).await, Ok(format!("PROXY {}", a.addr())));
 }
 
 #[tokio::test]

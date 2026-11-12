@@ -488,10 +488,11 @@ fn every_alternative_in_the_example_is_valid_when_turned_on() {
             _ => line.to_owned(),
         })
         // What excludes another setting: the parents and the PAC script are two
-        // ways of finding the proxy, a file and an address two places for the
-        // script, a password and a hash two forms of the secret.
+        // ways of finding the proxy, a file, an address and the system's setting
+        // three places for the script, a password and a hash two forms of the
+        // secret.
         .filter(|line| {
-            !["parents = ", "url = ", "nt_hash = "]
+            !["parents = ", "url = ", "system = ", "nt_hash = "]
                 .iter()
                 .any(|excluded| line.starts_with(excluded))
         })

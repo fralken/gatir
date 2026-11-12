@@ -240,6 +240,9 @@ pub enum PacLocation {
     File(PathBuf),
     /// An `http://` or `https://` address.
     Url(String),
+    /// The address that the operating system is set to use, asked again at
+    /// every look at the script.
+    System,
 }
 
 impl PacLocation {
@@ -248,6 +251,7 @@ impl PacLocation {
         match self {
             Self::File(path) => path.display().to_string(),
             Self::Url(url) => url.split(['?', '#']).next().unwrap_or_default().to_owned(),
+            Self::System => "the PAC address of the system".to_owned(),
         }
     }
 
@@ -306,6 +310,7 @@ impl std::fmt::Debug for PacLocation {
         match self {
             Self::File(_) => write!(f, "File({:?})", self.shown()),
             Self::Url(_) => write!(f, "Url({:?})", self.shown()),
+            Self::System => f.write_str("System"),
         }
     }
 }
@@ -327,9 +332,11 @@ pub struct PacConfig {
 
 impl PacConfig {
     pub fn with_defaults(location: PacLocation) -> Self {
-        // A file is cheap to read again, and edited by hand: look often.
+        // A file is cheap to read again, and edited by hand: look often. So is
+        // the setting of the system, which changes the address when a person
+        // changes it, and a script that has not changed is not fetched again.
         let refresh = match location {
-            PacLocation::File(_) => Duration::from_secs(60),
+            PacLocation::File(_) | PacLocation::System => Duration::from_secs(60),
             PacLocation::Url(_) => Duration::from_secs(3600),
         };
         Self {
@@ -355,6 +362,7 @@ impl PacConfig {
 struct RawPac {
     file: Option<PathBuf>,
     url: Option<String>,
+    system: Option<bool>,
     refresh_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -387,12 +395,19 @@ impl RawPac {
         from_command_line: Option<PacLocation>,
         base: Option<&Path>,
     ) -> Result<PacConfig, ConfigError> {
+        let system = self.system.unwrap_or(false);
         let location = match (from_command_line, self.file, self.url) {
             (Some(location), _, _) => location,
             (None, Some(_), Some(_)) => {
                 return Err(ConfigError::invalid(
                     "pac.file and pac.url cannot both be set: they are two places to read the \
                      script from",
+                ));
+            }
+            (None, Some(_), None) | (None, None, Some(_)) if system => {
+                return Err(ConfigError::invalid(
+                    "pac.system cannot be set with pac.file or pac.url: they are different \
+                     places to read the script from",
                 ));
             }
             (None, Some(file), None) => {
@@ -405,9 +420,18 @@ impl RawPac {
                 }
             }
             (None, None, Some(url)) => PacLocation::url(&url)?,
+            (None, None, None) if system => {
+                if !crate::pac::system_pac_is_supported() {
+                    return Err(ConfigError::invalid(
+                        "pac.system is only supported on macOS: name the script with pac.file \
+                         or pac.url",
+                    ));
+                }
+                PacLocation::System
+            }
             (None, None, None) => {
                 return Err(ConfigError::invalid(
-                    "pac.file or pac.url is required in the [pac] table",
+                    "pac.file, pac.url or pac.system is required in the [pac] table",
                 ));
             }
         };
@@ -1449,7 +1473,7 @@ mod tests {
     #[test]
     fn rejects_a_pac_table_that_makes_no_sense() {
         for (toml, expected) in [
-            ("[pac]", "pac.file or pac.url is required"),
+            ("[pac]", "pac.file, pac.url or pac.system is required"),
             (
                 "[pac]\nfile = \"a\"\nurl = \"http://h/p\"",
                 "pac.file and pac.url cannot both be set",
@@ -1546,7 +1570,10 @@ mod tests {
 
         // They are overrides of a script, so there must be a script.
         let text = error_text("[[pac.overrides]]\nhosts = [\"a.example.com\"]\nproxy = \"DIRECT\"");
-        assert!(text.contains("pac.file or pac.url is required"), "{text}");
+        assert!(
+            text.contains("pac.file, pac.url or pac.system is required"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1577,6 +1604,68 @@ mod tests {
             summary.contains("chosen by the PAC script at proxy.pac, with 1 override\n"),
             "{summary}"
         );
+    }
+
+    #[test]
+    fn the_system_script_is_chosen_with_pac_system() {
+        let result = load("[pac]\nsystem = true");
+        if crate::pac::system_pac_is_supported() {
+            let pac = result.unwrap().pac.unwrap();
+            assert_eq!(pac, PacConfig::with_defaults(PacLocation::System));
+            // The setting of the system is cheap to ask again, and a person
+            // changes the address: look often.
+            assert_eq!(pac.refresh, Duration::from_secs(60));
+            assert!(load("[pac]\nsystem = true\nrefresh_secs = 7").is_ok());
+        } else {
+            let text = result.unwrap_err().to_string();
+            assert!(
+                text.contains("pac.system is only supported on macOS"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_system_script_cannot_be_chosen_with_another() {
+        for table in [
+            "[pac]\nsystem = true\nfile = \"p.pac\"",
+            "[pac]\nsystem = true\nurl = \"http://h/p.pac\"",
+        ] {
+            let text = error_text(table);
+            assert!(
+                text.contains("pac.system cannot be set with pac.file or pac.url"),
+                "{table:?} -> {text}"
+            );
+        }
+        // Switched off, it is as if it were not there.
+        assert!(load("[pac]\nsystem = false\nfile = \"p.pac\"").is_ok());
+        let text = error_text("[pac]\nsystem = false");
+        assert!(
+            text.contains("pac.file, pac.url or pac.system is required"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_script_named_on_the_command_line_replaces_the_system_one() {
+        let config = Config::from_toml_str(
+            "[pac]\nsystem = true",
+            Overrides {
+                pac: Some(file_location("cli.pac")),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.pac.unwrap().location, file_location("cli.pac"));
+    }
+
+    #[test]
+    fn the_system_script_is_shown_without_an_address() {
+        assert_eq!(
+            PacLocation::System.to_string(),
+            "the PAC address of the system"
+        );
+        assert_eq!(format!("{:?}", PacLocation::System), "System");
     }
 
     #[test]

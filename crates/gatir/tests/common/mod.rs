@@ -75,6 +75,7 @@ async fn bind(extra: &str, tokens: Option<Arc<dyn TokenSource>>, trust: Option<T
     let services = Services {
         tokens,
         trust: trust.unwrap_or_else(Trust::system),
+        ..Services::default()
     };
     Server::bind_with(&config, services)
         .await

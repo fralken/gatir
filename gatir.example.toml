@@ -39,6 +39,9 @@ password = "change-me"
 # [pac]
 # file = "proxy.pac"
 # url = "https://pac.example.com/proxy.pac"
+# On macOS, the address that the system is set to use (the file, the url and
+# this one are alternatives):
+# system = true
 # refresh_secs = 3600
 #
 # Hosts that go to other proxies than the script says, whatever it says. The

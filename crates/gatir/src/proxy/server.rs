@@ -29,7 +29,7 @@ use crate::auth::TokenSource;
 use crate::config::{
     Config, Credentials, Fixed, HeaderRule, HostPort, PacConfig, Socks5Credentials, Timeouts,
 };
-use crate::pac::{PacSource, Trust};
+use crate::pac::{OperatingSystem, PacSource, SystemPac, Trust};
 
 /// Largest request head (target plus header fields) accepted, in bytes.
 ///
@@ -66,13 +66,16 @@ pub(super) struct Live {
 type LiveCell = Arc<RwLock<Arc<Live>>>;
 
 /// What a server takes from the operating system, and a test replaces: the
-/// Kerberos tickets it makes Negotiate tokens from, and the certificate
-/// authorities an `https://` PAC address may chain to.
+/// Kerberos tickets it makes Negotiate tokens from, the certificate
+/// authorities an `https://` PAC address may chain to, and the PAC address the
+/// system is set to use.
 #[derive(Clone)]
 pub struct Services {
     /// Where Negotiate tokens come from; `None` is the system's tickets.
     pub tokens: Option<Arc<dyn TokenSource>>,
     pub trust: Trust,
+    /// Where `[pac] system` finds the script.
+    pub system_pac: Arc<dyn SystemPac>,
 }
 
 impl Default for Services {
@@ -80,6 +83,7 @@ impl Default for Services {
         Self {
             tokens: None,
             trust: Trust::system(),
+            system_pac: Arc::new(OperatingSystem),
         }
     }
 }
@@ -127,7 +131,12 @@ async fn build_live(
         (Some(settings), _) => (
             Some((
                 settings.clone(),
-                PacSource::start_with(settings, services.trust.clone()).await?,
+                PacSource::start_with(
+                    settings,
+                    services.trust.clone(),
+                    services.system_pac.clone(),
+                )
+                .await?,
             )),
             None,
         ),

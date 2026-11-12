@@ -15,8 +15,8 @@ use hyper::Uri;
 use super::Source;
 use crate::config::{Overrides, PacConfig, PacLocation, pac_dir};
 use crate::pac::{
-    Fetched, PacEnv, PacOverride, Route, SystemResolver, Trust, Validators, check, fetch,
-    load_script, read_script_file, tool_limits, wrap,
+    Fetched, OperatingSystem, PacEnv, PacOverride, Route, SystemPac, SystemResolver, Trust,
+    Validators, check, fetch, load_script, read_script_file, tool_limits, wrap,
 };
 
 #[derive(Debug, Subcommand)]
@@ -144,8 +144,8 @@ fn located(location: PacLocation, config: Option<&Path>) -> anyhow::Result<Locat
                 bare,
             })
         }
-        url @ PacLocation::Url(_) => Ok(Located {
-            location: url,
+        other @ (PacLocation::Url(_) | PacLocation::System) => Ok(Located {
+            location: other,
             bare: false,
         }),
     }
@@ -166,7 +166,17 @@ impl Located {
     }
 }
 
+/// Where a script is: the address that the system gives, for the script of the
+/// system, and `location` itself for any other.
+fn resolve(location: &PacLocation) -> anyhow::Result<PacLocation> {
+    match location {
+        PacLocation::System => Ok(OperatingSystem.location()?),
+        other => Ok(other.clone()),
+    }
+}
+
 async fn read_script(location: &PacLocation) -> anyhow::Result<Vec<u8>> {
+    let location = &resolve(location)?;
     match location {
         PacLocation::File(path) => read_script_file(path)
             .await
@@ -185,6 +195,7 @@ async fn read_script(location: &PacLocation) -> anyhow::Result<Vec<u8>> {
                 Fetched::Unchanged => bail!("{location} answered that nothing had changed"),
             }
         }
+        PacLocation::System => bail!("the system did not say where the script is"),
     }
 }
 
@@ -209,11 +220,12 @@ fn export(args: &ExportArgs, pac: &PacConfig, config: Option<&Path>) -> anyhow::
         }
     }
 
-    let (script, answers) = runtime()?.block_on(async {
-        let original = read_script(&pac.location).await?;
-        let script = wrap(&original, &pac.overrides, &pac.location.to_string());
+    let (from, script, answers) = runtime()?.block_on(async {
+        let from = resolve(&pac.location)?;
+        let original = read_script(&from).await?;
+        let script = wrap(&original, &pac.overrides, &from.to_string());
         let answers = check(&script, &pac.overrides).await?;
-        anyhow::Ok((script, answers))
+        anyhow::Ok((from, script, answers))
     })?;
 
     let Some(output) = output else {
@@ -223,7 +235,7 @@ fn export(args: &ExportArgs, pac: &PacConfig, config: Option<&Path>) -> anyhow::
     };
     let kept = write_script(&output, &script, args.force)?;
 
-    println!("from:        {}", pac.location);
+    println!("from:        {from}");
     for over in &pac.overrides {
         println!(
             "override:    {} -> {}",
@@ -354,6 +366,7 @@ fn labels(scripts: &[PacLocation]) -> Vec<String> {
             |name| name.to_string_lossy().into_owned(),
         ),
         PacLocation::Url(_) => location.to_string(),
+        PacLocation::System => "system".to_owned(),
     };
     let shorts: Vec<String> = scripts.iter().map(short).collect();
     scripts

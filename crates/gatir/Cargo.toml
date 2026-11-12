@@ -62,3 +62,6 @@ libloading = "0.8.9"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.8.0"
