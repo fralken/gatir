@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::acl::{Acl, Action, Rule};
 use crate::noproxy::NoProxy;
+use crate::pac::PacOverride;
 
 pub use addr::{HostPort, HostPortError};
 pub use credentials::{AuthMethod, Credentials, NT_HASH_LEN, Secret};
@@ -309,12 +310,15 @@ impl std::fmt::Debug for PacLocation {
     }
 }
 
-/// Where the PAC script comes from, and how often it is looked at. What the
-/// script may use (time, memory, name lookups) is not configurable: see
-/// `pac::PacLimits`.
+/// Where the PAC script comes from, how often it is looked at, and the hosts
+/// that are sent elsewhere than the script says. What the script may use (time,
+/// memory, name lookups) is not configurable: see `pac::PacLimits`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacConfig {
     pub location: PacLocation,
+    /// Hosts that go to the proxies named here, whatever the script answers.
+    /// The first that lists a host decides.
+    pub overrides: Vec<PacOverride>,
     /// How often the script is read again to see if it changed.
     pub refresh: Duration,
     /// How long to wait for a PAC script to be fetched from an address.
@@ -330,9 +334,19 @@ impl PacConfig {
         };
         Self {
             location,
+            overrides: Vec::new(),
             refresh,
             fetch_timeout: Duration::from_secs(15),
         }
+    }
+
+    /// Whether the script is read from the same place in the same way, so that
+    /// what has been read is still good: the overrides are added to it as it is
+    /// loaded, and may differ.
+    pub fn same_script_as(&self, other: &Self) -> bool {
+        self.location == other.location
+            && self.refresh == other.refresh
+            && self.fetch_timeout == other.fetch_timeout
     }
 }
 
@@ -343,6 +357,15 @@ struct RawPac {
     url: Option<String>,
     refresh_secs: Option<u64>,
     fetch_timeout_secs: Option<u64>,
+    #[serde(default)]
+    overrides: Vec<RawOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOverride {
+    hosts: Vec<String>,
+    proxy: String,
 }
 
 fn within(name: &str, value: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
@@ -389,6 +412,11 @@ impl RawPac {
             }
         };
         let mut pac = PacConfig::with_defaults(location);
+        for (index, raw) in self.overrides.iter().enumerate() {
+            let one = PacOverride::new(&raw.hosts, &raw.proxy)
+                .map_err(|err| ConfigError::invalid(format!("pac.overrides[{index}]: {err}")))?;
+            pac.overrides.push(one);
+        }
         if let Some(secs) = self.refresh_secs {
             pac.refresh = Duration::from_secs(within("refresh_secs", secs, 1, 604_800)?);
         }
@@ -512,7 +540,15 @@ impl Config {
     pub fn summary(&self) -> String {
         let listen = join(self.listen.iter());
         let parents = match (&self.pac, self.parents.is_empty()) {
-            (Some(pac), _) => format!("chosen by the PAC script at {}", pac.location),
+            (Some(pac), _) if pac.overrides.is_empty() => {
+                format!("chosen by the PAC script at {}", pac.location)
+            }
+            (Some(pac), _) => format!(
+                "chosen by the PAC script at {}, with {} override{}",
+                pac.location,
+                pac.overrides.len(),
+                if pac.overrides.len() == 1 { "" } else { "s" }
+            ),
             (None, true) => "none (direct connections)".to_owned(),
             (None, false) => join(self.parents.iter()),
         };
@@ -1443,6 +1479,104 @@ mod tests {
             let text = error_text(toml);
             assert!(text.contains(expected), "{toml:?} -> {text}");
         }
+    }
+
+    #[test]
+    fn a_pac_table_lists_overrides_in_order() {
+        let config = load(
+            "[pac]\nfile = \"proxy.pac\"\n\
+             [[pac.overrides]]\nhosts = [\"GHCR.io\", \".githubusercontent.com\"]\n\
+             proxy = \"proxy  a.example.com;direct\"\n\
+             [[pac.overrides]]\nhosts = [\"*.intranet.example.com\"]\nproxy = \"DIRECT\"",
+        )
+        .unwrap();
+        let overrides = config.pac.unwrap().overrides;
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[0].hosts(), ["ghcr.io", "githubusercontent.com"]);
+        assert_eq!(overrides[0].proxy(), "PROXY a.example.com:80; DIRECT");
+        assert_eq!(overrides[1].hosts(), ["*.intranet.example.com"]);
+        assert_eq!(overrides[1].proxy(), "DIRECT");
+        assert!(
+            load("[pac]\nfile = \"p\"")
+                .unwrap()
+                .pac
+                .unwrap()
+                .overrides
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_overrides_that_make_no_sense() {
+        let pac = "[pac]\nfile = \"p\"\n[[pac.overrides]]\n";
+        for (overrides, expected) in [
+            ("proxy = \"DIRECT\"", "missing field `hosts`"),
+            ("hosts = [\"a.example.com\"]", "missing field `proxy`"),
+            (
+                "hosts = [\"a.example.com\"]\nproxy = \"DIRECT\"\nurl = \"x\"",
+                "unknown field",
+            ),
+            (
+                "hosts = []\nproxy = \"DIRECT\"",
+                "pac.overrides[0]: no host was given",
+            ),
+            (
+                "hosts = [\"http://a.example.com\"]\nproxy = \"DIRECT\"",
+                "pac.overrides[0]: \"http://a.example.com\" is not a host name",
+            ),
+            (
+                "hosts = [\"a.example.com\"]\nproxy = \"\"",
+                "pac.overrides[0]: the proxy list is empty",
+            ),
+            (
+                "hosts = [\"a.example.com\"]\nproxy = \"FTP b.example.com\"",
+                "pac.overrides[0]: \"FTP b.example.com\" is not a proxy",
+            ),
+        ] {
+            let text = error_text(&format!("{pac}{overrides}"));
+            assert!(text.contains(expected), "{overrides:?} -> {text}");
+        }
+
+        // The number says which one.
+        let text = error_text(&format!(
+            "{pac}hosts = [\"a.example.com\"]\nproxy = \"DIRECT\"\n\
+             [[pac.overrides]]\nhosts = [\"b.example.com\"]\nproxy = \"nonsense here\""
+        ));
+        assert!(text.contains("pac.overrides[1]"), "{text}");
+
+        // They are overrides of a script, so there must be a script.
+        let text = error_text("[[pac.overrides]]\nhosts = [\"a.example.com\"]\nproxy = \"DIRECT\"");
+        assert!(text.contains("pac.file or pac.url is required"), "{text}");
+    }
+
+    #[test]
+    fn a_script_named_on_the_command_line_keeps_the_overrides_of_the_file() {
+        let config = Config::from_toml_str(
+            "[pac]\nfile = \"file.pac\"\n[[pac.overrides]]\n\
+             hosts = [\"ghcr.io\"]\nproxy = \"DIRECT\"",
+            Overrides {
+                pac: Some(file_location("cli.pac")),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let pac = config.pac.unwrap();
+        assert_eq!(pac.location, file_location("cli.pac"));
+        assert_eq!(pac.overrides.len(), 1);
+    }
+
+    #[test]
+    fn the_summary_counts_the_overrides() {
+        let summary = load(
+            "[pac]\nfile = \"proxy.pac\"\n[[pac.overrides]]\n\
+             hosts = [\"ghcr.io\"]\nproxy = \"DIRECT\"",
+        )
+        .unwrap()
+        .summary();
+        assert!(
+            summary.contains("chosen by the PAC script at proxy.pac, with 1 override\n"),
+            "{summary}"
+        );
     }
 
     #[test]

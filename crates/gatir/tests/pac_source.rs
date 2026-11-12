@@ -232,6 +232,45 @@ async fn a_new_version_replaces_the_old_one() {
     assert!(proxy.finished_within(Duration::from_secs(5)).await);
 }
 
+/// The table of an override of `site.test` to `parent`.
+fn override_of_site(parent: &MockOrigin) -> String {
+    format!(
+        "[[pac.overrides]]\nhosts = [\"site.test\"]\nproxy = \"PROXY {}\"\n",
+        parent.addr()
+    )
+}
+
+/// What the parent named in the script answers for another host than `site.test`.
+async fn through_other(proxy: &TestProxy) -> String {
+    ask(proxy, get("other.test", "/", "")).await.body_text()
+}
+
+#[tokio::test]
+async fn overrides_are_added_to_a_script_fetched_from_an_address() {
+    let (a, b) = (named("A").await, named("B").await);
+    let pac = PacServer::start(Serve::Script(choosing(a.addr()))).await;
+    let proxy = start_proxy(&pac.table(&override_of_site(&b))).await;
+
+    assert_eq!(through(&proxy).await, "B");
+    assert_eq!(through_other(&proxy).await, "A");
+}
+
+#[tokio::test]
+async fn a_new_version_of_the_script_keeps_the_overrides() {
+    let (a, b, c) = (named("A").await, named("B").await, named("C").await);
+    let pac = PacServer::start(Serve::Script(choosing(a.addr()))).await;
+    let proxy =
+        start_proxy(&pac.table(&format!("refresh_secs = 1\n{}", override_of_site(&b)))).await;
+    assert_eq!(through_other(&proxy).await, "A");
+
+    pac.set(Serve::Script(choosing(c.addr())));
+    eventually("the new script", || async {
+        through_other(&proxy).await == "C"
+    })
+    .await;
+    assert_eq!(through(&proxy).await, "B");
+}
+
 #[tokio::test]
 async fn a_version_that_does_not_work_never_replaces_one_that_does() {
     let (a, b) = (named("A").await, named("B").await);

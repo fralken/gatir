@@ -1,6 +1,6 @@
-//! `gatir pac generate` and `gatir pac test`: making a local copy of a PAC
-//! script in which some hosts go to other proxies, and seeing what a script
-//! answers.
+//! `gatir pac export` and `gatir pac test`: writing the PAC script that gatir
+//! runs, with the overrides of the configuration in it, and seeing what a
+//! script answers.
 
 use std::fs;
 use std::io::Write as _;
@@ -13,56 +13,41 @@ use clap::{Args, Subcommand};
 use hyper::Uri;
 
 use super::Source;
-use crate::config::{Overrides, PacLocation, pac_dir};
+use crate::config::{Overrides, PacConfig, PacLocation, pac_dir};
 use crate::pac::{
-    Fetched, PacEnv, Route, Rule, SystemResolver, Trust, Validators, check, fetch, load_script,
-    read_script_file, tool_limits, wrap,
+    Fetched, PacEnv, PacOverride, Route, SystemResolver, Trust, Validators, check, fetch,
+    load_script, read_script_file, tool_limits, wrap,
 };
 
 #[derive(Debug, Subcommand)]
 pub enum PacCommand {
-    /// Make a copy of a PAC script that sends some hosts to other proxies
+    /// Write the PAC script that gatir runs, with its overrides in it
     ///
-    /// The hosts you name go to the proxies you name, and every other host is
-    /// left to the original script, which is kept as it is. It is for giving a
-    /// few destinations to another proxy without losing the rest of a script
-    /// that belongs to somebody else. The copy is a plain file: add hosts to it
-    /// by hand afterwards.
-    Generate(GenerateArgs),
+    /// gatir adds the `[[pac.overrides]]` of the configuration to the script
+    /// itself, as it loads it, so there is no file to keep up to date. This
+    /// writes the result as a file, to read it or to give it to another
+    /// program (a browser, say): the script of the configuration as it is,
+    /// followed by a block that sends the hosts of the overrides to their
+    /// proxies. The result is checked before it is written. Without --output it
+    /// goes to the standard output.
+    Export(ExportArgs),
 
     /// Say which proxies a PAC script gives for some URLs
     ///
-    /// With several --script they are shown side by side, which is how to see
-    /// what a copy changes. The names a script looks up are looked up for real.
+    /// Without --script it asks the script of the configuration, and when the
+    /// configuration has overrides it shows the answer without them next to the
+    /// answer with them, which is how to see what they change. The names a
+    /// script looks up are looked up for real.
     Test(TestArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct GenerateArgs {
-    /// The script to start from: a file, or an http:// or https:// address
-    #[arg(long, value_name = "FILE|URL")]
-    pub from: PacLocation,
-
-    /// A host that goes to the proxy list, repeated or separated by commas. A
-    /// name covers its sub-domains; * and ? match any text
-    #[arg(
-        long = "host",
-        required = true,
-        value_delimiter = ',',
-        value_name = "HOST"
-    )]
-    pub hosts: Vec<String>,
-
-    /// What those hosts get: DIRECT, or PROXY host:port, several separated by
-    /// semicolons, tried in order
-    #[arg(long, value_name = "LIST")]
-    pub proxy: String,
-
-    /// Where to write the copy: a file name alone goes in the `pac` folder next
-    /// to the configuration file, anything with a folder in it is the path as
-    /// written
+pub struct ExportArgs {
+    /// Where to write the script: a file name alone goes in the `pac` folder
+    /// next to the configuration file, anything with a folder in it is the path
+    /// as written. Without it, the standard output
     #[arg(long, value_name = "NAME|PATH")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 
     /// Replace the file if it exists (the old one is kept as NAME.prev)
     #[arg(long)]
@@ -76,9 +61,9 @@ pub struct TestArgs {
     #[arg(required = true, value_name = "URL")]
     pub urls: Vec<String>,
 
-    /// A script to ask: a file, or an address. A file name alone is looked for
-    /// in the `pac` folder. Repeat it to compare. Without it, the script of the
-    /// configuration
+    /// A script to ask, as it is, without the overrides: a file, or an address.
+    /// A file name alone is looked for in the `pac` folder. Repeat it to
+    /// compare. Without it, the script of the configuration
     #[arg(long = "script", value_name = "FILE|URL")]
     pub scripts: Vec<PacLocation>,
 }
@@ -89,22 +74,27 @@ pub(super) fn run(
     overrides: Overrides,
     password_prompt: bool,
 ) -> anyhow::Result<()> {
+    // Read, not started: these are tools, with nothing to log.
+    let configured = |config: &Option<PathBuf>, overrides| -> anyhow::Result<PacConfig> {
+        let source = Source::new(config.clone(), overrides, password_prompt)?;
+        source.read()?.pac.context(
+            "the configuration has no PAC script: add a [pac] table to it, or name one with --pac",
+        )
+    };
     match command {
-        PacCommand::Generate(args) => generate(&args, config.as_deref()),
+        PacCommand::Export(args) => {
+            let pac = configured(&config, overrides)?;
+            export(&args, &pac, config.as_deref())
+        }
         PacCommand::Test(args) => {
-            let scripts = if args.scripts.is_empty() {
-                // Read, not started: this is a tool, with nothing to log.
-                let source = Source::new(config.clone(), overrides, password_prompt)?;
-                match source.read()?.pac {
-                    Some(pac) => vec![pac.location],
-                    None => {
-                        bail!("the configuration has no PAC script to ask: name one with --script")
-                    }
-                }
+            let asked = if args.scripts.is_empty() {
+                let pac = configured(&config, overrides)
+                    .map_err(|err| anyhow::anyhow!("{err}; or ask a script with --script"))?;
+                vec![asked_by_configuration(pac)]
             } else {
-                args.scripts.clone()
+                asked_by_name(args.scripts, config.as_deref())?
             };
-            test(&args.urls, scripts, config.as_deref())
+            test(&args.urls, asked)
         }
     }
 }
@@ -198,64 +188,56 @@ async fn read_script(location: &PacLocation) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// A string for a TOML file: a literal one where it can be, so that a Windows
-/// path needs no escapes.
-fn toml_string(text: &str) -> String {
-    if text.contains('\'') {
-        format!("{text:?}")
-    } else {
-        format!("'{text}'")
+fn export(args: &ExportArgs, pac: &PacConfig, config: Option<&Path>) -> anyhow::Result<()> {
+    let output = args
+        .output
+        .as_deref()
+        .map(|name| in_pac_dir(name, config))
+        .transpose()?;
+    if let Some(output) = &output {
+        if output.is_dir() {
+            bail!("{} is a folder: name the file", output.display());
+        }
+        // Before anything is fetched: a file is not to be lost by mistake.
+        if output.exists() && !args.force {
+            bail!(
+                "{} exists already: name another file, or give --force to replace it (the old \
+                 one is kept as {}.prev)",
+                output.display(),
+                output.display()
+            );
+        }
     }
-}
-
-fn generate(args: &GenerateArgs, config: Option<&Path>) -> anyhow::Result<()> {
-    let rule = Rule::new(&args.hosts, &args.proxy)?;
-    let output = in_pac_dir(&args.output, config)?;
-    if output.is_dir() {
-        bail!("{} is a folder: name the file", output.display());
-    }
-    // Before anything is fetched: an edited copy is not to be lost by mistake.
-    if output.exists() && !args.force {
-        bail!(
-            "{} exists already, and may have been edited by hand: name another file, or give \
-             --force to replace it (the old one is kept as {}.prev)",
-            output.display(),
-            output.display()
-        );
-    }
-    let Located {
-        location: from,
-        bare,
-    } = located(args.from.clone(), config)?;
-    let source = Located {
-        location: from.clone(),
-        bare,
-    };
 
     let (script, answers) = runtime()?.block_on(async {
-        let original = source.read().await?;
-        let script = wrap(&original, &rule, &from.to_string());
-        let answers = check(&script, &rule).await?;
+        let original = read_script(&pac.location).await?;
+        let script = wrap(&original, &pac.overrides, &pac.location.to_string());
+        let answers = check(&script, &pac.overrides).await?;
         anyhow::Ok((script, answers))
     })?;
 
+    let Some(output) = output else {
+        return std::io::stdout()
+            .write_all(&script)
+            .context("cannot write to the standard output");
+    };
     let kept = write_script(&output, &script, args.force)?;
 
-    println!("from:        {from}");
-    println!(
-        "rule:        {} -> {}",
-        rule.hosts().join(", "),
-        rule.proxy()
-    );
-    for (host, routes) in &answers {
-        let shown = routes
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        println!("checked:     {host} -> {shown}");
+    println!("from:        {}", pac.location);
+    for over in &pac.overrides {
+        println!(
+            "override:    {} -> {}",
+            over.hosts().join(", "),
+            over.proxy()
+        );
     }
-    let unused = rule.unused();
+    if pac.overrides.is_empty() {
+        println!("override:    none (the script is copied as it is)");
+    }
+    for (host, routes) in &answers {
+        println!("checked:     {host} -> {}", describe(routes));
+    }
+    let unused: Vec<String> = pac.overrides.iter().flat_map(PacOverride::unused).collect();
     if !unused.is_empty() {
         println!(
             "note:        gatir does not use {}; a browser may",
@@ -266,21 +248,6 @@ fn generate(args: &GenerateArgs, config: Option<&Path>) -> anyhow::Result<()> {
     if let Some(previous) = kept {
         println!("previous:    kept as {}", previous.display());
     }
-    println!();
-    println!("To use it, in the configuration file:");
-    println!("    [pac]");
-    println!("    file = {}", toml_string(&output.display().to_string()));
-    if pac_dir(config).is_some_and(|dir| output.parent() == Some(dir.as_path())) {
-        println!(
-            "(a path relative to the configuration file works too: file = 'pac/{}')",
-            output
-                .file_name()
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
-        );
-    }
-    println!(
-        "To see what changed:  gatir pac test --script <the original> --script <this one> URL..."
-    );
     Ok(())
 }
 
@@ -402,11 +369,36 @@ fn labels(scripts: &[PacLocation]) -> Vec<String> {
         .collect()
 }
 
-fn test(urls: &[String], scripts: Vec<PacLocation>, config: Option<&Path>) -> anyhow::Result<()> {
-    let targets = urls
-        .iter()
-        .map(|text| target(text))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+/// A script to ask, and the ways of asking it: each has a label to show, and the
+/// overrides that are added to the script for it.
+struct Asked {
+    script: Located,
+    ways: Vec<(String, Vec<PacOverride>)>,
+}
+
+/// The script of the configuration: as it is, and with the overrides added if
+/// there are any, to see what they change.
+fn asked_by_configuration(pac: PacConfig) -> Asked {
+    let ways = if pac.overrides.is_empty() {
+        let label = labels(std::slice::from_ref(&pac.location)).remove(0);
+        vec![(label, Vec::new())]
+    } else {
+        vec![
+            ("original".to_owned(), Vec::new()),
+            ("with overrides".to_owned(), pac.overrides),
+        ]
+    };
+    Asked {
+        script: Located {
+            location: pac.location,
+            bare: false,
+        },
+        ways,
+    }
+}
+
+/// The scripts that were named, each as it is.
+fn asked_by_name(scripts: Vec<PacLocation>, config: Option<&Path>) -> anyhow::Result<Vec<Asked>> {
     let scripts = scripts
         .into_iter()
         .map(|location| located(location, config))
@@ -417,7 +409,26 @@ fn test(urls: &[String], scripts: Vec<PacLocation>, config: Option<&Path>) -> an
             .map(|script| script.location.clone())
             .collect::<Vec<_>>(),
     );
-    let width = labels.iter().map(String::len).max().unwrap_or(0);
+    Ok(scripts
+        .into_iter()
+        .zip(labels)
+        .map(|(script, label)| Asked {
+            script,
+            ways: vec![(label, Vec::new())],
+        })
+        .collect())
+}
+
+fn test(urls: &[String], asked: Vec<Asked>) -> anyhow::Result<()> {
+    let targets = urls
+        .iter()
+        .map(|text| target(text))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let width = asked
+        .iter()
+        .flat_map(|asked| asked.ways.iter().map(|(label, _)| label.len()))
+        .max()
+        .unwrap_or(0);
 
     let failures = runtime()?.block_on(async {
         // The names a script looks up are looked up for real: what is shown is
@@ -427,14 +438,21 @@ fn test(urls: &[String], scripts: Vec<PacLocation>, config: Option<&Path>) -> an
             Duration::from_secs(60),
         )));
         let mut loaded = Vec::new();
-        for (script, label) in scripts.iter().zip(&labels) {
-            let pac = match script.read().await {
-                Ok(bytes) => load_script(&bytes, tool_limits(), env.clone())
-                    .await
-                    .map_err(|err| format!("the script is not usable: {err}")),
-                Err(err) => Err(err.to_string()),
-            };
-            loaded.push((label.clone(), pac));
+        for asked in &asked {
+            // Read once, whatever the ways of asking it.
+            let bytes = asked.script.read().await.map_err(|err| err.to_string());
+            for (label, overrides) in &asked.ways {
+                let pac = match &bytes {
+                    Ok(bytes) => {
+                        let from = asked.script.location.to_string();
+                        load_script(&wrap(bytes, overrides, &from), tool_limits(), env.clone())
+                            .await
+                            .map_err(|err| format!("the script is not usable: {err}"))
+                    }
+                    Err(err) => Err(err.clone()),
+                };
+                loaded.push((label.clone(), pac));
+            }
         }
 
         let mut failures = 0usize;
@@ -540,12 +558,6 @@ mod tests {
         let c = PacLocation::File(PathBuf::from("/y/other.pac"));
         assert_eq!(labels(&[a.clone(), c.clone()]), ["proxy.pac", "other.pac"]);
         assert_eq!(labels(&[a, b]), ["/x/proxy.pac", "/y/proxy.pac"]);
-    }
-
-    #[test]
-    fn toml_strings_need_no_escapes_for_a_windows_path() {
-        assert_eq!(toml_string("C:\\Users\\a\\x.pac"), "'C:\\Users\\a\\x.pac'");
-        assert_eq!(toml_string("it's.pac"), "\"it's.pac\"");
     }
 
     #[test]

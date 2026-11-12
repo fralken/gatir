@@ -10,15 +10,15 @@
 
 mod engine;
 mod fetch;
-mod generate;
 mod helpers;
+mod overrides;
 mod resolver;
 mod route;
 mod source;
 
 pub use engine::{Pac, PacEnv, PacError, PacLimits};
 pub use fetch::{FetchError, Fetched, Trust, Validators, fetch};
-pub use generate::{GenerateError, Rule, check, load_script, tool_limits, wrap};
+pub use overrides::{OverrideError, PacOverride, check, load_script, tool_limits, wrap};
 pub use resolver::{Resolver, SystemResolver, system_local_addresses};
 pub use route::{Parsed, ProxyAddr, Route, parse};
 pub use source::{PacSource, read_script_file};

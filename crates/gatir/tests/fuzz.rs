@@ -20,7 +20,7 @@ use gatir::auth::ntlm::{Authenticator, Challenge};
 use gatir::auth::{challenge, refusal};
 use gatir::config::{Config, HostPort, Overrides, Tunnel};
 use gatir::noproxy::NoProxy;
-use gatir::pac::{self, Pac, PacEnv, PacError, PacLimits, Resolver, Route};
+use gatir::pac::{self, Pac, PacEnv, PacError, PacLimits, PacOverride, Resolver, Route};
 use gatir_testkit::fuzz::{each_text_variant, each_variant};
 use hyper::header::HeaderValue;
 
@@ -285,14 +285,31 @@ level = "info"
     )
 }
 
+/// A script with overrides instead of parents, which the full one cannot have.
+const PAC_CONFIGURATION: &str = r#"
+[pac]
+url = "https://pac.example.com/proxy.pac"
+refresh_secs = 600
+
+[[pac.overrides]]
+hosts = ["ghcr.io", ".githubusercontent.com", "*.cdn.example.com"]
+proxy = "PROXY a.example.com:80; PROXY b.example.com:80"
+
+[[pac.overrides]]
+hosts = ["a?.intranet.example.com"]
+proxy = "DIRECT"
+"#;
+
 #[test]
 fn fuzz_the_configuration_and_never_show_a_secret() {
     let full = full_configuration();
     Config::from_toml_str(&full, Overrides::default()).expect("the seed is a configuration");
+    Config::from_toml_str(PAC_CONFIGURATION, Overrides::default())
+        .expect("the seed is a configuration");
     let example = include_str!("../../../gatir.example.toml");
     Config::from_toml_str(example, Overrides::default()).expect("the example is a configuration");
 
-    each_text_variant(&[&full, example], 2_000, |text| {
+    each_text_variant(&[&full, PAC_CONFIGURATION, example], 2_000, |text| {
         let shown = match Config::from_toml_str(text, Overrides::default()) {
             Ok(config) => format!("{config:?}\n{}", config.summary()),
             Err(err) => format!("{err}\n{err:?}"),
@@ -421,6 +438,45 @@ fn fuzz_a_pac_script_that_is_broken() {
         if let Ok(pac) = Pac::load(&script, limits(), environment()) {
             let result = runtime.block_on(pac.find("http://www.example.com/", "www.example.com"));
             assert_engine_alive(&result, "a broken script");
+        }
+    });
+}
+
+#[test]
+fn fuzz_an_override_that_is_accepted_does_what_it_says() {
+    // What is accepted is written into a script, so it must load, and must
+    // answer for its hosts what was asked, whatever the text was.
+    let original =
+        "function FindProxyForURL(url, host) { return \"PROXY original.example.com:1\"; }\n";
+    let runtime = runtime();
+    let seeds = [
+        "ghcr.io,.githubusercontent.com|PROXY a.example.com:80; PROXY b.example.com:80",
+        "*.cdn.example.com,a?.example.com|DIRECT",
+        "example.com|proxy a.example.com;http b.example.com:8080 ;;direct",
+        "a\"b|PROXY a\";alert(1);\"",
+    ];
+    each_text_variant(&seeds, 1_500, |text| {
+        let (hosts, proxy) = text.split_once('|').unwrap_or((text, ""));
+        let hosts: Vec<String> = hosts.split(',').map(str::to_owned).collect();
+        let Ok(rule) = PacOverride::new(&hosts, proxy) else {
+            return;
+        };
+        let script = pac::wrap(
+            original.as_bytes(),
+            std::slice::from_ref(&rule),
+            "fuzz\nalert(1)",
+        );
+        let pac = runtime
+            .block_on(pac::load_script(&script, limits(), environment()))
+            .unwrap_or_else(|err| {
+                panic!("{text:?} was accepted, and the script is not usable: {err}")
+            });
+        for host in rule.hosts() {
+            let sample = host.replace('*', "www").replace('?', "a");
+            let routes = runtime
+                .block_on(pac.find(&format!("http://{sample}/"), &sample))
+                .unwrap_or_else(|err| panic!("{text:?}: asking about {sample}: {err}"));
+            assert_eq!(routes, rule.routes(), "{text:?}: {sample}");
         }
     });
 }

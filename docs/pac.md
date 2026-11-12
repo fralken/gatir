@@ -69,75 +69,97 @@ Nothing is remembered between requests: the script may look at the whole URL or
 at the time, so its answer is asked for every time. What is worth caching, the
 answers of name lookups, is cached.
 
-## A copy with routes of your own
+## Hosts that go elsewhere than the script says
 
 A script that belongs to the company cannot be edited, and some destinations
 need another proxy than the one it picks (a download its proxy blocks, say, that
-another lets through). `gatir pac generate` makes a copy of the script in which
-the hosts you name go to the proxies you name, and every other host is left to
-the original:
-
-```
-gatir pac generate \
-    --from https://pac.example.com/proxy.pac \
-    --host ghcr.io --host githubusercontent.com \
-    --proxy "PROXY a.example.com:80; PROXY b.example.com:80" \
-    --output local.pac
-```
-
-- `--from` is a file or an address; an address is fetched directly, like the
-  script of the configuration.
-- `--host` is repeated or separated by commas. A name covers the domain and its
-  sub-domains (`githubusercontent.com` covers `pkg.githubusercontent.com`, and not
-  `notgithubusercontent.com`); `*` and `?` make a pattern.
-- `--proxy` is what the hosts get: `DIRECT`, or `PROXY host:port`, several
-  separated by semicolons, tried in order.
-- `--output` is a file name, which goes in the `pac` folder next to the
-  configuration file (`~/.config/gatir/pac`, or `%APPDATA%\gatir\pac`), or a path
-  with a folder in it, which is used as written. `./name.pac` is the current folder.
-  An existing file is not replaced without `--force`, which keeps the old one as
-  `name.pac.prev`.
-
-The original is kept byte for byte, and the rule is a block appended to it. The
-file is checked before it is written: it is loaded with the engine of gatir, and
-each host is asked what it answers. Nothing is written if that fails.
-
-Then point the configuration at it:
+another lets through). The `[[pac.overrides]]` tables of the configuration name
+those hosts and the proxies they get, and every other host is left to the
+script:
 
 ```toml
 [pac]
-file = "pac/local.pac"
+url = "https://pac.example.com/proxy.pac"
+
+[[pac.overrides]]
+hosts = ["downloads.example.com", "cdn.example.net"]
+proxy = "PROXY a.example.com:80; PROXY b.example.com:80"
+
+[[pac.overrides]]
+hosts = ["*.intranet.example.com"]
+proxy = "DIRECT"
 ```
 
-The block is JavaScript to read and edit: add a name to the `hosts` list, or
-another entry to `routes`. gatir reads the file again by itself, every minute, or
-at once with a reload. Rerunning `generate` makes a new copy from the current
-script, and **does not keep what was added by hand**, which is why it refuses to
-replace a file without `--force`.
+- `hosts` is a list of names. A name covers the domain and its sub-domains
+  (`cdn.example.net` covers `pkg.cdn.example.net`, and not
+  `notcdn.example.net`); `*` and `?` make a pattern. They are matched against
+  the host, never the path.
+- `proxy` is what those hosts get: `DIRECT`, or `PROXY host:port`, several
+  separated by semicolons, tried in order.
+- The first entry that lists a host decides, so a specific name goes before a
+  pattern that also covers it.
+- `no_proxy` is asked first: what it lists goes direct without asking the script
+  or the overrides.
 
-## What a script answers
+gatir adds them to the script as it loads it, and keeps the script as it was
+read: the script is not changed on disk, and a new version of it, found at the
+next look, gets the overrides too. Changing only the overrides and reloading
+(`SIGHUP`) applies them at once, without reading the script again, so a script
+that cannot be fetched just then is not lost. A configuration whose overrides
+are not valid (a name that is not a host, a proxy that is not one) is refused
+with the number of the entry, like any other mistake in the file.
 
-`gatir pac test` asks a script about URLs, without starting the proxy:
+The overrides are added as a block of JavaScript after the script, which wraps
+`FindProxyForURL` (and `FindProxyForURLEx`, if there is one) and answers first.
+Nothing depends on how the script writes its function.
+
+### Seeing what they change
+
+`gatir pac test` asks the script of the configuration about URLs, without
+starting the proxy, and shows the answer without the overrides next to the
+answer with them:
 
 ```
-gatir pac test --script ./original.pac --script local.pac \
-    ghcr.io https://pkg.githubusercontent.com/ http://example.com/
+gatir pac test downloads.example.com https://pkg.cdn.example.net/ www.example.org
 ```
 
 ```
-https://ghcr.io/   (differs)
-  original.pac  PROXY 127.0.0.1:9000
-  local.pac     PROXY a.example.com:80; PROXY b.example.com:80
-https://example.com/
-  original.pac  PROXY 127.0.0.1:9000
-  local.pac     PROXY 127.0.0.1:9000
+https://downloads.example.com/   (differs)
+  original        PROXY 127.0.0.1:9000
+  with overrides  PROXY a.example.com:80; PROXY b.example.com:80
+https://pkg.cdn.example.net/   (differs)
+  original        PROXY 127.0.0.1:9000
+  with overrides  PROXY a.example.com:80; PROXY b.example.com:80
+https://www.example.org/
+  original        PROXY 127.0.0.1:9000
+  with overrides  PROXY 127.0.0.1:9000
 ```
 
-A host name alone is `https://HOST/`, which is what gatir asks for a tunnel. A
-file name alone after `--script` is looked for in the `pac` folder, as with
-`--output`. Without `--script` the script of the configuration is asked. The
-names a script looks up are looked up for real, so the answer is the one gatir
-would get here and now. The exit status is not zero if a script could not be used.
+A host name alone is `https://HOST/`, which is what gatir asks for a tunnel.
+`--script FILE|URL` asks a script of your choosing, as it is, without the
+overrides, and may be repeated to compare; a file name alone is looked for in
+the `pac` folder next to the configuration file (`~/.config/gatir/pac`, or
+`%APPDATA%\gatir\pac`). The names a script looks up are looked up for real, so
+the answer is the one gatir would get here and now. The exit status is not zero
+if a script could not be used.
+
+### Writing the script as a file
+
+`gatir pac export` writes the script that gatir runs, with the overrides in it,
+for you to read or for another program (a browser) to use:
+
+```
+gatir pac export --output local.pac
+gatir pac export > local.pac
+```
+
+`--output` is a file name, which goes in the `pac` folder, or a path with a
+folder in it, which is used as written (`./name.pac` is the current folder);
+without it the script goes to the standard output. An existing file is not
+replaced without `--force`, which keeps the old one as `name.pac.prev`. The
+script is checked before it is written: it is loaded with the engine of gatir,
+and each host of the overrides is asked what it answers, so an entry that an
+earlier one hides is reported.
 
 ## What it may return
 

@@ -5,6 +5,11 @@
 //! reported and forgotten: the last version that worked stays in use, because
 //! a proxy that stops answering when the network hiccups is worse than one
 //! that answers from a script a few hours old.
+//!
+//! The overrides of the configuration are added to the script as it is loaded.
+//! What is kept, to tell a script that changed from one that was only fetched
+//! again, is the script as it was read, so that the overrides can change
+//! without fetching it again.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -13,7 +18,10 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use super::fetch::{Fetched, Trust, Validators, fetch};
-use super::{MAX_SCRIPT_BYTES, Pac, PacEnv, PacError, PacLimits, SystemResolver};
+use super::{
+    MAX_SCRIPT_BYTES, Pac, PacEnv, PacError, PacLimits, PacOverride, SystemResolver, load_script,
+    wrap,
+};
 use crate::config::{PacConfig, PacLocation};
 
 /// How long a script waits for a name lookup.
@@ -28,9 +36,11 @@ const FIRST_RETRY: Duration = Duration::from_secs(5);
 #[derive(Default)]
 struct State {
     pac: Option<Pac>,
-    /// What `pac` was loaded from, to tell a script that changed from one that
-    /// was only fetched again.
+    /// The script as it was read, without the overrides: what `pac` was loaded
+    /// from, to tell a script that changed from one that was only fetched again.
     bytes: Vec<u8>,
+    /// What is added to the script when it is loaded.
+    overrides: Vec<PacOverride>,
     validators: Validators,
     /// Why the latest attempt failed, if it did.
     failed: Option<String>,
@@ -68,7 +78,10 @@ impl PacSource {
             env: PacEnv::system(resolver),
             trust,
             settings: settings.clone(),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                overrides: settings.overrides.clone(),
+                ..State::default()
+            }),
             looking: tokio::sync::Mutex::new(()),
         });
         if let Err(reason) = source.refresh().await {
@@ -170,6 +183,7 @@ impl PacSource {
                     tracing::info!(
                         pac = %self.settings.location,
                         size = bytes.len(),
+                        overrides = state.overrides.len(),
                         "PAC script {}",
                         if first { "loaded" } else { "updated" }
                     );
@@ -185,6 +199,50 @@ impl PacSource {
                 Err(reason)
             }
         }
+    }
+
+    /// Loads `script` with `overrides` added to it, as it would be used.
+    async fn load(&self, script: &[u8], overrides: &[PacOverride]) -> Result<Pac, String> {
+        let wrapped = wrap(script, overrides, &self.settings.location.to_string());
+        // Scripts written years ago are not always UTF-8: `load_script` reads
+        // them as well as it can.
+        load_script(&wrapped, self.limits.clone(), self.env.clone())
+            .await
+            .map_err(|err| format!("the script is not usable: {err}"))
+    }
+
+    /// Changes the overrides, and loads again the script that is in use with
+    /// them, without reading it again from where it is. Until a script has been
+    /// read there is nothing to load: the next one gets them.
+    ///
+    /// If the script does not load with them, nothing changes and the reason is
+    /// returned.
+    pub async fn set_overrides(&self, overrides: &[PacOverride]) -> Result<(), String> {
+        // Not while a look at the script is under way: it would finish with the
+        // overrides that it started with.
+        let _alone = self.looking.lock().await;
+        let bytes = {
+            let state = self.lock();
+            if state.overrides == overrides {
+                return Ok(());
+            }
+            state.pac.is_some().then(|| state.bytes.clone())
+        };
+        let loaded = match bytes {
+            Some(bytes) => Some(self.load(&bytes, overrides).await?),
+            None => None,
+        };
+        let mut state = self.lock();
+        state.overrides = overrides.to_vec();
+        if loaded.is_some() {
+            state.pac = loaded;
+            tracing::info!(
+                pac = %self.settings.location,
+                overrides = overrides.len(),
+                "PAC script loaded again with new overrides"
+            );
+        }
+        Ok(())
     }
 
     /// The script to switch to, if what was read is not the one in use.
@@ -211,15 +269,8 @@ impl PacSource {
             return Ok(None);
         }
 
-        let (limits, env) = (self.limits.clone(), self.env.clone());
-        let source = bytes.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            // Scripts written years ago are not always UTF-8.
-            Pac::load(&String::from_utf8_lossy(&source), limits, env)
-        })
-        .await
-        .map_err(|err| format!("the PAC script could not be loaded: {err}"))?
-        .map_err(|err| format!("the script is not usable: {err}"))?;
+        let overrides = self.lock().overrides.clone();
+        let loaded = self.load(&bytes, &overrides).await?;
         Ok(Some((loaded, bytes, validators)))
     }
 }

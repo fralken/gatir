@@ -322,6 +322,49 @@ async fn a_script_that_cannot_be_fetched_at_a_reload_is_kept_from_before() {
     assert_eq!(answer(&proxy).await, "A");
 }
 
+#[tokio::test]
+async fn a_reload_changes_the_overrides_of_a_script_that_cannot_be_fetched_now() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (a, b) = (named("A").await, named("B").await);
+    let script = script_for(&a);
+    let up = Arc::new(AtomicBool::new(true));
+    let pac = MockOrigin::start({
+        let up = up.clone();
+        move |_| {
+            if up.load(Ordering::SeqCst) {
+                Reply::ok(&script)
+            } else {
+                Reply::raw("HTTP/1.1 503 Gone\r\nContent-Length: 0\r\n\r\n")
+            }
+        }
+    })
+    .await;
+    let table = format!(
+        "[pac]\nurl = \"http://{}/proxy.pac\"\nrefresh_secs = 3600\n",
+        pac.authority()
+    );
+    let proxy = start_proxy(&table).await;
+    assert_eq!(answer(&proxy).await, "A");
+
+    // Only the overrides change, and the address does not answer: the script
+    // that was read is the one they are added to, and it is not lost.
+    up.store(false, Ordering::SeqCst);
+    let overridden = format!(
+        "{table}[[pac.overrides]]\nhosts = [\"site.test\"]\nproxy = \"PROXY {}\"\n",
+        b.addr()
+    );
+    apply(&proxy, &overridden).await;
+    assert_eq!(answer(&proxy).await, "B");
+    let other = ask(&proxy, get("other.test", "/", "")).await.body_text();
+    assert_eq!(other, "A");
+
+    // Taking them away gives the script's own answer back.
+    apply(&proxy, &table).await;
+    assert_eq!(answer(&proxy).await, "A");
+}
+
 // ---- what a reload cannot change ----
 
 #[tokio::test]

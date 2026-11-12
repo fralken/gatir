@@ -54,12 +54,11 @@ What a reload applies:
 - the `[timeouts]`.
 
 Connections to a parent that were kept for reuse are closed, since they may have
-been authenticated as someone else, or lead to another parent. A PAC script whose
-settings did not change is kept, and looked at again at once, so a reload is also
-how to say that it changed; if it cannot be read just then, the last version that
-worked stays. If the credentials did not change, the record of a parent that
-refused them is kept too: reading the same file again is no reason to try the
-account once more.
+been authenticated as someone else, or lead to another parent. A PAC script that is
+read from the same place in the same way is kept, with the overrides of the new
+file added to it, and looked at again at once, so a reload is also how to say that
+it changed; if it cannot be read just then, the last version that worked stays.
+If the credentials did not change, the record of a parent that refused them is kept too: reading the same file again is no reason to try the account once more.
 
 What only a new start applies is `listen`, the `[[tunnels]]`, the addresses of
 `[socks5]`, and `[log] level`. If they changed, gatir says which, and goes on with

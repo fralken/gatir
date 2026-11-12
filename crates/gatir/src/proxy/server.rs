@@ -107,9 +107,10 @@ impl Context {
 }
 
 /// Builds the settings of `config`. `previous` are those in use, from which
-/// the PAC script is kept if its settings did not change (it holds the last
-/// version that worked), and so are the credentials' record with the parent
-/// (an account refused recently is not tried again for it to be refused).
+/// the PAC script is kept if it is read from the same place in the same way
+/// (it holds the last version that worked), and so are the credentials' record
+/// with the parent (an account refused recently is not tried again for it to be
+/// refused).
 ///
 /// The second value is the script that was kept, if any.
 async fn build_live(
@@ -119,7 +120,7 @@ async fn build_live(
 ) -> io::Result<(Live, Option<Arc<PacSource>>)> {
     // A PAC file that is missing or wrong is found here, not on the first request.
     let (pac, kept_script) = match (&config.pac, previous.and_then(|live| live.pac.as_ref())) {
-        (Some(settings), Some((used, source))) if used == settings => (
+        (Some(settings), Some((used, source))) if used.same_script_as(settings) => (
             Some((settings.clone(), source.clone())),
             Some(source.clone()),
         ),
@@ -209,6 +210,20 @@ impl Reloader {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let (live, kept_script) = build_live(config, Some(&previous), &self.services).await?;
+        // A script that stayed is given the overrides of the new settings
+        // without being read again. It is done before anything is replaced, so
+        // that overrides it cannot load with leave the server as it was.
+        if let (Some(script), Some(pac)) = (&kept_script, &config.pac) {
+            script
+                .set_overrides(&pac.overrides)
+                .await
+                .map_err(|reason| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("cannot use the PAC overrides: {reason}"),
+                    )
+                })?;
+        }
 
         // The new settings come with a pool of their own: connections opened
         // under the old ones may have authenticated as someone else, or lead to

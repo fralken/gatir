@@ -40,6 +40,14 @@ password = "change-me"
 # file = "proxy.pac"
 # url = "https://pac.example.com/proxy.pac"
 # refresh_secs = 3600
+#
+# Hosts that go to other proxies than the script says, whatever it says. The
+# first entry that lists a host decides. A name covers its sub-domains; * and ?
+# stand for any text. The proxy is DIRECT, or PROXY host:port, several separated
+# by semicolons and tried in order.
+# [[pac.overrides]]
+# hosts = ["downloads.example.com", "*.cdn.example.net"]
+# proxy = "PROXY a.example.com:80; PROXY b.example.com:80"
 
 # Who may use gatir, by their address. The first rule that matches decides.
 # [access]

@@ -18,7 +18,7 @@ use crate::logging;
 pub use detect::DetectArgs;
 pub use hash::HashArgs;
 pub use negotiate::NegotiateArgs;
-pub use pac::{GenerateArgs, PacCommand, TestArgs};
+pub use pac::{ExportArgs, PacCommand, TestArgs};
 
 #[derive(Debug, Parser)]
 #[command(name = "gatir", version, about, arg_required_else_help = true)]
@@ -58,7 +58,7 @@ pub enum Command {
     /// configured, which one it accepts: unlike `negotiate`, this contacts it
     Detect(DetectArgs),
 
-    /// Make a PAC script copy with local routes, and see what a script answers
+    /// Write the PAC script gatir runs, with its overrides, and see what a script answers
     #[command(subcommand)]
     Pac(PacCommand),
 }
