@@ -662,7 +662,7 @@ impl Config {
         );
         format!(
             "listen:      {listen}\nparents:     {parents}\ncredentials: {credentials}\n\
-             access:      {access}\nno_proxy:    {no_proxy}\nheaders:     {headers} (set on every request)\ntunnels:     {tunnels}\nsocks5:      {socks5}\n\
+             access:      {access}\nno_proxy:    {no_proxy}\nheaders:     {headers} (set on requests through a parent)\ntunnels:     {tunnels}\nsocks5:      {socks5}\n\
              timeouts:    {timeouts}\nlog level:   {}",
             self.log_level.as_str()
         )
