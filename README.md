@@ -60,6 +60,7 @@ takes the place of the same setting in the file.
 
 ## Documentation
 
+- [Settings](docs/settings.md): every setting of the configuration file, with its default.
 - [Configuration](docs/configuration.md): where the file is, who may read it, reloading.
 - [Authentication](docs/authentication.md): NTLM, Negotiate (Kerberos, and SSPI on Windows), and how to find out why one fails.
 - [A parent that does not work](docs/failover.md): when gatir moves on to the next one, and what it remembers.

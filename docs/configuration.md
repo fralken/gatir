@@ -1,5 +1,7 @@
 # Where the configuration is, and what gatir says
 
+Every setting of the file is listed in [Settings](settings.md).
+
 ## Which file is read
 
 The commands that read the configuration (`run`, `config check`, `detect` and

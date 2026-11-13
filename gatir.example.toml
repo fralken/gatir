@@ -1,8 +1,8 @@
 # An example configuration for gatir. Copy it to ~/.config/gatir/gatir.toml (or
 # name the copy with --config) and edit it. Every name and value here is made up.
 #
-# Lines that start with "# " and hold a setting are alternatives and extras:
-# remove the "# " to turn one on. See the files in docs/ for each part.
+# Commented-out settings are optional: remove the leading "# " to turn one on.
+# docs/settings.md lists every setting, with its default.
 
 # Where gatir listens for programs that use an HTTP proxy. Keep it on the
 # loopback: whoever connects is served with your identity. Addresses are IP
@@ -15,8 +15,10 @@ listen = ["127.0.0.1:3128"]
 # other way of finding the proxy: use one of the two.
 parents = ["proxy.example.com:8080"]
 
-# Destinations reached directly instead of through the parent: names (with *
-# and ?), addresses and ranges.
+# Destinations reached directly instead of through the parent. A name matches
+# only itself (write "*.example.com" for its sub-domains), and * and ? stand for
+# any text. Addresses and ranges match only when a client asks for an address,
+# not for a name.
 no_proxy = ["localhost", "127.0.0.1", "*.internal.example.com", "10.0.0.0/8"]
 
 [credentials]
