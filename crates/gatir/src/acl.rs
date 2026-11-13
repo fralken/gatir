@@ -65,13 +65,9 @@ impl FromStr for Source {
         if text == "*" {
             return Ok(Self::Any);
         }
-        if let Ok(ip) = text.parse::<IpAddr>() {
-            return Ok(Self::Net(IpNet::from(ip)));
-        }
-        // Host bits are ignored: `10.1.2.3/8` means the whole 10.0.0.0/8.
-        text.parse::<IpNet>()
-            .map(|net| Self::Net(net.trunc()))
-            .map_err(|_| SourceError {
+        crate::cidr::parse(text)
+            .map(Self::Net)
+            .ok_or_else(|| SourceError {
                 input: input.to_owned(),
             })
     }
@@ -216,6 +212,17 @@ mod tests {
         ] {
             assert_eq!(acl.check(ip(client)), expected, "{client}");
         }
+    }
+
+    #[test]
+    fn ipv4_mapped_rules_match_ipv4_clients() {
+        let acl = Acl::new(vec![deny("::ffff:10.0.0.0/104")], Action::Allow);
+        assert_eq!(acl.check(ip("10.1.2.3")), Action::Deny);
+        assert_eq!(acl.check(ip("::ffff:10.1.2.3")), Action::Deny);
+        assert_eq!(acl.check(ip("11.0.0.1")), Action::Allow);
+
+        let acl = Acl::new(vec![allow("::ffff:127.0.0.1")], Action::Deny);
+        assert_eq!(acl.check(ip("127.0.0.1")), Action::Allow);
     }
 
     #[test]

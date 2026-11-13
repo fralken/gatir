@@ -3,6 +3,7 @@
 
 pub mod acl;
 pub mod auth;
+mod cidr;
 pub mod cli;
 pub mod config;
 pub mod logging;

@@ -45,10 +45,8 @@ impl NoProxy {
                 .strip_prefix('[')
                 .and_then(|rest| rest.strip_suffix(']'))
                 .unwrap_or(entry);
-            if let Ok(ip) = unbracketed.parse::<IpAddr>() {
-                nets.push(IpNet::from(ip));
-            } else if let Ok(net) = entry.parse::<IpNet>() {
-                nets.push(net.trunc());
+            if let Some(net) = crate::cidr::parse(unbracketed) {
+                nets.push(net);
             } else if let Some(character) = entry.chars().find(|c| "[]{}".contains(*c)) {
                 // A class or an alternative in a glob library: not here, where
                 // only `*` and `?` mean anything, and a typo should be told.
@@ -128,6 +126,15 @@ mod tests {
         ] {
             assert_eq!(list.matches(host), expected, "{host:?}");
         }
+    }
+
+    #[test]
+    fn ipv4_mapped_entries_match_ipv4_hosts() {
+        let list = no_proxy(&["::ffff:192.168.0.0/112", "[::ffff:10.0.0.1]"]);
+        assert!(list.matches("192.168.4.5"));
+        assert!(list.matches("[::ffff:192.168.4.5]"));
+        assert!(list.matches("10.0.0.1"));
+        assert!(!list.matches("192.169.0.1"));
     }
 
     #[test]
