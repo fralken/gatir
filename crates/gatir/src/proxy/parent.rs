@@ -46,6 +46,7 @@
 //! parent answers without asking for credentials, and a Kerberos ticket, whose
 //! refusal costs the account nothing.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,8 +93,12 @@ pub(super) struct ParentAuth {
     authenticator: Authenticator,
     /// Origin servers this may also answer an NTLM challenge from directly.
     origin_hosts: NoProxy,
-    /// When the parent last refused the credentials.
+    /// When the credentials were last refused, with nothing known to say
+    /// they are right.
     rejected_at: Mutex<Option<Instant>>,
+    /// The origin servers (`host:port`) that refused credentials which had
+    /// worked elsewhere, and when.
+    refused_by: Mutex<HashMap<String, Instant>>,
     /// Whether the credentials have worked, and not been refused since.
     verified: AtomicBool,
     /// Held from the moment an NTLM proof is ready until the answer to it
@@ -142,6 +147,7 @@ impl ParentAuth {
             authenticator,
             origin_hosts: credentials.origin_hosts.clone(),
             rejected_at: Mutex::new(None),
+            refused_by: Mutex::new(HashMap::new()),
             verified: AtomicBool::new(false),
             gate: tokio::sync::Mutex::new(()),
         })
@@ -163,7 +169,7 @@ impl ParentAuth {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Fails while the parent's refusal of the credentials is recent.
+    /// Fails while a refusal of the credentials is recent.
     pub(super) fn check(&self) -> Result<(), Failure> {
         match *self.rejected_at() {
             Some(at) if at.elapsed() < COOLDOWN => {
@@ -173,9 +179,27 @@ impl ParentAuth {
         }
     }
 
-    /// Notes that the parent refused the credentials of `whose`: gatir stays
-    /// away from it for a while.
-    fn hold_off(&self, whose: &str) {
+    /// Fails while the origin `server`'s refusal of the credentials is recent.
+    pub(super) fn check_origin(&self, server: &str) -> Result<(), Failure> {
+        let refused_by = self.refused_by();
+        match refused_by.get(server) {
+            Some(at) if at.elapsed() < COOLDOWN => Err(Failure::OriginCoolingDown {
+                server: server.to_owned(),
+                remaining: COOLDOWN - at.elapsed(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    fn refused_by(&self) -> MutexGuard<'_, HashMap<String, Instant>> {
+        self.refused_by
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes that `by` refused the credentials of `whose`: gatir stops using
+    /// them for a while.
+    fn hold_off(&self, whose: &str, by: &str) {
         let mut rejected_at = self.rejected_at();
         let first = rejected_at.is_none_or(|at| at.elapsed() >= COOLDOWN);
         *rejected_at = Some(Instant::now());
@@ -183,8 +207,9 @@ impl ParentAuth {
         if first {
             tracing::warn!(
                 user = %whose,
+                %by,
                 cooldown_secs = COOLDOWN.as_secs(),
-                "the parent proxy rejected the credentials; not trying again for a while"
+                "the credentials were rejected; not trying again for a while"
             );
         }
     }
@@ -355,7 +380,10 @@ pub(super) async fn negotiate_origin(
     let mut first = carrier();
     first.headers_mut().insert(AUTHORIZATION, ntlm.first()?);
     let response = send(sender, first, limit).await?;
-    if response.status() != StatusCode::UNAUTHORIZED {
+    // A `401` for another scheme (Basic, say) is for the client to answer.
+    if response.status() != StatusCode::UNAUTHORIZED
+        || !ntlm::offered(response.headers().get_all(WWW_AUTHENTICATE))
+    {
         return Ok(Outcome::Answered(response));
     }
     let (parts, body) = response.into_parts();
@@ -602,30 +630,51 @@ impl Admission<'_> {
         match &self.auth.authenticator {
             Authenticator::Ntlm(ntlm) => {
                 let user = ntlm.user().to_owned();
-                self.auth.hold_off(&user);
+                self.auth.hold_off(&user, "the parent proxy");
                 Failure::CredentialsRejected { user }
             }
             Authenticator::Negotiate(_) => {
                 let service = self.made.clone().unwrap_or_default();
-                self.auth.hold_off("the logged-on user");
+                self.auth.hold_off("the logged-on user", "the parent proxy");
                 Failure::SessionRejected { service }
             }
         }
     }
 
-    /// The origin server at `host` refused the proof: also a failed logon of
-    /// the same account, so it is held off the same way a parent's refusal
-    /// would be. Only ever called for an NTLM proof: [`ParentAuth::ntlm_for_origin`]
-    /// is what could have made one at all.
-    pub(super) fn refused_by_origin(self, host: &str) -> Failure {
+    /// The origin `server` (`host:port`) refused the proof. Only ever called
+    /// for an NTLM proof: [`ParentAuth::ntlm_for_origin`] is what could have
+    /// made one at all.
+    ///
+    /// Credentials that have worked (with the parent, or another server) are
+    /// not a wrong password: a server also answers `401` to a user it knows but
+    /// does not let in. gatir then keeps away from that server alone. Otherwise
+    /// the password may be wrong, and every attempt anywhere would be another
+    /// failed logon, so it stops using the credentials altogether, as after a
+    /// parent's refusal.
+    pub(super) fn refused_by_origin(self, server: &str) -> Failure {
         let Authenticator::Ntlm(ntlm) = &self.auth.authenticator else {
             unreachable!("origin auth needs the configured NTLM identity")
         };
         let user = ntlm.user().to_owned();
-        self.auth.hold_off(&user);
+        let everywhere = !self.auth.verified.load(Ordering::Acquire);
+        if everywhere {
+            self.auth.hold_off(&user, server);
+        } else {
+            let mut refused_by = self.auth.refused_by();
+            refused_by.retain(|_, at| at.elapsed() < COOLDOWN);
+            refused_by.insert(server.to_owned(), Instant::now());
+            tracing::warn!(
+                user = %user,
+                %server,
+                cooldown_secs = COOLDOWN.as_secs(),
+                "the server rejected credentials that work elsewhere; not sending them to it \
+                 for a while"
+            );
+        }
         Failure::OriginCredentialsRejected {
             user,
-            host: host.to_owned(),
+            server: server.to_owned(),
+            everywhere,
         }
     }
 }

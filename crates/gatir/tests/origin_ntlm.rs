@@ -9,7 +9,7 @@ use common::*;
 use gatir_testkit::http::Response;
 use gatir_testkit::ntlm_origin::MockNtlmOrigin;
 use gatir_testkit::ntlm_parent::Account;
-use gatir_testkit::origin::Reply;
+use gatir_testkit::origin::{MockOrigin, Reply};
 
 async fn origin_with(account: Account) -> MockNtlmOrigin {
     MockNtlmOrigin::start(account, |request| {
@@ -112,6 +112,71 @@ async fn a_wrong_password_is_reported_and_not_tried_again_for_a_while() {
     let response = ask(&proxy, &origin, "/").await;
     assert_eq!(response.status, 503);
     assert_eq!(origin.requests().len(), tried, "nothing more goes out");
+}
+
+/// A server that knows the user but does not let them in answers `401` too.
+/// Once the credentials have worked, that is no reason to stop using them
+/// everywhere else.
+#[tokio::test]
+async fn a_refusal_after_the_credentials_worked_keeps_away_from_that_server_only() {
+    let first = origin_with(Account::new("alice", "CORP", "s3cret")).await;
+    let refusing = origin_with(Account::new("alice", "CORP", "another")).await;
+    let third = origin_with(Account::new("alice", "CORP", "s3cret")).await;
+    let proxy = start_proxy(&config(&first)).await;
+
+    assert_eq!(ask(&proxy, &first, "/").await.status, 200);
+
+    let response = ask(&proxy, &refusing, "/").await;
+    assert_eq!(response.status, 502);
+    let text = response.body_text();
+    assert!(text.contains("which work elsewhere"), "{text}");
+    let tried = refusing.requests().len();
+
+    let response = ask(&proxy, &refusing, "/").await;
+    assert_eq!(response.status, 503, "{}", response.body_text());
+    assert_eq!(refusing.requests().len(), tried, "nothing more goes to it");
+
+    // A new connection to another server still authenticates.
+    let response = ask(&proxy, &third, "/").await;
+    assert_eq!(response.status, 200, "{}", response.body_text());
+}
+
+/// gatir only answers NTLM: a `401` for another scheme is the client's to
+/// answer, whether it comes back to the first request or to the real one
+/// after a probe.
+#[tokio::test]
+async fn a_401_that_does_not_offer_ntlm_is_passed_to_the_client() {
+    let origin = MockOrigin::start(|_| {
+        Reply::raw(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"intranet\"\r\n\
+             Content-Length: 0\r\n\r\n",
+        )
+    })
+    .await;
+    let proxy = start_proxy(&format!(
+        "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"s3cret\"\n\
+         origin_hosts = [\"{}\"]\n",
+        origin.addr().ip()
+    ))
+    .await;
+
+    let authority = origin.addr().to_string();
+    let post = format!(
+        "POST http://{authority}/form HTTP/1.1\r\nHost: {authority}\r\n\
+         Content-Length: 5\r\n\r\nhello"
+    );
+    for request in [get(&authority, "/", ""), post] {
+        let mut client = gatir_testkit::http::RawClient::connect(proxy.addr)
+            .await
+            .unwrap();
+        client.send(&request).await.unwrap();
+        let response = client.read_response(false).await.unwrap();
+        assert_eq!(response.status, 401, "{}", response.body_text());
+        assert_eq!(
+            response.headers.get("www-authenticate"),
+            Some("Basic realm=\"intranet\"")
+        );
+    }
 }
 
 #[tokio::test]

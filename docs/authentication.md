@@ -90,8 +90,21 @@ answer such a challenge with, so `origin_hosts` needs an NTLM secret
 (`password`, `nt_hash` or `ntlmv2_hash`) and is rejected at start-up otherwise.
 
 A wrong password here counts as a failed logon against the same account as a
-wrong one against the parent, and is held off the same way: one attempt at a
-time, and five minutes away from a server that refuses it.
+wrong one against the parent, so it is guarded the same way: one attempt at a
+time until the credentials have worked once. What happens after a server refuses
+them depends on whether they have:
+
+- **They have not worked yet**: the password may be wrong, so gatir stops using
+  the credentials for five minutes, with the parent too.
+- **They have worked** (with the parent, or another server): the server most
+  likely knows the user but does not let them in. gatir keeps away from that
+  server alone for five minutes.
+
+A `401` that does not offer NTLM (only `Basic`, say) is passed on to the client.
+
+A server that asks for credentials for some requests and not others (a `POST`
+but not a `GET`) is not supported: a request with a body is preceded by a `GET`,
+and if only the request itself is refused, it cannot be sent again.
 
 ## Finding out why it does not work
 

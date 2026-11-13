@@ -148,6 +148,14 @@ pub fn challenge<'a>(
         .map_err(|err| AuthError::BadChallenge(err.to_string()))
 }
 
+/// Whether the authentication fields (`Proxy-Authenticate` or
+/// `WWW-Authenticate`) offer NTLM at all.
+pub fn offered<'a>(fields: impl IntoIterator<Item = &'a HeaderValue>) -> bool {
+    offers::all(fields)
+        .iter()
+        .any(|offer| offer.scheme.eq_ignore_ascii_case(SCHEME))
+}
+
 /// The token of the NTLM challenge among the `Proxy-Authenticate` fields.
 fn find_challenge<'a>(
     fields: impl IntoIterator<Item = &'a HeaderValue>,

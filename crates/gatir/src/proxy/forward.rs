@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Incoming};
-use hyper::header::{AUTHORIZATION, HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION};
+use hyper::header::{
+    AUTHORIZATION, HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION, WWW_AUTHENTICATE,
+};
 use hyper::http::Extensions;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use tokio::net::TcpStream;
@@ -17,6 +19,7 @@ use super::parent::{Admission, Outcome, ParentAuth, negotiate_origin, reusable};
 use super::pool::Lease;
 use super::server::{Context, Live};
 use super::upstream::{Hop, Opened, handshake};
+use crate::auth::ntlm;
 use crate::config::HeaderRule;
 
 pub(super) async fn handle(
@@ -139,7 +142,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 if let Some(proof) = admission.take() {
                     return Err(match &lease.hop {
                         Hop::Parent(_) => proof.refused(),
-                        Hop::Direct => proof.refused_by_origin(&target.host),
+                        Hop::Direct => proof.refused_by_origin(&target.address),
                     });
                 }
                 // No proof went out on this connection: it had been
@@ -252,6 +255,7 @@ fn demands_authentication(
                 .as_deref()
                 .is_some_and(|auth| auth.ntlm_for_origin(host).is_some())
                 && response.status() == StatusCode::UNAUTHORIZED
+                && ntlm::offered(response.headers().get_all(WWW_AUTHENTICATE))
         }
     }
 }
@@ -317,6 +321,7 @@ async fn authenticate<'a>(
                 "a direct connection needs authentication only when the host is one of \
                  credentials.origin_hosts",
             );
+            auth.check_origin(&target.address)?;
             let outcome = negotiate_origin(ntlm, &mut lease.sender, carrier, limit).await?;
             (outcome, AUTHORIZATION)
         }

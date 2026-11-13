@@ -66,13 +66,20 @@ pub(super) enum Failure {
         user: String,
     },
     /// An origin server named in `credentials.origin_hosts` answered the NTLM
-    /// proof with another `401`.
+    /// proof with another `401`. `everywhere` if the credentials are no longer
+    /// used at all, not only with this server.
     OriginCredentialsRejected {
         user: String,
-        host: String,
+        server: String,
+        everywhere: bool,
     },
-    /// The parent refused the credentials recently, so nobody is trying yet.
+    /// The credentials were refused recently, so nobody is trying yet.
     CoolingDown(Duration),
+    /// The origin `server` refused credentials that work elsewhere recently.
+    OriginCoolingDown {
+        server: String,
+        remaining: Duration,
+    },
     /// The parent offers Negotiate and did not accept the Kerberos ticket.
     TicketRejected {
         service: String,
@@ -171,10 +178,24 @@ impl Failure {
                  account does not get locked.",
                 COOLDOWN.as_secs() / 60
             )),
-            Self::OriginCredentialsRejected { user, host } => bad_gateway(format!(
-                "{host} rejected the credentials of {user}. Check credentials.origin_hosts, and \
-                 the user name, domain and password. gatir will not try again for {} minutes, \
-                 so that the account does not get locked.",
+            Self::OriginCredentialsRejected {
+                user,
+                server,
+                everywhere: true,
+            } => bad_gateway(format!(
+                "{server} rejected the credentials of {user}. Check credentials.origin_hosts, \
+                 and the user name, domain and password. gatir will not try again for {} \
+                 minutes, so that the account does not get locked.",
+                COOLDOWN.as_secs() / 60
+            )),
+            Self::OriginCredentialsRejected {
+                user,
+                server,
+                everywhere: false,
+            } => bad_gateway(format!(
+                "{server} rejected the credentials of {user}, which work elsewhere: the account \
+                 may not be allowed on this server. gatir will not send them to it again for {} \
+                 minutes.",
                 COOLDOWN.as_secs() / 60
             )),
             Self::Pac(err) => bad_gateway(format!(
@@ -199,8 +220,16 @@ impl Failure {
             Self::CoolingDown(remaining) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "The parent proxy rejected the credentials recently. Not trying again for \
-                     {} seconds, so that the account does not get locked.",
+                    "The credentials were rejected recently. Not trying again for {} seconds, \
+                     so that the account does not get locked.",
+                    remaining.as_secs() + 1
+                ),
+            ),
+            Self::OriginCoolingDown { server, remaining } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "{server} rejected the credentials recently. Not sending them to it again \
+                     for {} seconds.",
                     remaining.as_secs() + 1
                 ),
             ),
@@ -221,7 +250,7 @@ impl Failure {
     pub(super) fn into_response(self) -> Response<Body> {
         let (status, message) = self.status_and_message();
         let mut response = error_response(status, message, matches!(self, Self::BadRequest(_)));
-        if let Self::CoolingDown(remaining) = &self {
+        if let Self::CoolingDown(remaining) | Self::OriginCoolingDown { remaining, .. } = &self {
             response
                 .headers_mut()
                 .insert(RETRY_AFTER, HeaderValue::from(remaining.as_secs() + 1));
