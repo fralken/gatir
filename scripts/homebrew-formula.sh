@@ -61,7 +61,8 @@ class Gatir < Formula
 
   def caveats
     <<~EOS
-      gatir needs a configuration file before it can run:
+      To use your company's proxy, gatir needs to know it and your
+      credentials: copy the example configuration and edit it.
         mkdir -p ~/.config/gatir
         cp #{doc}/gatir.example.toml ~/.config/gatir/gatir.toml
         chmod 600 ~/.config/gatir/gatir.toml
