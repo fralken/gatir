@@ -37,10 +37,13 @@ const DEFAULT_LISTEN: SocketAddr =
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("cannot read config file {}: {source}", path.display())]
+    /// The cause is part of the message, not a `source`: a reload logs only
+    /// the message, and a `source` would make the command line print the cause
+    /// a second time.
+    #[error("cannot read config file {}: {error}", path.display())]
     Read {
         path: PathBuf,
-        source: std::io::Error,
+        error: std::io::Error,
     },
     #[error("invalid config at {location}: {message}")]
     Parse { location: String, message: String },
@@ -136,6 +139,8 @@ pub struct Config {
     pub socks5: Option<Socks5>,
     pub timeouts: Timeouts,
     pub log_level: LogLevel,
+    /// Whether the file holds a secret: see [`Config::holds_secrets`].
+    secrets_in_file: bool,
 }
 
 /// The parts of a configuration that only a new start applies: where gatir
@@ -330,6 +335,10 @@ pub struct PacConfig {
     pub fetch_timeout: Duration,
 }
 
+/// How long a PAC script may take to be fetched, unless `fetch_timeout_secs`
+/// says otherwise.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl PacConfig {
     pub fn with_defaults(location: PacLocation) -> Self {
         // A file is cheap to read again, and edited by hand: look often. So is
@@ -343,7 +352,7 @@ impl PacConfig {
             location,
             overrides: Vec::new(),
             refresh,
-            fetch_timeout: Duration::from_secs(15),
+            fetch_timeout: DEFAULT_FETCH_TIMEOUT,
         }
     }
 
@@ -515,10 +524,10 @@ impl Config {
         let raw = match path {
             Some(path) => {
                 // The file may contain a password: wipe our copy once parsed.
-                let source = Zeroizing::new(fs::read_to_string(path).map_err(|source| {
+                let source = Zeroizing::new(fs::read_to_string(path).map_err(|error| {
                     ConfigError::Read {
                         path: path.to_owned(),
-                        source,
+                        error,
                     }
                 })?);
                 RawConfig::parse(&source, &path.display().to_string())?
@@ -547,17 +556,11 @@ impl Config {
         }
     }
 
-    /// Whether the configuration holds something a stranger must not read: a
-    /// password or hash, the password of the SOCKS5 server, or a header value.
+    /// Whether the file the configuration was read from holds something a
+    /// stranger must not read: a password or hash, the password of the SOCKS5
+    /// server, or a header value. A password typed at the prompt is not in it.
     pub fn holds_secrets(&self) -> bool {
-        self.credentials
-            .as_ref()
-            .is_some_and(|credentials| credentials.secret.is_some())
-            || self
-                .socks5
-                .as_ref()
-                .is_some_and(|socks5| socks5.credentials.is_some())
-            || !self.request_headers.is_empty()
+        self.secrets_in_file
     }
 
     /// A multi-line description that never includes secret values.
@@ -691,6 +694,7 @@ impl RawConfig {
 
     /// `base` is the directory of the configuration file, if it was read from one.
     fn resolve(self, overrides: Overrides, base: Option<&Path>) -> Result<Config, ConfigError> {
+        let secrets_in_file = self.holds_secrets();
         let listen = if overrides.listen.is_empty() {
             self.listen.unwrap_or_else(|| vec![DEFAULT_LISTEN])
         } else {
@@ -836,7 +840,24 @@ impl RawConfig {
             socks5,
             timeouts,
             log_level,
+            secrets_in_file,
         })
+    }
+
+    /// See [`Config::holds_secrets`].
+    fn holds_secrets(&self) -> bool {
+        self.credentials.as_ref().is_some_and(|credentials| {
+            credentials.password.is_some()
+                || credentials.nt_hash.is_some()
+                || credentials.ntlmv2_hash.is_some()
+        }) || self
+            .socks5
+            .as_ref()
+            .is_some_and(socks5::RawSocks5::holds_secret)
+            || self
+                .headers
+                .as_ref()
+                .is_some_and(|headers| !headers.is_empty())
     }
 }
 
@@ -1323,6 +1344,33 @@ mod tests {
                 .summary()
                 .contains("default allow, no rules")
         );
+    }
+
+    #[test]
+    fn only_secrets_in_the_file_count_as_held() {
+        assert!(!load("").unwrap().holds_secrets());
+        assert!(
+            !load("[credentials]\nmethod = \"negotiate\"\n")
+                .unwrap()
+                .holds_secrets()
+        );
+        for toml in [
+            "[credentials]\nusername = \"u\"\npassword = \"p\"\n",
+            "[credentials]\nusername = \"u\"\nnt_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"\n",
+            "[socks5]\nlisten = [\"127.0.0.1:1080\"]\nusername = \"u\"\npassword = \"p\"\n",
+            "[headers]\nX-Token = \"t\"\n",
+        ] {
+            assert!(load(toml).unwrap().holds_secrets(), "{toml}");
+        }
+
+        // A password typed at the prompt is in memory, not in the file.
+        let overrides = Overrides {
+            password: Some(SecretString::from("typed")),
+            ..Overrides::default()
+        };
+        let config = Config::from_toml_str("[credentials]\nusername = \"u\"\n", overrides).unwrap();
+        assert!(config.credentials.as_ref().unwrap().secret.is_some());
+        assert!(!config.holds_secrets());
     }
 
     #[test]

@@ -22,15 +22,16 @@ const OVERRIDES: &str = "[[pac.overrides]]\n\
 hosts = [\"ghcr.io\", \"githubusercontent.com\"]\n\
 proxy = \"PROXY a.example.com:80; PROXY b.example.com:80\"\n";
 
-/// A gatir that finds nothing of the machine it runs on: it runs in `dir`, where
-/// its configuration is.
-fn gatir(dir: &Path) -> Command {
+/// `gatir pac`, finding nothing of the machine it runs on: it runs in `dir`,
+/// where its configuration is.
+fn gatir_pac(dir: &Path) -> Command {
     let mut command = Command::cargo_bin("gatir").unwrap();
     command
         .env("HOME", "/nonexistent/gatir-test-home")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("NO_COLOR")
         .current_dir(dir)
+        .arg("pac")
         .arg("--config")
         .arg(dir.join("gatir.toml"));
     command
@@ -63,8 +64,8 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 fn export(dir: &Path, output: &str) -> Command {
-    let mut command = gatir(dir);
-    command.args(["pac", "export", "--output", output]);
+    let mut command = gatir_pac(dir);
+    command.args(["export", "--output", output]);
     command
 }
 
@@ -99,8 +100,8 @@ fn the_script_is_written_where_the_output_says_and_the_original_is_kept() {
 #[test]
 fn without_an_output_the_script_goes_to_the_standard_output_and_nothing_else() {
     let dir = workdir();
-    let assert = gatir(dir.path())
-        .args(["pac", "export"])
+    let assert = gatir_pac(dir.path())
+        .arg("export")
         .assert()
         .success()
         .stderr("");
@@ -257,11 +258,40 @@ fn a_script_can_be_fetched_from_an_address() {
 }
 
 #[test]
+fn the_configured_fetch_timeout_applies() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let origin = runtime.block_on(MockOrigin::start(|_| {
+        Reply::ok(ORIGINAL).after(std::time::Duration::from_secs(10))
+    }));
+    let dir = workdir();
+    let address = format!("http://{}/proxy.pac", origin.authority());
+    configure(
+        dir.path(),
+        &format!("[pac]\nurl = {address:?}\nfetch_timeout_secs = 1\n"),
+    );
+
+    let started = std::time::Instant::now();
+    gatir_pac(dir.path())
+        .args(["test", "ghcr.io"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("within 1 second"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn test_shows_what_the_overrides_change() {
     let dir = workdir();
 
-    let assert = gatir(dir.path())
-        .args(["pac", "test"])
+    let assert = gatir_pac(dir.path())
+        .arg("test")
         .args([
             "ghcr.io",
             "https://pkg.githubusercontent.com/x",
@@ -300,9 +330,8 @@ fn test_compares_scripts_that_are_named_as_they_are() {
 
     // --script is the file as it is, without the overrides of the configuration:
     // here the exported file already has them.
-    gatir(dir.path())
+    gatir_pac(dir.path())
         .args([
-            "pac",
             "test",
             "--script",
             "./original.pac",
@@ -328,8 +357,8 @@ fn test_without_overrides_shows_one_answer() {
     let dir = workdir();
     configure(dir.path(), "[pac]\nfile = \"original.pac\"\n");
 
-    gatir(dir.path())
-        .args(["pac", "test", "ghcr.io"])
+    gatir_pac(dir.path())
+        .args(["test", "ghcr.io"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -338,8 +367,8 @@ fn test_without_overrides_shows_one_answer() {
 
     // No script anywhere: it says so.
     configure(dir.path(), "parents = [\"p.example.com:80\"]\n");
-    gatir(dir.path())
-        .args(["pac", "test", "ghcr.io"])
+    gatir_pac(dir.path())
+        .args(["test", "ghcr.io"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no PAC script"));
@@ -348,9 +377,8 @@ fn test_without_overrides_shows_one_answer() {
 #[test]
 fn test_fails_when_a_script_cannot_be_used() {
     let dir = workdir();
-    gatir(dir.path())
+    gatir_pac(dir.path())
         .args([
-            "pac",
             "test",
             "--script",
             "./original.pac",

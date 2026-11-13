@@ -55,6 +55,10 @@ pub(super) struct RawSocks5 {
 }
 
 impl RawSocks5 {
+    pub(super) fn holds_secret(&self) -> bool {
+        self.password.is_some()
+    }
+
     /// `from_command_line` are the addresses given with `--socks5`, which
     /// replace those of the file.
     pub(super) fn resolve(self, from_command_line: Vec<SocketAddr>) -> Result<Socks5, ConfigError> {

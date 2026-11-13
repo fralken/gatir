@@ -12,8 +12,8 @@ use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use hyper::Uri;
 
-use super::Source;
-use crate::config::{Overrides, PacConfig, PacLocation};
+use super::{ConfigArgs, Source};
+use crate::config::{DEFAULT_FETCH_TIMEOUT, PacConfig, PacLocation};
 use crate::pac::{
     Fetched, OperatingSystem, PacEnv, PacOverride, Route, SystemPac, SystemResolver, Trust,
     Validators, check, fetch, load_script, read_script_file, tool_limits, wrap,
@@ -66,27 +66,21 @@ pub struct TestArgs {
     pub scripts: Vec<PacLocation>,
 }
 
-pub(super) fn run(
-    command: PacCommand,
-    config: Option<PathBuf>,
-    overrides: Overrides,
-    password_prompt: bool,
-) -> anyhow::Result<()> {
+pub(super) fn run(command: PacCommand, source: ConfigArgs) -> anyhow::Result<()> {
     // Read, not started: these are tools, with nothing to log.
-    let configured = |config: &Option<PathBuf>, overrides| -> anyhow::Result<PacConfig> {
-        let source = Source::new(config.clone(), overrides, password_prompt)?;
-        source.read()?.pac.context(
+    let configured = |source: ConfigArgs| -> anyhow::Result<PacConfig> {
+        Source::new(source)?.read()?.pac.context(
             "the configuration has no PAC script: add a [pac] table to it, or name one with --pac",
         )
     };
     match command {
         PacCommand::Export(args) => {
-            let pac = configured(&config, overrides)?;
+            let pac = configured(source)?;
             export(&args, &pac)
         }
         PacCommand::Test(args) => {
             let asked = if args.scripts.is_empty() {
-                let pac = configured(&config, overrides)
+                let pac = configured(source)
                     .map_err(|err| anyhow::anyhow!("{err}; or ask a script with --script"))?;
                 vec![asked_by_configuration(pac)]
             } else {
@@ -96,9 +90,6 @@ pub(super) fn run(
         }
     }
 }
-
-/// How long a script may take to be fetched from an address.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
@@ -116,21 +107,17 @@ fn resolve(location: &PacLocation) -> anyhow::Result<PacLocation> {
     }
 }
 
-async fn read_script(location: &PacLocation) -> anyhow::Result<Vec<u8>> {
+/// Reads the script at `location`, waiting at most `limit` for an address.
+async fn read_script(location: &PacLocation, limit: Duration) -> anyhow::Result<Vec<u8>> {
     let location = &resolve(location)?;
     match location {
         PacLocation::File(path) => read_script_file(path)
             .await
             .map_err(|err| anyhow::anyhow!("cannot read {}: {err}", path.display())),
         PacLocation::Url(address) => {
-            match fetch(
-                address,
-                FETCH_TIMEOUT,
-                &Validators::default(),
-                &Trust::system(),
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("cannot fetch {location}: {err}"))?
+            match fetch(address, limit, &Validators::default(), &Trust::system())
+                .await
+                .map_err(|err| anyhow::anyhow!("cannot fetch {location}: {err}"))?
             {
                 Fetched::Script { bytes, .. } => Ok(bytes),
                 Fetched::Unchanged => bail!("{location} answered that nothing had changed"),
@@ -159,7 +146,7 @@ fn export(args: &ExportArgs, pac: &PacConfig) -> anyhow::Result<()> {
 
     let (from, script, answers) = runtime()?.block_on(async {
         let from = resolve(&pac.location)?;
-        let original = read_script(&from).await?;
+        let original = read_script(&from, pac.fetch_timeout).await?;
         let script = wrap(&original, &pac.overrides, &from.to_string());
         let answers = check(&script, &pac.overrides).await?;
         anyhow::Ok((from, script, answers))
@@ -323,6 +310,8 @@ fn labels(scripts: &[PacLocation]) -> Vec<String> {
 /// overrides that are added to the script for it.
 struct Asked {
     script: PacLocation,
+    /// How long it may take to fetch.
+    fetch_timeout: Duration,
     ways: Vec<(String, Vec<PacOverride>)>,
 }
 
@@ -340,6 +329,7 @@ fn asked_by_configuration(pac: PacConfig) -> Asked {
     };
     Asked {
         script: pac.location,
+        fetch_timeout: pac.fetch_timeout,
         ways,
     }
 }
@@ -352,6 +342,7 @@ fn asked_by_name(scripts: Vec<PacLocation>) -> Vec<Asked> {
         .zip(labels)
         .map(|(script, label)| Asked {
             script,
+            fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             ways: vec![(label, Vec::new())],
         })
         .collect()
@@ -378,7 +369,7 @@ fn test(urls: &[String], asked: Vec<Asked>) -> anyhow::Result<()> {
         let mut loaded = Vec::new();
         for asked in &asked {
             // Read once, whatever the ways of asking it.
-            let bytes = read_script(&asked.script)
+            let bytes = read_script(&asked.script, asked.fetch_timeout)
                 .await
                 .map_err(|err| err.to_string());
             for (label, overrides) in &asked.ways {

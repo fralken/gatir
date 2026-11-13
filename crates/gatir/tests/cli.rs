@@ -114,7 +114,9 @@ fn config_check_reports_a_missing_file() {
         .args(["config", "check", "--config", "/nonexistent/gatir.toml"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cannot read config file"));
+        .stderr(predicate::str::contains("cannot read config file"))
+        // The cause is said once, in the message, not again as "Caused by".
+        .stderr(predicate::str::contains("Caused by").not());
 }
 
 #[test]

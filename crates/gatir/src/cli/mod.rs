@@ -9,7 +9,7 @@ mod pac;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
 
 use crate::config::{Config, Overrides};
@@ -23,7 +23,16 @@ pub use pac::{ExportArgs, PacCommand, TestArgs};
 #[derive(Debug, Parser)]
 #[command(name = "gatir", version, about, arg_required_else_help = true)]
 pub struct Cli {
-    /// Path to the TOML configuration file
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Where the configuration comes from: the options of the commands that read
+/// it, and only of those.
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// Path to the TOML configuration file (by default, the first found in the
+    /// places listed under FILES in gatir(1))
     #[arg(short, long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
@@ -33,22 +42,23 @@ pub struct Cli {
     /// Ask for the password on the terminal (replaces any password or hash from the file)
     #[arg(long, global = true)]
     pub password_prompt: bool,
-
-    #[command(subcommand)]
-    pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run the proxy until interrupted (Ctrl-C or SIGTERM)
-    Run,
+    Run(ConfigArgs),
 
     /// Compute the NT hash of a password, to store in the configuration in its place
     Hash(HashArgs),
 
     /// Inspect the configuration
-    #[command(subcommand)]
-    Config(ConfigCommand),
+    Config {
+        #[command(flatten)]
+        source: ConfigArgs,
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 
     /// Ask the system for a Negotiate token for a service, and say what it is:
     /// to find out why Kerberos or NTLM single sign-on does not work
@@ -56,11 +66,23 @@ pub enum Command {
 
     /// Probe a real parent proxy for what it offers, and, if credentials are
     /// configured, which one it accepts: unlike `negotiate`, this contacts it
-    Detect(DetectArgs),
+    ///
+    /// Each attempt with the credentials is a real login: if the password is
+    /// wrong, it counts toward locking the account.
+    Detect {
+        #[command(flatten)]
+        source: ConfigArgs,
+        #[command(flatten)]
+        args: DetectArgs,
+    },
 
     /// Write the PAC script gatir runs, with its overrides, and see what a script answers
-    #[command(subcommand)]
-    Pac(PacCommand),
+    Pac {
+        #[command(flatten)]
+        source: ConfigArgs,
+        #[command(subcommand)]
+        command: PacCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -73,14 +95,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Hash(args) => hash::run(&args),
         Command::Negotiate(args) => negotiate::run(&args),
-        Command::Pac(command) => pac::run(command, cli.config, cli.overrides, cli.password_prompt),
-        Command::Detect(args) => {
-            let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
+        Command::Pac { source, command } => pac::run(command, source),
+        Command::Detect { source, args } => {
+            let source = Source::new(source)?;
             let config = load_config(&source)?;
             detect::run(&config, &args)
         }
-        Command::Run => {
-            let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
+        Command::Run(source) => {
+            let source = Source::new(source)?;
             let config = load_config(&source)?;
             if config.parents.is_empty()
                 && config.pac.is_none()
@@ -102,8 +124,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 .block_on(crate::proxy::run(&config, load))?;
             Ok(())
         }
-        Command::Config(ConfigCommand::Check) => {
-            let source = Source::new(cli.config, cli.overrides, cli.password_prompt)?;
+        Command::Config {
+            source,
+            command: ConfigCommand::Check,
+        } => {
+            let source = Source::new(source)?;
             let config = load_config(&source)?;
             println!("configuration OK");
             match &source.file {
@@ -128,16 +153,17 @@ struct Source {
 }
 
 impl Source {
-    fn new(
-        path: Option<PathBuf>,
-        mut overrides: Overrides,
-        password_prompt: bool,
-    ) -> anyhow::Result<Self> {
+    fn new(args: ConfigArgs) -> anyhow::Result<Self> {
+        let ConfigArgs {
+            config,
+            mut overrides,
+            password_prompt,
+        } = args;
         if password_prompt {
             overrides.password = Some(prompt_password()?);
         }
         Ok(Self {
-            file: path.or_else(crate::config::default_path),
+            file: config.or_else(crate::config::default_path),
             overrides,
         })
     }
@@ -185,12 +211,19 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// The configuration options of `config check`.
+    fn config_check(args: &[&str]) -> ConfigArgs {
+        let mut argv = vec!["gatir", "config", "check"];
+        argv.extend(args);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Config { source, .. } => source,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
-    fn overrides_can_follow_the_subcommand() {
-        let cli = Cli::try_parse_from([
-            "gatir",
-            "config",
-            "check",
+    fn overrides_follow_the_subcommand() {
+        let source = config_check(&[
             "--config",
             "gatir.toml",
             "--listen",
@@ -201,13 +234,54 @@ mod tests {
             "alice",
             "-m",
             "nt",
-        ])
-        .unwrap();
-        assert_eq!(cli.config, Some(PathBuf::from("gatir.toml")));
-        assert_eq!(cli.overrides.listen.len(), 1);
-        assert_eq!(cli.overrides.parents[0].port, 8080);
-        assert_eq!(cli.overrides.username.as_deref(), Some("alice"));
-        assert_eq!(cli.overrides.method, Some(AuthMethod::Nt));
+        ]);
+        assert_eq!(source.config, Some(PathBuf::from("gatir.toml")));
+        assert_eq!(source.overrides.listen.len(), 1);
+        assert_eq!(source.overrides.parents[0].port, 8080);
+        assert_eq!(source.overrides.username.as_deref(), Some("alice"));
+        assert_eq!(source.overrides.method, Some(AuthMethod::Nt));
+    }
+
+    #[test]
+    fn a_group_of_commands_takes_them_before_or_after_its_command() {
+        for argv in [
+            ["gatir", "pac", "--config", "gatir.toml", "export"],
+            ["gatir", "pac", "export", "--config", "gatir.toml"],
+        ] {
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Pac { source, .. } => {
+                    assert_eq!(source.config, Some(PathBuf::from("gatir.toml")));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn commands_that_do_not_read_the_configuration_refuse_its_options() {
+        for argv in [
+            vec!["gatir", "hash", "--stdin", "--listen", "127.0.0.1:1"],
+            vec!["gatir", "hash", "--config", "gatir.toml"],
+            vec![
+                "gatir",
+                "negotiate",
+                "--service",
+                "HTTP@p",
+                "--parent",
+                "p:1",
+            ],
+            vec![
+                "gatir",
+                "negotiate",
+                "--service",
+                "HTTP@p",
+                "--password-prompt",
+            ],
+            // Before the command, they belong to no command at all.
+            vec!["gatir", "--config", "gatir.toml", "run"],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
     }
 
     #[test]
@@ -216,8 +290,7 @@ mod tests {
         assert!(Cli::try_parse_from(["gatir", "config", "check", "--password", "x"]).is_err());
         assert!(Cli::try_parse_from(["gatir", "config", "check", "-p", "x"]).is_err());
 
-        let cli = Cli::try_parse_from(["gatir", "config", "check", "--password-prompt"]).unwrap();
-        assert!(cli.password_prompt);
+        assert!(config_check(&["--password-prompt"]).password_prompt);
     }
 
     #[test]
