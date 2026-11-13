@@ -498,7 +498,14 @@ pub(crate) fn accepts(
     if !user.eq_ignore_ascii_case(&account.user) || !domain.eq_ignore_ascii_case(&account.domain) {
         return false;
     }
-    if !valid_response(&auth, &user, &domain, &account.password, challenge) {
+    if !valid_response(
+        &auth,
+        &user,
+        &domain,
+        &account.password,
+        challenge,
+        timestamp.is_some(),
+    ) {
         return false;
     }
     // An NTLMv2 blob must carry the target info the server sent, and its
@@ -518,12 +525,16 @@ pub(crate) fn accepts(
 
 /// The cryptographic check of an AUTHENTICATE message: does its response
 /// prove knowledge of `password`, given the `challenge` that was sent?
+/// `timestamped` if the target info carried the server's clock, in which case
+/// an NTLMv2 client sends zeros instead of the LMv2 response (MS-NLMP
+/// 3.1.5.1.2).
 fn valid_response(
     auth: &Authenticate<'_>,
     user: &str,
     domain: &str,
     password: &str,
     challenge: &[u8; 8],
+    timestamped: bool,
 ) -> bool {
     let nt_hash: [u8; 16] = Md4::digest(utf16(password)).into();
     match auth.nt.len() {
@@ -554,8 +565,11 @@ fn valid_response(
                 && blob[1] == 1
                 && proof == hmac_md5(&key, &[challenge, blob]);
             // LMv2: HMAC-MD5 over both challenges, then the client nonce.
-            let lm_ok = auth.lm.len() == 24
-                && auth.lm[..16] == hmac_md5(&key, &[challenge, &auth.lm[16..]]);
+            let lm_ok = if timestamped {
+                auth.lm == [0; 24]
+            } else {
+                auth.lm.len() == 24 && auth.lm[..16] == hmac_md5(&key, &[challenge, &auth.lm[16..]])
+            };
             nt_ok && lm_ok
         }
         _ => false,
@@ -739,7 +753,7 @@ mod tests {
         let unicode = auth.flags & UNICODE != 0;
         let user = auth.text(auth.user, unicode);
         let domain = auth.text(auth.domain, unicode);
-        valid_response(&auth, &user, &domain, password, challenge)
+        valid_response(&auth, &user, &domain, password, challenge, false)
     }
 
     #[test]

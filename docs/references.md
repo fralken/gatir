@@ -42,6 +42,7 @@ depends on a detail of it.
 |---|---|---|
 | 2.2.1.1 to 2.2.1.3 | NEGOTIATE, CHALLENGE and AUTHENTICATE messages | `message.rs` |
 | 2.2.2.1, 2.2.2.5, 2.2.2.7 | AV pairs, negotiate flags, the NTLMv2 client blob | `message.rs`, `response.rs` |
+| 3.1.5.1.2 | The client's answer to a CHALLENGE: zeros for the LMv2 response when the server sent its clock | `message.rs` |
 | 3.3.1, 3.3.2 | NTLMv1 and NTLMv2 authentication: hashes and responses | `hash.rs`, `response.rs` |
 | 4.2 | Cryptographic values for validation: the test vectors | tests in `hash.rs`, `response.rs`, `message.rs` |
 | 6 | Appendix A, cryptographic operations (`DESL`) | `response.rs` |

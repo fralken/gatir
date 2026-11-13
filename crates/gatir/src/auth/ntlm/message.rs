@@ -7,7 +7,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::hash::{NtHash, Ntlmv2Hash};
-use super::response::{CHALLENGE_LEN, ntlm2_session_responses, ntlmv1_responses, ntlmv2_responses};
+use super::response::{
+    CHALLENGE_LEN, LMV2_RESPONSE_LEN, ntlm2_session_responses, ntlmv1_responses, ntlmv2_responses,
+};
 use crate::config::AuthMethod;
 
 /// NEGOTIATE flags (MS-NLMP 2.2.2.5), the subset used here.
@@ -88,17 +90,20 @@ impl Challenge {
             return Err(MessageError::WrongType(message_type));
         }
 
+        let flags = u32_at(message, 20);
         let mut server_challenge = [0u8; CHALLENGE_LEN];
         server_challenge.copy_from_slice(&message[24..32]);
 
-        // Older servers stop after the reserved field and send no target info.
-        let target_info = if message.len() >= 48 {
+        // The flag says whether the header goes on with a TargetInfo field.
+        // Older servers end it after the reserved field, and the payload (the
+        // target name) may then start where that field would be.
+        let target_info = if flags & flags::TARGET_INFO != 0 && message.len() >= 48 {
             field_at(message, 40)?.to_vec()
         } else {
             Vec::new()
         };
         Ok(Self {
-            flags: u32_at(message, 20),
+            flags,
             server_challenge,
             target_info,
         })
@@ -266,15 +271,21 @@ pub fn authenticate<'a>(
             };
             // Use the server's clock when it gave one, so a skewed local
             // clock cannot make the response look stale.
-            let time = challenge.timestamp().unwrap_or(entropy.time);
+            let timestamp = challenge.timestamp();
             let responses = ntlmv2_responses(
                 v2_hash,
                 server_challenge,
                 &entropy.client_nonce,
                 &challenge.target_info,
-                time,
+                timestamp.unwrap_or(entropy.time),
             );
-            (responses.lm.to_vec(), responses.nt)
+            // With the server's clock in the target info, the LMv2 response is
+            // replaced by zeros (MS-NLMP 3.1.5.1.2).
+            let lm = match timestamp {
+                Some(_) => vec![0; LMV2_RESPONSE_LEN],
+                None => responses.lm.to_vec(),
+            };
+            (lm, responses.nt)
         }
         (_, Key::Ntlmv2(_)) => return Err(MessageError::NtHashRequired),
         (Dialect::V1Extended, Key::Nt(nt_hash))
@@ -365,12 +376,16 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// The bytes a field descriptor at `position` points to.
+/// The bytes a field descriptor at `position` points to. The offset of an
+/// empty field is not checked: MS-NLMP does not require it to be meaningful.
 fn field_at(message: &[u8], position: usize) -> Result<&[u8], MessageError> {
     let length = usize::from(u16::from_le_bytes([
         message[position],
         message[position + 1],
     ]));
+    if length == 0 {
+        return Ok(&[]);
+    }
     let offset = u32_at(message, position + 4) as usize;
     let end = offset.checked_add(length).ok_or(MessageError::BadField)?;
     message.get(offset..end).ok_or(MessageError::BadField)
@@ -380,8 +395,14 @@ fn field_at(message: &[u8], position: usize) -> Result<&[u8], MessageError> {
 mod tests {
     use super::*;
 
-    /// A CHALLENGE message as a server would send it.
+    /// A CHALLENGE message as a server would send it: the TARGET_INFO flag is
+    /// added when there is target info.
     fn challenge_message(flags: u32, server_challenge: [u8; 8], target_info: &[u8]) -> Vec<u8> {
+        let flags = if target_info.is_empty() {
+            flags
+        } else {
+            flags | flags::TARGET_INFO
+        };
         let mut message = Vec::new();
         message.extend_from_slice(SIGNATURE);
         message.extend_from_slice(&TYPE_CHALLENGE.to_le_bytes());
@@ -437,6 +458,30 @@ mod tests {
         let challenge = Challenge::parse(&message).unwrap();
         assert!(challenge.target_info.is_empty());
         assert_eq!(challenge.server_challenge, [9; 8]);
+    }
+
+    #[test]
+    fn without_the_target_info_flag_the_bytes_after_the_header_are_not_a_field() {
+        // An older server: the header ends at 40, and the target name follows.
+        let name: Vec<u8> = "CORP".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut message = challenge_message(flags::UNICODE, [9; 8], &[]);
+        message.truncate(CHALLENGE_MIN_LEN);
+        message[12..14].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        message[14..16].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        message[16..20].copy_from_slice(&40u32.to_le_bytes());
+        message.extend_from_slice(&name);
+
+        let challenge = Challenge::parse(&message).unwrap();
+        assert!(challenge.target_info.is_empty());
+        assert_eq!(challenge.server_challenge, [9; 8]);
+    }
+
+    #[test]
+    fn an_empty_field_may_point_anywhere() {
+        let mut message = challenge_message(flags::TARGET_INFO, [5; 8], &[]);
+        message[44..48].copy_from_slice(&0x1000u32.to_le_bytes());
+        let challenge = Challenge::parse(&message).unwrap();
+        assert!(challenge.target_info.is_empty());
     }
 
     #[test]
@@ -677,6 +722,8 @@ mod tests {
         let nt = authenticate_field(&message, 1);
         // proof (16) + version bytes and reserved (8), then the time
         assert_eq!(&nt[24..32], &42u64.to_le_bytes());
+        // With the server's clock, the LMv2 response is all zeros.
+        assert_eq!(authenticate_field(&message, 0), [0; LMV2_RESPONSE_LEN]);
     }
 
     #[test]
