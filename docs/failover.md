@@ -27,12 +27,20 @@ it answered.
 
 ## When the request cannot go to the next one
 
-The next parent is given the same request when nothing of it was delivered: for
-a tunnel (`CONNECT`, SOCKS5, `-L`) always, and for a request when the parent
-failed during authentication (only a probe or the head of the request went out),
-or when the request has no body. A request with a body that was already being
-sent, to a parent that wants no authentication, cannot be sent twice: that one
-gets a `502`, and the next request does go to the next parent.
+A parent that ends the connection after reading a request may have passed it on
+first, so the next parent is given the same request only when doing it twice is
+harmless:
+
+- **A tunnel** (`CONNECT`, SOCKS5, `-L`): always. Nothing goes through it
+  before the parent answers.
+- **A request without a body whose method is idempotent** (`GET`, `HEAD`,
+  `OPTIONS`, `TRACE`, `PUT`, `DELETE`, as defined by RFC 9110).
+- **Any request, when the parent fails during authentication.** Only a probe
+  (a `GET`) has gone out by then, or the request itself if it is one of the
+  above.
+
+Any other request, such as a `POST`, gets a `502`, and the next request goes to
+the next parent.
 
 If none is left, the client gets a `502` that names every parent and how it
 failed, and the log has a `warn` line for each:

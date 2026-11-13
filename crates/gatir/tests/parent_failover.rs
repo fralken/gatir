@@ -239,6 +239,80 @@ async fn a_request_with_a_body_is_not_lost_nor_sent_twice() {
     }
 }
 
+/// A parent that reads the request, then closes the connection without an
+/// answer: it may have passed the request on before it failed.
+async fn swallowing_parent() -> MockOrigin {
+    MockOrigin::start(|_| Reply::raw("").then_close()).await
+}
+
+/// A bodiless request, with `method`.
+fn bodiless(method: &str) -> String {
+    format!(
+        "{method} http://origin.example.com/do HTTP/1.1\r\n\
+         Host: origin.example.com\r\nContent-Length: 0\r\n\r\n"
+    )
+}
+
+#[tokio::test]
+async fn a_bodiless_request_that_is_not_safe_to_repeat_is_not_sent_twice() {
+    for method in ["POST", "PATCH"] {
+        let swallowing = swallowing_parent().await;
+        let live = live_parent("live").await;
+        let proxy = start_proxy(&parents_toml(&[swallowing.addr(), live.addr()])).await;
+
+        let first = ask(&proxy, bodiless(method)).await;
+        assert_eq!(first.status, 502, "{method}: {}", first.body_text());
+        assert_eq!(swallowing.requests().len(), 1, "{method}");
+        assert!(live.requests().is_empty(), "{method}: sent twice");
+
+        // The parent has been given up on all the same.
+        let second = ask(&proxy, bodiless(method)).await;
+        assert_eq!(second.status, 200, "{method}");
+        assert_eq!(swallowing.requests().len(), 1, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn a_bodiless_request_that_is_safe_to_repeat_goes_to_the_next_parent() {
+    for method in ["GET", "PUT", "DELETE"] {
+        let swallowing = swallowing_parent().await;
+        let live = live_parent("live").await;
+        let proxy = start_proxy(&parents_toml(&[swallowing.addr(), live.addr()])).await;
+
+        let response = ask(&proxy, bodiless(method)).await;
+        assert_eq!(response.status, 200, "{method}: {}", response.body_text());
+        assert_eq!(live.requests().len(), 1, "{method}");
+    }
+}
+
+/// With credentials, a request that is not safe to repeat does not open the
+/// exchange itself: a probe does, so a parent that fails then has seen nothing
+/// that acts.
+#[tokio::test]
+async fn a_bodiless_post_is_not_sent_to_a_parent_that_fails_during_authentication() {
+    let swallowing = swallowing_parent().await;
+    let live = MockNtlmParent::start(
+        Account::new("alice", "CORP", "s3cret"),
+        Options::default(),
+        |request| Reply::ok(&request.method),
+    )
+    .await;
+    let proxy = start_proxy(&format!(
+        "{}[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"s3cret\"\n\
+         method = \"ntlmv2\"\n",
+        parents_toml(&[swallowing.addr(), live.addr()])
+    ))
+    .await;
+
+    let response = ask(&proxy, bodiless("POST")).await;
+    assert_eq!(response.status, 200, "{}", response.body_text());
+    assert_eq!(response.body_text(), "POST");
+    let swallowed = swallowing.requests();
+    assert_eq!(swallowed.len(), 1);
+    assert_eq!(swallowed[0].method, "GET", "only the probe may reach it");
+    assert_eq!(live.served().len(), 1);
+}
+
 #[tokio::test]
 async fn the_next_hop_may_be_the_destination_itself() {
     // A parent takes the full URL and a server the path alone: the request is

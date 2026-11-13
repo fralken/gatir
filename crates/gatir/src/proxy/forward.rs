@@ -73,8 +73,8 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         headers: parts.headers.clone(),
         extensions: parts.extensions.clone(),
     });
-    // If a pooled connection turns out to be dead, it may be sent again only
-    // when that cannot change anything twice.
+    // A request that was sent may be sent again (on a new connection, or to
+    // the next parent) only when doing it twice is harmless.
     let replay = head.as_ref().filter(|_| is_idempotent(&parts.method));
 
     // The wait for a response is timed from the moment the request is sent.
@@ -108,7 +108,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 context,
                 &mut lease,
                 &mut request,
-                head.as_ref(),
+                replay,
                 &target,
                 lapsed,
             )
@@ -117,8 +117,8 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 Ok(Authenticated::Answered(response)) => break response,
                 Ok(Authenticated::Proof(proof)) => admission = Some(proof),
                 Ok(Authenticated::Ready) => {}
-                // Nothing of the request was sent but its head, or a probe, so
-                // it is the same for the next parent.
+                // Only a probe went out, or a request that is safe to repeat,
+                // so it is the same for the next parent.
                 Err(Failure::NoAnswer(error)) if lease.hop.is_parent() => {
                     admission = None;
                     lease =
@@ -179,13 +179,15 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             && context.auth.is_none()
             && ended_without_answer(&error)
         {
-            let again = match (returned, head.as_ref()) {
+            // The parent may have passed the request on before it failed, so
+            // only one that is safe to repeat goes to the next parent, unless
+            // hyper never sent it.
+            let again = match (returned, replay) {
                 (Some(returned), _) => Some(returned),
-                (None, Some(head)) => {
+                (None, Some(replay)) => {
                     sent = Sent::already();
-                    Some(head.request(&lease.hop))
+                    Some(replay.request(&lease.hop))
                 }
-                // The body is gone, partly or all of it: it cannot be sent again.
                 (None, None) => None,
             };
             let Some(again) = again else {
@@ -270,23 +272,25 @@ enum Authenticated<'a> {
 /// Runs the first half of the exchange on a new connection: to the parent, or,
 /// for a host named in `credentials.origin_hosts`, straight to the origin.
 ///
-/// A request without a body opens the exchange itself, so when the other side
-/// asks for nothing its answer is the real one. Otherwise a probe does: a
-/// `GET`, never the method of the request, so that nothing is done twice if it
-/// answers it. That also goes for `HEAD`, which some proxies do not accept
-/// there, unless a first attempt has already gone wrong.
+/// `replay` is the request if it has no body and is safe to repeat. It then
+/// opens the exchange itself, so when the other side asks for nothing its
+/// answer is the real one. Any other request is preceded by a probe: a `GET`,
+/// never the method of the request, so that nothing is done twice if the other
+/// side answers the probe, or fails after passing it on. That also goes for
+/// `HEAD`, which some proxies do not accept there, unless a first attempt has
+/// already gone wrong.
 async fn authenticate<'a>(
     auth: &'a ParentAuth,
     context: &Live,
     lease: &mut Lease,
     request: &mut Request<Body>,
-    head: Option<&Head>,
+    replay: Option<&Head>,
     target: &Target,
     lapsed: bool,
 ) -> Result<Authenticated<'a>, Failure> {
     let admission = auth.admit()?;
     let limit = context.timeouts.response;
-    let real = head.filter(|head| lapsed || head.method != Method::HEAD);
+    let real = replay.filter(|head| lapsed || head.method != Method::HEAD);
     let is_real = real.is_some();
     let through = lease.hop.clone();
     let carrier = || match real {
