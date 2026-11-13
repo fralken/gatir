@@ -127,8 +127,8 @@ pub struct Config {
     pub access: Acl,
     /// Destinations contacted directly instead of through a parent proxy.
     pub no_proxy: NoProxy,
-    /// Header fields set on every forwarded request, replacing any the client
-    /// sent. Values are sensitive.
+    /// Header fields set on every request sent through a parent, replacing any
+    /// the client sent. Values are sensitive.
     pub request_headers: Vec<HeaderRule>,
     /// Local ports whose connections are carried to a fixed destination.
     pub tunnels: Vec<Tunnel>,

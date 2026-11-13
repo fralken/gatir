@@ -52,7 +52,7 @@ pub(super) struct Live {
     /// How connections to a parent proxy authenticate; `None` if no
     /// credentials are configured.
     pub auth: Option<Arc<ParentAuth>>,
-    /// Fields set on every request sent upstream.
+    /// Fields set on every request sent through a parent.
     pub request_headers: Vec<HeaderRule>,
     /// Who may use the SOCKS5 server (anyone, if not set).
     pub socks5_credentials: Option<Arc<Socks5Credentials>>,

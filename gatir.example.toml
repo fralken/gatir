@@ -57,7 +57,9 @@ password = "change-me"
 # default = "deny"
 # rules = [{ allow = "127.0.0.1" }, { allow = "192.168.0.0/16" }]
 
-# Header fields set on every request sent to the parent. The values are secrets.
+# Header fields set on every request sent through a parent proxy (plain HTTP
+# requests, and the CONNECT that opens an HTTPS tunnel), replacing the ones the
+# client sent. Never sent to a server reached directly. The values are secrets.
 # [headers]
 # X-Example = "value"
 

@@ -1,4 +1,5 @@
-//! Request header fields added or replaced on every forwarded request.
+//! Request header fields added or replaced on every request sent through a
+//! parent proxy.
 //!
 //! Values may hold tokens, so they are treated as secrets: they are marked
 //! sensitive, never shown by `Debug` or the configuration summary, and never

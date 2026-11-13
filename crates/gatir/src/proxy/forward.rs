@@ -53,8 +53,8 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     let target = Target::from_uri(&parts.uri)?;
 
     strip_hop_by_hop(&mut parts.headers);
-    apply_rules(&mut parts.headers, &context.request_headers);
     parts.headers.insert(HOST, target.host_header.clone());
+    let rules = &context.request_headers;
 
     let mut hops = context
         .upstreams
@@ -68,8 +68,6 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
     // failed attempt, or to open the authentication with.
     let head = body.is_end_stream().then(|| Head {
         method: parts.method.clone(),
-        absolute: target.absolute.clone(),
-        origin_form: target.origin_form.clone(),
         headers: parts.headers.clone(),
         extensions: parts.extensions.clone(),
     });
@@ -83,12 +81,11 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
 
     let mut request = Request::new(body);
     *request.method_mut() = parts.method.clone();
-    *request.uri_mut() = target.uri_for(&lease.hop);
-    *request.headers_mut() = parts.headers;
     *request.version_mut() = Version::HTTP_11;
     // Carries the original capitalization of the header names (see the server
     // and client builders), which some proxies and firewalls are picky about.
     *request.extensions_mut() = parts.extensions;
+    address(&mut request, &parts.headers, &lease.hop, &target, rules);
 
     // Set once a proof has been sent on `lease`, until the parent has said
     // whether it accepts it.
@@ -123,7 +120,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                     admission = None;
                     lease =
                         fail_over(context, &lease, &error, &mut hops, &mut tried, &target).await?;
-                    *request.uri_mut() = target.uri_for(&lease.hop);
+                    address(&mut request, &parts.headers, &lease.hop, &target, rules);
                     continue;
                 }
                 Err(failure) => return Err(failure),
@@ -153,7 +150,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 tracing::debug!("a connection lost its authentication, retrying on a new one");
                 lapsed = true;
                 let hop = lease.hop.clone();
-                request = head.request(&hop);
+                request = head.request(&hop, &target, rules);
                 sent = Sent::already();
                 lease = connect(context, &hop, &target).await?;
                 continue;
@@ -186,7 +183,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 (Some(returned), _) => Some(returned),
                 (None, Some(replay)) => {
                     sent = Sent::already();
-                    Some(replay.request(&lease.hop))
+                    Some(replay.request(&lease.hop, &target, rules))
                 }
                 (None, None) => None,
             };
@@ -196,7 +193,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             };
             request = again;
             lease = fail_over(context, &lease, &error, &mut hops, &mut tried, &target).await?;
-            *request.uri_mut() = target.uri_for(&lease.hop);
+            address(&mut request, &parts.headers, &lease.hop, &target, rules);
             continue;
         }
         // Only a pooled connection can have gone stale unnoticed. The request
@@ -210,7 +207,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
             (Some(returned), _) => returned,
             (None, Some(replay)) => {
                 sent = Sent::already();
-                replay.request(&lease.hop)
+                replay.request(&lease.hop, &target, rules)
             }
             (None, None) => return Err(Failure::Upstream(error)),
         };
@@ -294,8 +291,8 @@ async fn authenticate<'a>(
     let is_real = real.is_some();
     let through = lease.hop.clone();
     let carrier = || match real {
-        Some(head) => head.request(&through),
-        None => probe(target, &context.request_headers),
+        Some(head) => head.request(&through, target, &context.request_headers),
+        None => probe(target, &through, &context.request_headers),
     };
 
     lease.needs_auth = false;
@@ -368,16 +365,33 @@ async fn fail_over(
         .map_err(|failure| failure.after(std::mem::take(tried)))
 }
 
-/// A request that only serves to open the authentication.
-fn probe(target: &Target, rules: &[HeaderRule]) -> Request<Body> {
+/// A request that only serves to open the authentication with `hop`.
+fn probe(target: &Target, hop: &Hop, rules: &[HeaderRule]) -> Request<Body> {
     let mut request = Request::new(full(Bytes::new()));
     *request.method_mut() = Method::GET;
-    *request.uri_mut() = target.absolute.clone();
     *request.version_mut() = Version::HTTP_11;
-    let headers = request.headers_mut();
+    let mut headers = HeaderMap::new();
     headers.insert(HOST, target.host_header.clone());
-    apply_rules(headers, rules);
+    address(&mut request, &headers, hop, target, rules);
     request
+}
+
+/// Writes `request` for `hop`: its target, and the `client` header fields plus,
+/// through a parent only, the configured `[headers]`. Their values are secrets,
+/// and a server reached directly may be reached over plain HTTP.
+fn address(
+    request: &mut Request<Body>,
+    client: &HeaderMap,
+    hop: &Hop,
+    target: &Target,
+    rules: &[HeaderRule],
+) {
+    *request.uri_mut() = target.uri_for(hop);
+    let mut headers = client.clone();
+    if hop.is_parent() {
+        apply_rules(&mut headers, rules);
+    }
+    *request.headers_mut() = headers;
 }
 
 /// Opens a connection through the first of `hops` that answers: a pooled one if
@@ -465,25 +479,19 @@ fn is_stale(error: &hyper::Error) -> bool {
 /// What is needed to build the same body-less request again.
 struct Head {
     method: Method,
-    /// The two ways the target is written: to a proxy and to a server.
-    absolute: Uri,
-    origin_form: Uri,
+    /// The client's header fields, without the hop-by-hop ones.
     headers: HeaderMap,
     extensions: Extensions,
 }
 
 impl Head {
-    /// The request as it is sent through `hop`.
-    fn request(&self, hop: &Hop) -> Request<Body> {
+    /// The request to `target` as it is sent through `hop`.
+    fn request(&self, hop: &Hop, target: &Target, rules: &[HeaderRule]) -> Request<Body> {
         let mut request = Request::new(full(Bytes::new()));
         *request.method_mut() = self.method.clone();
-        *request.uri_mut() = match hop {
-            Hop::Direct => self.origin_form.clone(),
-            Hop::Parent(_) => self.absolute.clone(),
-        };
-        *request.headers_mut() = self.headers.clone();
         *request.version_mut() = Version::HTTP_11;
         *request.extensions_mut() = self.extensions.clone();
+        address(&mut request, &self.headers, hop, target, rules);
         request
     }
 }

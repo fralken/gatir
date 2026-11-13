@@ -5,11 +5,14 @@ mod common;
 use common::*;
 use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
+use gatir_testkit::tcp::{DeadServer, Hangup};
 
 const RULES: &str = "[headers]\nUser-Agent = \"corp/1.0\"\nX-Added = \"yes\"\n";
 
+/// The values may be secrets meant for the parent, and a server reached
+/// directly may be reached over plain HTTP.
 #[tokio::test]
-async fn configured_fields_replace_and_add_on_direct_requests() {
+async fn configured_fields_are_not_sent_on_direct_requests() {
     let origin = MockOrigin::start(|_| Reply::ok("ok")).await;
     let proxy = start_proxy(RULES).await;
 
@@ -18,16 +21,49 @@ async fn configured_fields_replace_and_add_on_direct_requests() {
         .send(get(
             &origin.authority(),
             "/",
-            "User-Agent: client/2.0\r\nX-Added: no\r\nX-Keep: as-is\r\n",
+            "User-Agent: client/2.0\r\nX-Keep: as-is\r\n",
         ))
         .await
         .unwrap();
     assert_eq!(client.read_response(false).await.unwrap().status, 200);
 
     let seen = &origin.requests()[0];
-    assert_eq!(seen.headers.get_all("user-agent"), ["corp/1.0"]);
-    assert_eq!(seen.headers.get_all("x-added"), ["yes"]);
+    assert_eq!(seen.headers.get_all("user-agent"), ["client/2.0"]);
+    assert_eq!(seen.headers.get("x-added"), None);
     assert_eq!(seen.headers.get("x-keep"), Some("as-is"));
+}
+
+/// A request written for a parent that fails is written again for the next
+/// hop: going direct, it loses the configured fields and gets the client's back.
+#[tokio::test]
+async fn configured_fields_are_dropped_when_a_request_fails_over_to_direct() {
+    let dead = DeadServer::start(Hangup::Close).await;
+    let origin = MockOrigin::start(|_| Reply::ok("ok")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pac = dir.path().join("proxy.pac");
+    std::fs::write(
+        &pac,
+        format!(
+            "function FindProxyForURL(url, host) {{ return \"PROXY {}; DIRECT\"; }}",
+            dead.addr()
+        ),
+    )
+    .unwrap();
+    let config = format!("{RULES}[pac]\nfile = {:?}\n", pac.display().to_string());
+    let proxy = start_proxy(&config).await;
+
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client
+        .send(get(&origin.authority(), "/", "User-Agent: client/2.0\r\n"))
+        .await
+        .unwrap();
+    assert_eq!(client.read_response(false).await.unwrap().status, 200);
+
+    assert_eq!(dead.accepted(), 1);
+    let seen = &origin.requests()[0];
+    assert_eq!(seen.target, "/");
+    assert_eq!(seen.headers.get_all("user-agent"), ["client/2.0"]);
+    assert_eq!(seen.headers.get("x-added"), None);
 }
 
 #[tokio::test]
