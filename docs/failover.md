@@ -1,31 +1,32 @@
 # When a parent proxy does not work
 
-Parents come as a list: the `parents` of the configuration, or what a PAC script
-returns (`PROXY a; PROXY b; DIRECT`). A request is sent through the first one
-that works. gatir moves on to the next in two cases:
+Parents come as a list: `parents` in the configuration, or what a PAC script
+returns (`PROXY a; PROXY b; DIRECT`). gatir sends a request through the first
+one that works, and moves on to the next in two cases:
 
-- **It cannot be reached**: the connection is refused, or times out.
-- **It accepts the connection and ends it before answering the first request on
-  it**: closed (FIN) or reset (RST). A listener with nothing behind it does
-  that. It is what a browser does too: Chromium goes on to the next proxy when a
-  connection is reset or closed, and does not when the proxy answers.
+- **The parent cannot be reached**: the connection is refused, or times out.
+- **The parent accepts the connection and closes it before answering the first
+  request**, with a FIN or a reset. A listener with nothing behind it does
+  this. Browsers behave the same way: Chromium moves on to the next proxy when
+  a connection is reset or closed, and not when the proxy answers.
 
-Anything the parent *says* is not a failure, so nothing moves on: a `403` from
-its policy or a `407` for credentials is the answer, and it is passed on or
-dealt with as such. A parent that never answers is not a case either; the
-`response_secs` timeout ends the wait (a `504`).
+Anything the parent *says* is an answer, not a failure, so gatir does not move
+on: a `403` from its policy or a `407` for credentials is passed on or handled
+as such. A parent that never answers is not a failure either; the
+`response_secs` timeout ends the wait, with a `504`.
 
-## What is remembered
+## What gatir remembers
 
-A parent that failed is tried last for **one minute**. This is what keeps a
-script that returns the same list every time from trying the dead proxy first on
-every request. When the parent answers again, it takes its place back. If every
-parent failed lately, they are tried in the order of the list anyway.
+A parent that failed is tried last for **one minute**. So a PAC script that
+returns the same list every time does not make gatir try the dead proxy first
+on every request. Once the minute is over, the parent takes its place in the
+list back. If every parent failed recently, gatir tries them in list order
+anyway.
 
-A parent is not known to work because it accepted the connection, only because
-it answered.
+A parent counts as working only once it answers, not when it accepts a
+connection.
 
-## When the request cannot go to the next one
+## When a request cannot go to the next parent
 
 A parent that ends the connection after reading a request may have passed it on
 first, so the next parent is given the same request only when doing it twice is
@@ -42,17 +43,18 @@ harmless:
 Any other request, such as a `POST`, gets a `502`, and the next request goes to
 the next parent.
 
-If none is left, the client gets a `502` that names every parent and how it
-failed, and the log has a `warn` line for each:
+If no parent is left, the program gets a `502` that names every parent and how
+it failed, and the log has a `warn` line for each:
 
 ```
 No parent proxy is reachable: a.example.com:80 (closed the connection without
 answering: Connection reset by peer (os error 54)); b.example.com:80 (timed out)
 ```
 
-A tunnel client that does not speak HTTP (SOCKS5, a forwarded port) is just
-disconnected, and the reason is in the log.
+A program connected through SOCKS5 or a forwarded port does not speak HTTP, so
+it is simply disconnected, and the reason is in the log.
 
-Nothing is proved to a parent that ends the connection before answering, so
-trying the next one does not count as a failed logon: the lock-out protection of
-[authentication](authentication.md) is not involved.
+A parent that closes the connection before answering has been sent no
+credentials yet, so moving on to the next one costs no failed logon: the
+lockout protection described in [Authentication](authentication.md) is not
+involved.
