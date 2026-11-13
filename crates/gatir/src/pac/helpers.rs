@@ -27,8 +27,10 @@ pub fn local_host_or_domain_is(host: &str, host_or_domain: &str) -> bool {
         && host_or_domain.as_bytes()[host.len()] == b'.'
 }
 
+/// A name without a domain. An IPv6 literal (`::1`) is not one, as in
+/// browsers.
 pub fn is_plain_host_name(host: &str) -> bool {
-    !host.contains('.')
+    !host.contains(['.', ':'])
 }
 
 pub fn dns_domain_levels(host: &str) -> usize {
@@ -195,6 +197,8 @@ mod tests {
     fn plain_host_names_and_domain_levels() {
         assert!(is_plain_host_name("intranet"));
         assert!(!is_plain_host_name("www.example.com"));
+        assert!(!is_plain_host_name("::1"));
+        assert!(!is_plain_host_name("fe80::1"));
         assert_eq!(dns_domain_levels("www"), 0);
         assert_eq!(dns_domain_levels("www.netscape.com"), 2);
     }

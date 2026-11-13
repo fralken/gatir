@@ -232,14 +232,28 @@ impl Engine {
         outcome.map_err(|failure| match failure {
             Failure::Bad(what) => PacError::BadResult(what),
             Failure::Script(message) => {
-                let lower = message.to_ascii_lowercase();
-                if lower.contains("out of memory") || lower.contains("stack overflow") {
+                if exhausted(&message) {
                     self.replace = true;
                 }
                 PacError::Script(message)
             }
         })
     }
+}
+
+/// Whether a script error says that the engine ran out of memory or stack,
+/// which may leave it in a bad state. QuickJS-ng reports an overflow as
+/// "Maximum call stack size exceeded", and the original QuickJS as "stack
+/// overflow".
+fn exhausted(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "out of memory",
+        "stack overflow",
+        "maximum call stack size exceeded",
+    ]
+    .iter()
+    .any(|sign| lower.contains(sign))
 }
 
 fn describe(value: &Value<'_>) -> String {
@@ -1017,6 +1031,18 @@ mod tests {
             matches!(error, PacError::Script(_) | PacError::Timeout(_)),
             "{error}"
         );
+    }
+
+    #[test]
+    fn an_engine_that_overflowed_its_stack_is_replaced() {
+        let source =
+            "function FindProxyForURL(url, host) { function f() { return f(); } return f(); }";
+        let mut engine = Engine::new(source, &PacLimits::default(), &env(NOON)).unwrap();
+        let error = engine
+            .call("http://x/", "x", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(matches!(error, PacError::Script(_)), "{error}");
+        assert!(engine.replace, "{error}");
     }
 
     #[tokio::test]

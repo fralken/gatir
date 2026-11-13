@@ -289,7 +289,7 @@ impl PacSource {
         } else {
             self.settings.location.clone()
         };
-        let (known, current) = {
+        let (known, current, loaded) = {
             let mut state = self.lock();
             // Validators are those of an address: the system may have pointed
             // somewhere else since.
@@ -299,7 +299,11 @@ impl PacSource {
                 }
                 state.resolved = Some(location.clone());
             }
-            (state.validators.clone(), state.bytes.clone())
+            (
+                state.validators.clone(),
+                state.bytes.clone(),
+                state.pac.is_some(),
+            )
         };
         let (bytes, validators) = match &location {
             PacLocation::File(path) => (read_script_file(path).await?, Validators::default()),
@@ -314,7 +318,9 @@ impl PacSource {
             }
             PacLocation::System => return Err("the system did not say where the script is".into()),
         };
-        if bytes == current {
+        // Before the first script is loaded, `current` is empty, and so may be
+        // what was read: that is not the same script.
+        if loaded && bytes == current {
             // Same script, possibly with new validators: nothing to load.
             self.lock().validators = validators;
             return Ok(None);

@@ -375,6 +375,14 @@ async fn a_pac_file_that_cannot_be_used_is_refused_at_start_up() {
         "{error}"
     );
 
+    // A file left empty (by a download cut short, say) is no script either.
+    let (_dir, empty) = pac_table("", "");
+    let error = bind(&empty).await.to_string();
+    assert!(
+        error.contains("does not define a function FindProxyForURL"),
+        "{error}"
+    );
+
     let dir = tempfile::tempdir().unwrap();
     let absent = dir.path().join("absent.pac");
     let error = bind(&format!(
