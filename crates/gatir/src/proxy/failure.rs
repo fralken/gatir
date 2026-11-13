@@ -94,9 +94,15 @@ pub(super) enum Failure {
     /// The PAC script chose only ways of reaching the destination that gatir
     /// cannot use, such as a SOCKS proxy.
     PacUnsupported(String),
-    /// A connection the parent had authenticated asked for authentication
-    /// again, and the request cannot be sent twice.
-    AuthenticationLapsed,
+    /// A connection that the named party had authenticated asked for
+    /// authentication again, and the request cannot be sent twice.
+    AuthenticationLapsed(&'static str),
+    /// The NTLM exchange with an origin server named in
+    /// `credentials.origin_hosts` could not be carried out.
+    OriginAuthentication {
+        server: String,
+        error: AuthError,
+    },
 }
 
 impl From<AuthError> for Failure {
@@ -172,6 +178,9 @@ impl Failure {
             Self::Authentication(err) => {
                 bad_gateway(format!("Cannot authenticate to the parent proxy: {err}"))
             }
+            Self::OriginAuthentication { server, error } => {
+                bad_gateway(format!("Cannot authenticate to {server}: {error}"))
+            }
             Self::CredentialsRejected { user } => bad_gateway(format!(
                 "The parent proxy rejected the credentials of {user}. Check the user name, \
                  domain and password. gatir will not try again for {} minutes, so that the \
@@ -233,11 +242,10 @@ impl Failure {
                     remaining.as_secs() + 1
                 ),
             ),
-            Self::AuthenticationLapsed => bad_gateway(
-                "The parent proxy asked for authentication again on a connection it had \
+            Self::AuthenticationLapsed(who) => bad_gateway(format!(
+                "Authentication was asked for again by {who}, on a connection it had \
                  authenticated, and this request cannot be sent twice. Try again."
-                    .to_owned(),
-            ),
+            )),
         }
     }
 

@@ -65,6 +65,7 @@ use tokio::time::timeout;
 
 use super::body::{Body, answer_within};
 use super::failure::Failure;
+use super::upstream::Hop;
 use crate::auth::{
     AuthError, Authenticator, Refusal, SecurityContext, TokenSource, challenge, negotiate_header,
     ntlm, refusal,
@@ -371,15 +372,26 @@ async fn negotiate_ticket<'r>(
 /// (`401`/`WWW-Authenticate`), reusing the configured identity: there is no
 /// ticket to ask the system for, so, unlike [`ParentAuth::negotiate`], there
 /// is only ever one scheme and one shape to this exchange.
+/// `server` (`host:port`) names it in an error.
 pub(super) async fn negotiate_origin(
     ntlm: &ntlm::Authenticator,
+    server: &str,
     sender: &mut SendRequest<Body>,
     carrier: impl Fn() -> Request<Body>,
     limit: Duration,
 ) -> Result<Outcome, Failure> {
+    let failed = |error| Failure::OriginAuthentication {
+        server: server.to_owned(),
+        error,
+    };
     let mut first = carrier();
-    first.headers_mut().insert(AUTHORIZATION, ntlm.first()?);
-    let response = send(sender, first, limit).await?;
+    first
+        .headers_mut()
+        .insert(AUTHORIZATION, ntlm.first().map_err(failed)?);
+    let response = answer_within(limit, sender.send_request(first))
+        .await
+        .ok_or(Failure::ResponseTimeout(Hop::Direct.who()))?
+        .map_err(Failure::Upstream)?;
     // A `401` for another scheme (Basic, say) is for the client to answer.
     if response.status() != StatusCode::UNAUTHORIZED
         || !ntlm::offered(response.headers().get_all(WWW_AUTHENTICATE))
@@ -387,7 +399,9 @@ pub(super) async fn negotiate_origin(
         return Ok(Outcome::Answered(response));
     }
     let (parts, body) = response.into_parts();
-    let header = ntlm.respond(parts.headers.get_all(WWW_AUTHENTICATE))?;
+    let header = ntlm
+        .respond(parts.headers.get_all(WWW_AUTHENTICATE))
+        .map_err(failed)?;
     if !reusable(body, sender, limit).await {
         return Err(Failure::Parent(
             "the origin server did not keep the connection open during authentication",

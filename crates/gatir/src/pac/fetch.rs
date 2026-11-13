@@ -35,7 +35,7 @@ pub enum FetchError {
         address: String,
         source: std::io::Error,
     },
-    #[error("no complete answer within {} seconds", .0.as_secs())]
+    #[error("no complete answer within {}", seconds(*.0))]
     Timeout(Duration),
     #[error("the server answered {0}")]
     Status(StatusCode),
@@ -58,6 +58,14 @@ pub enum FetchError {
          issued by an authority this system trusts)"
     )]
     Tls { host: String, reason: String },
+}
+
+/// A whole number of seconds, in words: "1 second", "15 seconds".
+fn seconds(duration: Duration) -> String {
+    match duration.as_secs() {
+        1 => "1 second".to_owned(),
+        n => format!("{n} seconds"),
+    }
 }
 
 fn protocol(error: hyper::Error) -> FetchError {

@@ -424,7 +424,7 @@ async fn a_parent_without_negotiate_is_reported_with_the_schemes_it_offers() {
     assert!(
         response
             .body_text()
-            .contains("does not offer Negotiate authentication (it offers: NTLM)"),
+            .contains("Negotiate authentication is not offered (it offers: NTLM)"),
         "{}",
         response.body_text()
     );

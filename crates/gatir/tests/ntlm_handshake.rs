@@ -166,7 +166,7 @@ async fn a_parent_without_ntlm_is_reported_with_the_schemes_it_offers() {
     let error = auth.respond(&challenge_fields(&refusal)).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "the parent proxy does not offer NTLM authentication (it offers: Basic, Negotiate)"
+        "NTLM authentication is not offered (it offers: Basic, Negotiate)"
     );
 }
 

@@ -289,7 +289,7 @@ async fn a_parent_that_refuses_or_does_not_offer_negotiate_is_reported() {
     assert!(
         response
             .body_text()
-            .contains("does not offer Negotiate authentication (it offers: Basic)"),
+            .contains("Negotiate authentication is not offered (it offers: Basic)"),
         "{}",
         response.body_text()
     );

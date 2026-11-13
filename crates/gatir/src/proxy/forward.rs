@@ -148,7 +148,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
                 // No proof went out on this connection: it had been
                 // authenticated, and is not any more.
                 let Some(head) = head.as_ref().filter(|_| !lapsed) else {
-                    return Err(Failure::AuthenticationLapsed);
+                    return Err(Failure::AuthenticationLapsed(lease.hop.who()));
                 };
                 tracing::debug!("a connection lost its authentication, retrying on a new one");
                 lapsed = true;
@@ -322,7 +322,8 @@ async fn authenticate<'a>(
                  credentials.origin_hosts",
             );
             auth.check_origin(&target.address)?;
-            let outcome = negotiate_origin(ntlm, &mut lease.sender, carrier, limit).await?;
+            let outcome =
+                negotiate_origin(ntlm, &target.address, &mut lease.sender, carrier, limit).await?;
             (outcome, AUTHORIZATION)
         }
     };

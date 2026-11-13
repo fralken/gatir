@@ -247,7 +247,7 @@ async fn a_system_that_cannot_do_ntlm_by_itself_reports_what_the_parent_offers()
     assert!(
         response
             .body_text()
-            .contains("does not offer Negotiate authentication (it offers: NTLM)"),
+            .contains("Negotiate authentication is not offered (it offers: NTLM)"),
         "{}",
         response.body_text()
     );
@@ -288,7 +288,7 @@ async fn a_parent_that_does_not_answer_ntlm_with_a_challenge_is_reported() {
     assert!(
         response
             .body_text()
-            .contains("did not send an NTLM challenge"),
+            .contains("Cannot authenticate to the parent proxy: no NTLM challenge came back"),
         "{}",
         response.body_text()
     );

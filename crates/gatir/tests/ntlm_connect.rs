@@ -211,7 +211,7 @@ async fn a_parent_without_ntlm_is_reported_with_the_schemes_it_offers() {
     assert!(
         response
             .body_text()
-            .contains("does not offer NTLM authentication (it offers: Basic, Negotiate)"),
+            .contains("NTLM authentication is not offered (it offers: Basic, Negotiate)"),
         "{}",
         response.body_text()
     );

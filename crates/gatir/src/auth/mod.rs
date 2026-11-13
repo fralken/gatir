@@ -16,17 +16,20 @@ pub use negotiate::{
 use crate::config::{AuthMethod, Credentials};
 use ntlm::MessageError;
 
+/// What went wrong with authentication. The messages do not name the other
+/// side (a parent proxy, or a server in `credentials.origin_hosts`): what
+/// reports them does.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("this is not an NTLM method")]
     NotNtlm,
-    #[error("the credentials have neither a password nor an NT hash")]
+    #[error("the credentials have no password or hash")]
     NoSecret,
-    #[error("the parent proxy does not offer NTLM authentication{}", offered_list(.offered))]
+    #[error("NTLM authentication is not offered{}", offered_list(.offered))]
     NtlmNotOffered { offered: Vec<String> },
-    #[error("the parent proxy did not send an NTLM challenge")]
+    #[error("no NTLM challenge came back")]
     NoChallenge,
-    #[error("the parent proxy sent an invalid NTLM challenge: {0}")]
+    #[error("the NTLM challenge is invalid: {0}")]
     BadChallenge(String),
     #[error("cannot build the NTLM message: {0}")]
     Message(#[from] MessageError),
@@ -38,7 +41,7 @@ pub enum AuthError {
     KerberosLibrary { reason: String },
     #[error("cannot get a Kerberos ticket for {service}: {reason}")]
     NoTicket { service: String, reason: String },
-    #[error("the parent proxy does not offer Negotiate authentication{}", offered_list(.offered))]
+    #[error("Negotiate authentication is not offered{}", offered_list(.offered))]
     NegotiateNotOffered { offered: Vec<String> },
     #[error("the Negotiate exchange with {service} went wrong: {reason}")]
     Exchange { service: String, reason: String },

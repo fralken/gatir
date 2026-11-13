@@ -180,6 +180,39 @@ async fn a_401_that_does_not_offer_ntlm_is_passed_to_the_client() {
 }
 
 #[tokio::test]
+async fn an_error_in_the_exchange_names_the_server_not_a_parent() {
+    let origin = MockOrigin::start(|_| {
+        Reply::raw(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM not-a-challenge\r\n\
+             Content-Length: 0\r\n\r\n",
+        )
+    })
+    .await;
+    let proxy = start_proxy(&format!(
+        "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"s3cret\"\n\
+         origin_hosts = [\"{}\"]\n",
+        origin.addr().ip()
+    ))
+    .await;
+
+    let authority = origin.addr().to_string();
+    let mut client = gatir_testkit::http::RawClient::connect(proxy.addr)
+        .await
+        .unwrap();
+    client.send(get(&authority, "/", "")).await.unwrap();
+    let response = client.read_response(false).await.unwrap();
+    assert_eq!(response.status, 502);
+    let text = response.body_text();
+    assert!(
+        text.contains(&format!(
+            "Cannot authenticate to {authority}: the NTLM challenge"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("parent"), "{text}");
+}
+
+#[tokio::test]
 async fn negotiate_has_no_secret_to_answer_an_origin_with() {
     // credentials.origin_hosts needs an NTLM secret at configuration time.
     let origin = origin_with(Account::new("alice", "CORP", "s3cret")).await;

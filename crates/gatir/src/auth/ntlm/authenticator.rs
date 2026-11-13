@@ -313,13 +313,10 @@ mod tests {
         let error = authenticator().respond(&offered).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "the parent proxy does not offer NTLM authentication (it offers: Basic, Negotiate)"
+            "NTLM authentication is not offered (it offers: Basic, Negotiate)"
         );
         let nothing = authenticator().respond(&fields(&[])).unwrap_err();
-        assert_eq!(
-            nothing.to_string(),
-            "the parent proxy does not offer NTLM authentication"
-        );
+        assert_eq!(nothing.to_string(), "NTLM authentication is not offered");
     }
 
     #[test]

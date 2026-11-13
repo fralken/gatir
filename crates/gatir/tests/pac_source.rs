@@ -444,8 +444,9 @@ async fn a_slow_server_is_given_up_on() {
     );
 
     let text = ask(&proxy, get("site.test", "/", "")).await.body_text();
+    // "1 second", not "1 seconds".
     assert!(
-        text.contains("no complete answer within 1 seconds"),
+        text.contains("no complete answer within 1 second)"),
         "{text}"
     );
 }

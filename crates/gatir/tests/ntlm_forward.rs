@@ -369,7 +369,7 @@ async fn a_parent_without_ntlm_is_reported_with_the_schemes_it_offers() {
     assert!(
         response
             .body_text()
-            .contains("does not offer NTLM authentication (it offers: Basic, Negotiate)"),
+            .contains("Cannot authenticate to the parent proxy: NTLM authentication is not offered (it offers: Basic, Negotiate)"),
         "{}",
         response.body_text()
     );
@@ -470,7 +470,7 @@ async fn a_post_cannot_be_repeated_when_its_connection_loses_authentication() {
     assert!(
         response
             .body_text()
-            .contains("asked for authentication again"),
+            .contains("Authentication was asked for again by the parent proxy"),
         "{}",
         response.body_text()
     );
