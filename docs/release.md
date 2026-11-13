@@ -41,79 +41,82 @@ of that run; nothing is published.
 | `SHA256SUMS` | the checksum of each of the files above but the formula |
 
 An archive holds one directory with the program, the two licenses, the README,
-`gatir.example.toml`, the documentation and, except for Windows, the manual pages
-(`man/man1`, written by `crates/mangen` from the command-line definition). The packages hold the same, in the places
-their systems keep them (`/usr/bin/gatir`, `/usr/share/doc/gatir`), and nothing else:
-no service, no file in `/etc`.
+`gatir.example.toml`, the documentation and, except on Windows, the manual pages
+(`man/man1`, written by `crates/mangen` from the command-line definition). The
+packages hold the same files where their systems keep them (`/usr/bin/gatir`,
+`/usr/share/doc/gatir`), and nothing else: no service, no file in `/etc`.
 
 ### What the Linux builds need
 
-The Linux builds are made on Ubuntu 22.04, so they need a system with at least its
-C library (glibc 2.35: Debian 12, Ubuntu 22.04, Fedora 36 and their successors; not
-RHEL and its rebuilds 9, whose glibc is older) and OpenSSL 3 (`libssl3`), which are
-linked when the program starts.
+The Linux builds are made on Ubuntu 22.04, so they need:
 
-Kerberos goes through the system's library, `libgssapi_krb5` (`libgssapi-krb5-2`), which
-gatir does not link: it opens the library when Negotiate is configured, so a computer
-without it can run gatir with NTLM, and Negotiate says which library is missing (checked
-in a container with the library removed). The packages recommend it.
+- its C library or newer: glibc 2.35, that is Debian 12, Ubuntu 22.04, Fedora 36
+  and later. Not RHEL 9 or its rebuilds, whose glibc is older.
+- OpenSSL 3 (`libssl3`).
 
-The packages say so, and their tools install what is missing: `sudo apt install
-./gatir_<version>-1_<arch>.deb` fetches `libssl3`, and the Kerberos library as well
-unless recommended packages are turned off; `dnf install` does the same for the .rpm.
-What each package requires is worked out from the program itself, by `dpkg-shlibdeps`
-and by `rpmbuild`, not written by hand. For the archives it is for the user to install
-them.
+Both are linked when the program starts.
 
-The maintainer written in the packages is `Francesco MDE
-<6103677+fralken@users.noreply.github.com>` unless `GATIR_MAINTAINER` says otherwise, in
-the form `Name <address>`. That address is a GitHub-privacy relay: it does not receive
-mail, so open an issue on the repository instead of writing to it. The packages are not
-signed: check them with `SHA256SUMS`.
+Kerberos goes through the system's library, `libgssapi_krb5` (package
+`libgssapi-krb5-2`), which gatir does not link. It opens the library only when
+Negotiate is configured, so a computer without it can still run gatir with NTLM,
+and Negotiate says which library is missing. This was checked in a container
+with the library removed.
+
+The packages declare these needs, and their tools install what is missing:
+`sudo apt install ./gatir_<version>-1_<arch>.deb` fetches `libssl3`, and the
+Kerberos library too unless recommended packages are turned off; `dnf install`
+does the same for the `.rpm`. `dpkg-shlibdeps` and `rpmbuild` work out what each
+package requires from the program itself, so nothing is written by hand. With
+an archive, the user installs them.
+
+The packages name `Francesco MDE <6103677+fralken@users.noreply.github.com>` as
+their maintainer, unless `GATIR_MAINTAINER` gives another, in the form
+`Name <address>`. That address is a GitHub privacy relay that receives no mail:
+open an issue on the repository instead. The packages are not signed: check them
+with `SHA256SUMS`.
 
 ### Homebrew
 
-`gatir.rb` installs the macOS archive of its release. Homebrew reads formulae from a
-tap, which is a repository named `homebrew-<something>` with the formula in its
-`Formula` directory. Copy `gatir.rb` there, and
+`gatir.rb` installs the macOS archive of its release. Homebrew reads formulae from
+a tap: a repository named `homebrew-<name>` with the formula in its `Formula`
+directory. gatir's tap is `fralken/homebrew-tap`. To publish a release there,
+copy `gatir.rb` to its `Formula` directory and push. Users then install it with:
 
 ```sh
-brew tap <owner>/<something>
-brew install gatir
+brew install fralken/tap/gatir
 ```
 
-`scripts/homebrew-formula.sh REPOSITORY TAG SHA256SUMS` writes the formula for any
-release. It is for macOS only: on Linux, use the package or the archive.
+`scripts/homebrew-formula.sh REPOSITORY TAG SHA256SUMS` writes the formula for
+any release. The formula is for macOS only: on Linux, use the package or the
+archive.
 
 ### The Windows installer
 
 `gatir-<version>-x64.msi` installs `gatir.exe` under Program Files and adds that
-folder to the `PATH`, so that `gatir` can be run from a new terminal without naming
-its path; both are undone when it is uninstalled. Installing a newer version removes
-the older one first (a major upgrade, by the Windows Installer itself). There is no
-setup wizard: double-clicking the file shows the ordinary Windows Installer progress
-dialog, and
+folder to the `PATH`, so a new terminal can run `gatir` without its path.
+Uninstalling undoes both. Installing a newer version removes the older one first
+(a major upgrade, done by Windows Installer itself). There is no setup wizard:
+double-clicking the file shows the usual Windows Installer progress dialog, and
 
 ```powershell
 msiexec /i gatir-<version>-x64.msi /quiet
 ```
 
-installs it without asking anything, which is also how it would be rolled out to
-several computers. The installer needs Windows to be x86-64: on Arm64 Windows it runs
-under emulation, as `gatir.exe` itself does.
+installs it without asking anything, which is also how to roll it out to many
+computers. The installer is built for x86-64; on Arm64 Windows it runs under
+emulation, as `gatir.exe` itself does.
 
-Installing it needs an administrator, since it writes to Program Files and to the
-`PATH` of every user. Without one, the `.zip` works with no privilege at all: extract
-it anywhere in your own folders, and put it on your own `PATH` instead of the
-computer's:
+Installing needs an administrator, since it writes to Program Files and to every
+user's `PATH`. Without one, use the `.zip`, which needs no privilege: extract it
+anywhere in your own folders, and add it to your own `PATH`:
 
 ```powershell
 setx PATH "%PATH%;C:\path\to\the\extracted\folder"
 ```
 
-(open a new terminal afterwards, as with the installer). With only the `.msi` in
-hand, `msiexec /a gatir-<version>-x64.msi /qn TARGETDIR=C:\path\to\extract\to` copies
-out its files the same way, without installing anything.
+Then open a new terminal, as with the installer. With only the `.msi`,
+`msiexec /a gatir-<version>-x64.msi /qn TARGETDIR=C:\path\to\extract\to` copies
+out its files without installing anything.
 
 ## Checking a download
 
@@ -127,19 +130,24 @@ shasum -a 256 --check --ignore-missing SHA256SUMS  # macOS
 
 ## Packing by hand
 
-`scripts/package.sh [TARGET]` does what the workflow does for one target: it builds
-in release mode, then writes the archive and its `.sha256` file to `dist/`.
-`scripts/package-linux.sh [TARGET]` then makes the `.deb` and the `.rpm` from it (it needs
-`dpkg-dev` and `rpm`), and `scripts/package-windows.sh [TARGET]` makes the `.msi` from a
-Windows one (it needs `wixl`, `brew install msitools` on macOS). None of the three needs
-Windows or a copy of WiX itself, so the `.msi` can be made, and tried (`msiinfo tables`,
-`msiextract`, from the same formula) on any machine that builds gatir — except that
-Debian and Ubuntu's own `wixl` package (0.103 as of this writing) is too old for the
-`<Environment>` element the `.wxs` uses to put gatir on the `PATH`; use macOS for this
-one until a newer `wixl` reaches their repositories (this is also why the workflow's own
-`.msi` job runs on macOS, not Linux like the rest). The workflow calls all of these
-tools, so that what is tried here is what is released.
+The workflow calls these scripts, so what you build by hand is what is released:
 
-The workflow is not run anywhere but on GitHub. What it depends on there (the
-names of the runners, the actions it uses) is the part to look at first if a release
-fails.
+- `scripts/package.sh [TARGET]` builds one target in release mode, and writes the
+  archive and its `.sha256` file to `dist/`.
+- `scripts/package-linux.sh [TARGET]` makes the `.deb` and the `.rpm` from a Linux
+  archive. It needs `dpkg-dev` and `rpm`.
+- `scripts/package-windows.sh [TARGET]` makes the `.msi` from a Windows archive.
+  It needs `wixl` (`brew install msitools` on macOS).
+
+None of them needs Windows or WiX, so the `.msi` can be made and inspected
+(`msiinfo tables`, `msiextract`, from the same `msitools`) on any computer that
+builds gatir.
+
+One exception: the `wixl` that Debian and Ubuntu ship (0.103 at the time of
+writing) is too old for the `<Environment>` element, which puts gatir on the
+`PATH`. Build the `.msi` on macOS until a newer `wixl` reaches their
+repositories. This is also why the workflow's `.msi` job runs on macOS, while
+the others run on Linux.
+
+The workflow runs only on GitHub. If a release fails, look first at what it
+depends on there: the names of the runners, and the actions it uses.

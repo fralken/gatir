@@ -1,44 +1,35 @@
 # Load-testing gatir
 
-`gatir-loadgen`, a small tool in this workspace (`crates/loadgen`, run as
-`cargo run --release -p gatir-loadgen --` or the built `gatir-loadgen`
-binary), measures gatir's own throughput and latency as a plain HTTP proxy,
-and gives it something real to authenticate to while doing it. It exists
-because the obvious choices for this turned out not to fit:
+`gatir-loadgen` measures gatir's throughput and latency as an HTTP proxy, with a
+parent that really asks for NTLM. It is in this workspace (`crates/loadgen`): run
+it with `cargo run --release -p gatir-loadgen --`, or build it and run
+`gatir-loadgen`.
 
-- **curl**, run in a loop, is subject to the shell's `no_proxy`/`NO_PROXY`
-  environment variable even when the proxy is named explicitly with `-x`: a
-  destination on `127.0.0.1` (a natural choice for a local load test) is
-  likely to be in that list already, in which case curl quietly bypasses the
-  proxy under test and talks to the destination directly — nothing in its
-  output makes this obvious unless `-v` is read carefully. `--noproxy ''`
-  overrides it; still, curl one request at a time cannot report throughput or
-  latency percentiles across many requests.
-- **Apache Bench** (`ab`), the one load-testing tool macOS ships, has a `-X
-  proxy:port` option for exactly this, but its keep-alive handling through a
-  proxy did not behave predictably in practice (connections did not appear to
-  be reused the way `-k` implies), which is exactly what a proxy load test
-  needs to be measuring correctly.
-- Neither gives the proxy a **parent that actually asks for authentication**.
-  A load test against a bare, no-auth-needed backend never exercises the
-  parent-connection handshake or its pooling, which is a large part of what
-  makes a corporate-proxy client's design (gatir's, or any other's) worth
-  measuring in the first place; a proxy that authenticates once per
-  connection and one that re-authenticates every request can look identical
-  against a backend that never challenges either of them.
+The usual tools did not fit:
 
-`gatir-loadgen` is a thin wrapper around the same low-level `hyper` client
-gatir itself uses, so what it measures is genuine HTTP/1.1 keep-alive traffic
-with no tool-specific quirks in the way.
+- **curl** in a loop cannot report throughput or latency percentiles, and it
+  obeys `no_proxy` even with `-x`: a destination on `127.0.0.1` is often listed
+  there, and curl then bypasses the proxy without saying so. (`--noproxy ''`
+  turns that off.)
+- **Apache Bench** (`ab`) has `-X proxy:port`, but through a proxy it did not
+  reuse connections the way `-k` should, and connection reuse is what a proxy
+  test must get right.
+- **Neither gives the proxy a parent that asks for authentication.** Without
+  one, the authentication of new connections and their pooling are never
+  exercised: a proxy that authenticates once per connection and one that
+  authenticates every request look the same.
 
-## `serve-parent`: something real to authenticate to
+`gatir-loadgen` uses the same `hyper` client as gatir, so it sends real HTTP/1.1
+keep-alive traffic.
+
+## `serve-parent`: a parent that asks for NTLM
 
 ```sh
 gatir-loadgen serve-parent [--user U] [--domain D] [--password P]
 ```
 
-Starts a parent proxy that actually challenges for NTLM (defaults:
-`bench`/`BENCH`/`change-me`), on an ephemeral port, and prints it:
+This starts a parent proxy that asks for NTLM (by default `bench`, `BENCH`,
+`change-me`) on a free port, and prints its address:
 
 ```
 listening on 127.0.0.1:54321
@@ -46,16 +37,13 @@ credentials: user=bench domain=BENCH password=change-me
 (Ctrl-C to stop)
 ```
 
-Every request it accepts, once authenticated, gets the same small fixed
-reply, so the origin's own response time never confounds what is being
-measured. It answers with an explicit `Connection: keep-alive` — some
-proxies only treat a connection as reusable when told so outright, not merely
-by the absence of `Connection: close` that HTTP/1.1 already implies, so a
-partner that says so explicitly is the fairer, more representative one to
-benchmark against.
+Once a connection is authenticated, every request gets the same small reply, so
+no origin server's response time affects the measurement. The reply says
+`Connection: keep-alive` explicitly, because some proxies reuse a connection
+only when told so.
 
-Point the proxy under test's configuration at the address it printed, with
-matching credentials, e.g. for gatir:
+Point the proxy under test at the printed address, with the same credentials.
+For gatir:
 
 ```toml
 listen = ["127.0.0.1:3128"]
@@ -74,53 +62,46 @@ password = "change-me"
 gatir-loadgen bench <proxy-host:port> <origin-host:port> <connections> <seconds>
 ```
 
-`origin-host:port` is `serve-parent`'s own address here (the request target
-does not have to be real: `serve-parent` answers everything the same way).
-Opens `connections` persistent connections to the proxy, and on each fires
-`GET`s back to back for `seconds`, waiting for the full response before
-sending the next — real keep-alive traffic, not pipelining. A connection that
-drops for any reason is simply reopened, so a dropped socket lowers the
-count instead of ending the run: what is measured is the proxy's throughput,
-not this tool's tolerance for a single dropped connection.
+- `origin-host:port` can be `serve-parent`'s own address: the target does not
+  have to exist, since `serve-parent` answers every request the same way.
+- `bench` opens `connections` persistent connections to the proxy, and on each
+  sends `GET`s one after another for `seconds`, waiting for each full response
+  before the next: keep-alive, not pipelining.
+- A connection that drops is reopened, so a dropped socket lowers the count
+  instead of ending the run.
 
 ```
 connections=10 requests=69028 errors=0 seconds=5 rps=13805.6
 latency_us: p50=406 p90=816 p95=914 p99=1241 max=57237
 ```
 
-`errors` counts a request that failed outright (the connection dropped
-mid-request) or came back with a non-2xx status; a growing `errors` count
-across otherwise-identical runs is itself a finding worth explaining before
-trusting the `rps`/latency numbers next to it.
+`errors` counts requests that failed (the connection dropped mid-request) or got
+a status other than 2xx. If `errors` grows across identical runs, explain that
+before trusting the `rps` and latency next to it.
 
-## Soaking
+## Soak testing
 
-The same `bench` command with a longer `seconds` is the soak test: run it for
-several minutes at a concurrency the proxy handles cleanly at short duration,
-and watch its resident memory over that time (`ps -o rss= -p <pid>` sampled
-every so often, or Activity Monitor) for growth that does not level off — a
-leak, as opposed to memory that grows once and then stays flat.
+For a soak test, run the same `bench` for several minutes, at a concurrency the
+proxy handles cleanly in a short run. Sample the proxy's resident memory now and
+then (`ps -o rss= -p <pid>`, or Activity Monitor). Memory that grows once and
+then stays flat is normal; memory that keeps growing is a leak.
 
-## A known pitfall of loopback benchmarking on macOS
+## Port exhaustion on macOS
 
-Pushing many short-lived connections through 127.0.0.1 can exhaust the
-ephemeral port range (`sysctl net.inet.ip.portrange.first`/`.last`, 16384
-ports by default) before any of them naturally leave `TIME_WAIT`
-(`sysctl net.inet.tcp.msl`, so roughly twice that many milliseconds): both the
-proxy under test and `gatir-loadgen` itself then start seeing `Can't assign
-requested address` on new outbound connections. This is a limit of the local
-machine's own port pool during a synthetic loopback test, not necessarily a
-statement about the proxy's real capacity, and it gets worse across
-consecutive runs if a previous one churned through connections quickly (the
-`TIME_WAIT` sockets it left behind take their own ~30 seconds to clear, all
-the while shared with whatever a following run tries to do). Give a machine a
-short pause between high-concurrency runs, or lower the concurrency, if this
-shows up.
+Many short-lived connections through `127.0.0.1` can use up the ephemeral port
+range (16384 ports by default: `sysctl net.inet.ip.portrange.first` and
+`.last`) while closed sockets wait in `TIME_WAIT` (about twice
+`sysctl net.inet.tcp.msl` milliseconds). Both the proxy and `gatir-loadgen` then
+fail new connections with `Can't assign requested address`.
 
-## Comparing against another proxy
+This is a limit of the local computer in a loopback test, not of the proxy.
+It gets worse when runs follow each other closely, since the sockets left by one
+run take about 30 seconds to clear. Pause between high-concurrency runs, or
+lower the concurrency.
 
-Since `serve-parent` speaks real NTLM over a real port, any other proxy that
-can authenticate to a corporate NTLM proxy can be pointed at it the same way
-gatir is above, with the same credentials, and benchmarked with the same
-`bench` command — a same-backend, same-load-tool comparison, which is the
-only kind worth drawing conclusions from.
+## Comparing with another proxy
+
+`serve-parent` speaks real NTLM on a real port, so any other proxy that
+authenticates to an NTLM parent can be pointed at it with the same credentials,
+and measured with the same `bench` command. Only a comparison with the same
+parent and the same load tool is worth drawing conclusions from.
