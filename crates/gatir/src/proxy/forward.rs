@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Incoming};
+use hyper::client::conn::TrySendError;
 use hyper::header::{
     AUTHORIZATION, HOST, HeaderMap, HeaderValue, PROXY_AUTHORIZATION, WWW_AUTHENTICATE,
 };
@@ -57,15 +58,12 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
 
     strip_hop_by_hop(&mut parts.headers);
     parts.headers.insert(HOST, target.host_header.clone());
-    let rules = &context.request_headers;
 
-    let mut hops = context
+    let hops = context
         .upstreams
         .hops(&target.pac_url(), &target.host)
         .await?;
-    // The parents that accepted a connection and ended it without answering.
-    let mut tried = Vec::new();
-    let mut lease = acquire(context, hops.clone(), &target).await?;
+    let lease = acquire(context, hops.clone(), &target).await?;
 
     // A request that never had a body can be built again: to send it after a
     // failed attempt, or to open the authentication with.
@@ -74,149 +72,30 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         headers: parts.headers.clone(),
         extensions: parts.extensions.clone(),
     });
-    // A request that was sent may be sent again (on a new connection, or to
-    // the next parent) only when doing it twice is harmless.
-    let replay = head.as_ref().filter(|_| is_idempotent(&parts.method));
 
     // The wait for a response is timed from the moment the request is sent.
-    let (body, mut sent) = watch(body.boxed_unsync());
-    let limit = context.timeouts.response;
-
+    let (body, sent) = watch(body.boxed_unsync());
     let mut request = Request::new(body);
     *request.method_mut() = parts.method.clone();
     *request.version_mut() = Version::HTTP_11;
     // Carries the original capitalization of the header names (see the server
     // and client builders), which some proxies and firewalls are picky about.
     *request.extensions_mut() = parts.extensions;
-    address(&mut request, &parts.headers, &lease.hop, &target, rules);
 
-    // Set once a proof has been sent on `lease`, until the parent has said
-    // whether it accepts it.
-    let mut admission: Option<Admission<'_>> = None;
-    // Whether the request was already repeated because a connection had lost
-    // its authentication. Once is enough.
-    let mut lapsed = false;
-
-    let response = loop {
-        if lease.needs_auth {
-            let auth = context
-                .auth
-                .as_ref()
-                .expect("a connection needs authentication only when there are credentials");
-            match authenticate(
-                auth,
-                context,
-                &mut lease,
-                &mut request,
-                replay,
-                &target,
-                lapsed,
-            )
-            .await
-            {
-                Ok(Authenticated::Answered(response)) => break response,
-                Ok(Authenticated::Proof(proof)) => admission = Some(proof),
-                Ok(Authenticated::Ready) => {}
-                // Only a probe went out, or a request that is safe to repeat,
-                // so it is the same for the next parent.
-                Err(Failure::NoAnswer(error)) if lease.hop.is_parent() => {
-                    admission = None;
-                    lease =
-                        fail_over(context, &lease, &error, &mut hops, &mut tried, &target).await?;
-                    address(&mut request, &parts.headers, &lease.hop, &target, rules);
-                    continue;
-                }
-                Err(failure) => return Err(failure),
-            }
-        }
-
-        let attempt = response_within(limit, &mut sent, lease.sender.try_send_request(request));
-        let mut failed = match attempt.await {
-            None => return Err(Failure::ResponseTimeout(lease.hop.who())),
-            Some(Ok(response))
-                if demands_authentication(&response, &lease.hop, context, &target.host) =>
-            {
-                if !lease.reused {
-                    context.upstreams.worked(&lease.hop);
-                }
-                if let Some(proof) = admission.take() {
-                    return Err(match &lease.hop {
-                        Hop::Parent(_) => proof.refused(),
-                        Hop::Direct => proof.refused_by_origin(&target.address),
-                    });
-                }
-                // No proof went out on this connection: it had been
-                // authenticated, and is not any more.
-                let Some(head) = head.as_ref().filter(|_| !lapsed) else {
-                    return Err(Failure::AuthenticationLapsed(lease.hop.who()));
-                };
-                tracing::debug!("a connection lost its authentication, retrying on a new one");
-                lapsed = true;
-                let hop = lease.hop.clone();
-                request = head.request(&hop, &target, rules);
-                sent = Sent::already();
-                lease = connect(context, &hop, &target).await?;
-                continue;
-            }
-            Some(Ok(response)) => {
-                if !lease.reused {
-                    context.upstreams.worked(&lease.hop);
-                }
-                if let Some(proof) = admission.take() {
-                    proof.accepted();
-                }
-                break response;
-            }
-            Some(Err(failed)) => failed,
-        };
-        let returned = failed.take_message();
-        let error = failed.into_error();
-        // A new connection to a parent that wants no authentication, and that
-        // ended without a word: the next parent may do. (When there are
-        // credentials, the parent has answered by now: see `authenticate`.)
-        if !lease.reused
-            && lease.hop.is_parent()
-            && context.auth.is_none()
-            && ended_without_answer(&error)
-        {
-            // The parent may have passed the request on before it failed, so
-            // only one that is safe to repeat goes to the next parent, unless
-            // hyper never sent it.
-            let again = match (returned, replay) {
-                (Some(returned), _) => Some(returned),
-                (None, Some(replay)) => {
-                    sent = Sent::already();
-                    Some(replay.request(&lease.hop, &target, rules))
-                }
-                (None, None) => None,
-            };
-            let Some(again) = again else {
-                context.upstreams.no_answer(&lease.hop, &error);
-                return Err(Failure::NoAnswer(error));
-            };
-            request = again;
-            lease = fail_over(context, &lease, &error, &mut hops, &mut tried, &target).await?;
-            address(&mut request, &parts.headers, &lease.hop, &target, rules);
-            continue;
-        }
-        // Only a pooled connection can have gone stale unnoticed. The request
-        // may be sent again if hyper never sent it, or if it is safe to repeat.
-        let repeatable = returned.is_some() || (replay.is_some() && is_stale(&error));
-        if !lease.reused || !repeatable {
-            return Err(Failure::Upstream(error));
-        }
-        tracing::debug!(%error, "pooled connection was stale, retrying on a new one");
-        request = match (returned, replay) {
-            (Some(returned), _) => returned,
-            (None, Some(replay)) => {
-                sent = Sent::already();
-                replay.request(&lease.hop, &target, rules)
-            }
-            (None, None) => return Err(Failure::Upstream(error)),
-        };
-        let hop = lease.hop.clone();
-        lease = connect(context, &hop, &target).await?;
+    let mut forwarding = Forwarding {
+        context,
+        idempotent: is_idempotent(&parts.method),
+        headers: parts.headers,
+        target,
+        head,
+        hops,
+        tried: Vec::new(),
+        sent,
+        admission: None,
+        lapsed: false,
     };
+    forwarding.address(&mut request, &lease.hop);
+    let (response, lease) = forwarding.run(lease, request).await?;
 
     if lease.hop.is_parent()
         && context.auth.is_none()
@@ -234,6 +113,237 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         parts,
         lease.attach(&context.pool, body),
     ))
+}
+
+/// One request on its way: what is needed to send it, and to send it again
+/// on another connection or through another hop when an attempt fails.
+struct Forwarding<'a> {
+    context: &'a Live,
+    target: Target,
+    /// The client's header fields, without the hop-by-hop ones.
+    headers: HeaderMap,
+    /// The request, if it has no body and can be built again.
+    head: Option<Head>,
+    /// Whether doing the request twice is harmless.
+    idempotent: bool,
+    /// The hops not yet given up on, in order.
+    hops: Vec<Hop>,
+    /// The parents that accepted a connection and ended it without answering.
+    tried: Vec<ParentAttempt>,
+    /// When the request went out, for the response timeout.
+    sent: Sent,
+    /// Set once a proof has been sent, until the other side has said whether
+    /// it accepts it.
+    admission: Option<Admission<'a>>,
+    /// Whether the request was already sent again because a connection had
+    /// lost its authentication. Once is enough.
+    lapsed: bool,
+}
+
+impl<'a> Forwarding<'a> {
+    /// Sends `request` on `lease`, and on new connections or through other
+    /// hops as long as an attempt fails in a way that allows another. Returns
+    /// the response, and the connection it came on.
+    async fn run(
+        &mut self,
+        mut lease: Lease,
+        mut request: Request<Body>,
+    ) -> Result<(Response<Incoming>, Lease), Failure> {
+        loop {
+            if lease.needs_auth
+                && let Some(response) = self.authenticate(&mut lease, &mut request).await?
+            {
+                return Ok((response, lease));
+            }
+            let limit = self.context.timeouts.response;
+            let attempt = response_within(
+                limit,
+                &mut self.sent,
+                lease.sender.try_send_request(request),
+            );
+            (lease, request) = match attempt.await {
+                None => return Err(Failure::ResponseTimeout(lease.hop.who())),
+                Some(Ok(response))
+                    if demands_authentication(
+                        &response,
+                        &lease.hop,
+                        self.context,
+                        &self.target.host,
+                    ) =>
+                {
+                    self.lost_authentication(&lease).await?
+                }
+                Some(Ok(response)) => {
+                    if !lease.reused {
+                        self.context.upstreams.worked(&lease.hop);
+                    }
+                    if let Some(proof) = self.admission.take() {
+                        proof.accepted();
+                    }
+                    return Ok((response, lease));
+                }
+                Some(Err(failed)) => self.after_failure(lease, failed).await?,
+            };
+        }
+    }
+
+    /// Authenticates the new connection `lease`, moving on to the next parent
+    /// if this one ends the connection without answering. Returns the response
+    /// if the other side asked for nothing and the request itself opened the
+    /// exchange.
+    async fn authenticate(
+        &mut self,
+        lease: &mut Lease,
+        request: &mut Request<Body>,
+    ) -> Result<Option<Response<Incoming>>, Failure> {
+        let context = self.context;
+        let auth = context
+            .auth
+            .as_deref()
+            .expect("a connection needs authentication only when there are credentials");
+        loop {
+            let replay = self.head.as_ref().filter(|_| self.idempotent);
+            match authenticate(
+                auth,
+                context,
+                lease,
+                request,
+                replay,
+                &self.target,
+                self.lapsed,
+            )
+            .await
+            {
+                Ok(Authenticated::Answered(response)) => return Ok(Some(response)),
+                Ok(Authenticated::Proof(proof)) => {
+                    self.admission = Some(proof);
+                    return Ok(None);
+                }
+                Ok(Authenticated::Ready) => return Ok(None),
+                // Only a probe went out, or a request that is safe to repeat,
+                // so it is the same for the next parent.
+                Err(Failure::NoAnswer(error)) if lease.hop.is_parent() => {
+                    *lease = self.fail_over(lease, &error).await?;
+                    self.address(request, &lease.hop);
+                    if !lease.needs_auth {
+                        return Ok(None);
+                    }
+                }
+                Err(failure) => return Err(failure),
+            }
+        }
+    }
+
+    /// The other side asked for authentication on `lease`. After a proof, that
+    /// is a refusal. On a connection that had been authenticated before, the
+    /// request is sent again, once, on a new connection: the answer says that
+    /// it was not served, so even a request that is not safe to repeat can go
+    /// again, as long as it has no body.
+    async fn lost_authentication(
+        &mut self,
+        lease: &Lease,
+    ) -> Result<(Lease, Request<Body>), Failure> {
+        if !lease.reused {
+            self.context.upstreams.worked(&lease.hop);
+        }
+        if let Some(proof) = self.admission.take() {
+            return Err(match &lease.hop {
+                Hop::Parent(_) => proof.refused(),
+                Hop::Direct => proof.refused_by_origin(&self.target.address),
+            });
+        }
+        let Some(head) = self.head.as_ref().filter(|_| !self.lapsed) else {
+            return Err(Failure::AuthenticationLapsed(lease.hop.who()));
+        };
+        tracing::debug!("a connection lost its authentication, retrying on a new one");
+        let request = head.request(&lease.hop, &self.target, &self.context.request_headers);
+        self.lapsed = true;
+        self.sent = Sent::already();
+        let lease = connect(self.context, &lease.hop, &self.target).await?;
+        Ok((lease, request))
+    }
+
+    /// The connection `lease` failed before an answer came. Two cases allow
+    /// another attempt: a new connection to a parent that wants no
+    /// authentication and ended without a word, which moves on to the next
+    /// parent; and a pooled connection that had gone stale unnoticed, which is
+    /// replaced by a new one through the same hop. (When there are
+    /// credentials, a new connection to a parent has answered by now: see
+    /// `authenticate`.)
+    async fn after_failure(
+        &mut self,
+        lease: Lease,
+        mut failed: TrySendError<Request<Body>>,
+    ) -> Result<(Lease, Request<Body>), Failure> {
+        let returned = failed.take_message();
+        let error = failed.into_error();
+
+        if !lease.reused
+            && lease.hop.is_parent()
+            && self.context.auth.is_none()
+            && ended_without_answer(&error)
+        {
+            let Some(mut request) = self.resend(returned, &lease.hop) else {
+                self.context.upstreams.no_answer(&lease.hop, &error);
+                return Err(Failure::NoAnswer(error));
+            };
+            let next = self.fail_over(&lease, &error).await?;
+            self.address(&mut request, &next.hop);
+            return Ok((next, request));
+        }
+
+        if !lease.reused || (returned.is_none() && !is_stale(&error)) {
+            return Err(Failure::Upstream(error));
+        }
+        let Some(request) = self.resend(returned, &lease.hop) else {
+            return Err(Failure::Upstream(error));
+        };
+        tracing::debug!(%error, "pooled connection was stale, retrying on a new one");
+        let lease = connect(self.context, &lease.hop, &self.target).await?;
+        Ok((lease, request))
+    }
+
+    /// The request to send again through `hop` after a failed attempt: the one
+    /// hyper gave back unsent, or else, if doing it twice is harmless, the
+    /// same request built again. `None` if it cannot go again: the other side
+    /// may have acted on it, or its body is gone.
+    fn resend(&mut self, returned: Option<Request<Body>>, hop: &Hop) -> Option<Request<Body>> {
+        if returned.is_some() {
+            return returned;
+        }
+        let head = self.head.as_ref().filter(|_| self.idempotent)?;
+        let request = head.request(hop, &self.target, &self.context.request_headers);
+        self.sent = Sent::already();
+        Some(request)
+    }
+
+    /// A parent accepted the connection `from` and ended it before answering.
+    /// It is left for last for a while, and a connection is opened through the
+    /// next hop that is left. If there is none, the client is told about every
+    /// parent that was tried.
+    async fn fail_over(&mut self, from: &Lease, error: &hyper::Error) -> Result<Lease, Failure> {
+        self.admission = None;
+        self.tried
+            .push(self.context.upstreams.no_answer(&from.hop, error));
+        self.hops.retain(|hop| *hop != from.hop);
+        if self.hops.is_empty() {
+            return Err(Failure::ParentsUnavailable(std::mem::take(&mut self.tried)));
+        }
+        acquire(self.context, self.hops.clone(), &self.target)
+            .await
+            .map_err(|failure| failure.after(std::mem::take(&mut self.tried)))
+    }
+
+    /// Writes `request` for `hop`: see [`address`].
+    fn address(&self, request: &mut Request<Body>, hop: &Hop) {
+        address(
+            request,
+            &self.headers,
+            hop,
+            &self.target,
+            &self.context.request_headers,
+        );
+    }
 }
 
 /// Whether the next hop is asking for authentication, and has been given the
@@ -347,28 +457,6 @@ async fn authenticate<'a>(
             Ok(Authenticated::Ready)
         }
     }
-}
-
-/// A parent accepted the connection and ended it before answering the first
-/// request on it. It is left for last for a while, and the connection is
-/// opened through the next of the `hops` that is left. If there is none, the
-/// client is told about every parent that was tried.
-async fn fail_over(
-    context: &Live,
-    from: &Lease,
-    error: &hyper::Error,
-    hops: &mut Vec<Hop>,
-    tried: &mut Vec<ParentAttempt>,
-    target: &Target,
-) -> Result<Lease, Failure> {
-    tried.push(context.upstreams.no_answer(&from.hop, error));
-    hops.retain(|hop| *hop != from.hop);
-    if hops.is_empty() {
-        return Err(Failure::ParentsUnavailable(std::mem::take(tried)));
-    }
-    acquire(context, hops.clone(), target)
-        .await
-        .map_err(|failure| failure.after(std::mem::take(tried)))
 }
 
 /// A request that only serves to open the authentication with `hop`.
