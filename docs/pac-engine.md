@@ -1,8 +1,8 @@
 # The PAC script engine
 
-gatir runs PAC (proxy auto-configuration) scripts with **QuickJS**, through the
-`rquickjs` crate. This records why, what was measured, and what the choice
-costs.
+gatir runs PAC (proxy auto-configuration) scripts with **QuickJS-ng**, a fork
+of QuickJS, through the `rquickjs` crate. This page records why, what was
+measured, and what the choice costs.
 
 ## What was needed
 
@@ -25,7 +25,7 @@ repository) evaluated for 1094 URLs, three generated PACs of 80 to 190 KB that
 call helpers thousands of times per evaluation, and 36 cases of ordinary and
 hostile scripts, each in its own process with a time limit.
 
-| | `rquickjs` 0.14 (QuickJS, C) | `boa_engine` 0.22 (Rust) |
+| | `rquickjs` 0.14 (QuickJS-ng, C) | `boa_engine` 0.22 (Rust) |
 |---|---|---|
 | Ordinary and hostile cases passed (of 36) | 35 | 32, with the `annex-b` feature |
 | Differences from V8 on the real PAC | 0 | 0, with `annex-b` |
@@ -44,24 +44,27 @@ Boa only runs `substr`, `escape` and `unescape` when it is built with its
 PAC.
 
 Neither engine can stop a long loop inside a built-in function, such as
-`new Array(4294967295).join("x")`.
+`new Array(4294967295).join("x")`. Which of the 36 cases QuickJS-ng failed was
+not recorded; this one is the likely candidate.
 
 ## Decision
 
-QuickJS. It has the limits that matter (an interrupt handler, a memory limit, a
-stack limit), it runs the scripts correctly, and it is small.
+QuickJS-ng. It has the limits that matter (an interrupt handler, a memory limit,
+a stack limit), it runs the scripts correctly, and it is small.
 
 The cost is C code in the process. `rquickjs` bundles QuickJS-ng (MIT), the
-maintained fork of Fabrice Bellard's QuickJS, and it is kept behind
-`pac::engine`: nothing else in gatir calls into it.
+maintained fork of Fabrice Bellard's QuickJS, and gatir keeps it behind
+`pac::engine`: nothing else calls into it.
+
 What limits the damage a bad script can do:
 
 - time, memory and stack limits on every evaluation;
-- the one runaway the engine cannot interrupt is caught from outside: the worker
-  is given up on and replaced, and while too many given-up workers are still
-  busy, requests get an error that says so;
-- name lookups, which a script cannot interrupt either, run on their own threads
-  with a time limit.
+- name lookups run on their own threads, and a script waits for each at most 2
+  seconds;
+- what the engine cannot interrupt (a loop inside a built-in function, a name
+  lookup that never ends) is caught from outside: the worker is given up on and
+  replaced, and while too many given-up workers are still busy, requests get an
+  error that says so.
 
 If this ever needs to be stronger, the evaluation can move to a separate
 process that can be killed, which would also contain a crash of the engine.
@@ -69,10 +72,10 @@ process that can be killed, which would also contain a crash of the engine.
 ## What was not chosen
 
 - **Boa**: pure Rust, and correct on the scripts once built with `annex-b`, but
-  with no limit on time or memory, so a runaway script hangs the proxy or takes
-  its memory. It also pulls in many more crates.
-- **Brimstone**: complete and active, but not published as a crate, it says it is
-  not ready for production, its library has no embedding interface (host
+  with no limit on time or memory, so a runaway script hangs the proxy or uses
+  up its memory. It also pulls in many more crates.
+- **Brimstone**: complete and active, but not published as a crate, and it says
+  it is not ready for production. Its library has no embedding interface (host
   functions are defined with the engine's internal macros), and it has no limits
   on time or stack.
 

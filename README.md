@@ -104,7 +104,7 @@ line replaces the same setting from the file.
 - [Configuration](docs/configuration.md): where the file is, who may read it, reloading.
 - [Authentication](docs/authentication.md): NTLM, Negotiate (Kerberos, and SSPI on Windows), and how to find out why one fails.
 - [A parent that does not work](docs/failover.md): when gatir moves on to the next one, and what it remembers.
-- [PAC scripts](docs/pac.md) ([why its engine is QuickJS](docs/pac-engine.md)),
+- [PAC scripts](docs/pac.md) ([why its engine is QuickJS-ng](docs/pac-engine.md)),
   [ports forwarded through the proxy](docs/tunnels.md), [the SOCKS5 server](docs/socks5.md).
 - [Making a release](docs/release.md), [load-testing gatir](docs/load-testing.md), and [the specifications gatir follows](docs/references.md).
 - [Notes for contributors](AGENTS.md).
