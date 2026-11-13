@@ -1,73 +1,82 @@
-# Where the configuration is, and what gatir says
+# Configuration
 
-Every setting of the file is listed in [Settings](settings.md).
+This page covers where the configuration file is, who may read it, the log, and
+how to reload a running gatir. [Settings](settings.md) lists what the file can
+say.
 
-## Which file is read
+## Where the file is
 
 The commands that read the configuration (`run`, `config check`, `detect` and
-`pac`) read the file named with `--config`. Without it they look, in this order,
-for
+`pac`) use the file named with `--config`. Without that option, they use the
+first of these that exists:
 
-1. `$XDG_CONFIG_HOME/gatir/gatir.toml`, or `~/.config/gatir/gatir.toml` when that
-   variable is not set (a relative `XDG_CONFIG_HOME` is ignored, as the XDG
-   specification says);
-2. `/etc/gatir/gatir.toml` (Linux and macOS);
-3. on Windows, `%APPDATA%\gatir\gatir.toml`.
+1. `$XDG_CONFIG_HOME/gatir/gatir.toml`, or `~/.config/gatir/gatir.toml` when
+   `XDG_CONFIG_HOME` is not set. A relative `XDG_CONFIG_HOME` is ignored, as the
+   XDG specification says.
+2. `/etc/gatir/gatir.toml` (Linux and macOS).
+3. `%APPDATA%\gatir\gatir.toml` (Windows).
 
-The first one that exists is used. If there is none, the built-in defaults apply
-(a proxy on `127.0.0.1:3128` that connects directly), together with whatever the
-command line says. A file that is named and is not there is an error, not a
-reason to look elsewhere.
+If none exists, gatir uses its built-in defaults: a proxy on `127.0.0.1:3128`
+that connects directly, plus whatever the command line says. A file named with
+`--config` that does not exist is an error; gatir does not look elsewhere.
 
-gatir says which file it read: `gatir config check` prints it, and `gatir run` logs
-it when it starts.
+`gatir config check` prints which file it read, and `gatir run` logs it when it
+starts.
 
-## Who may read it
+## File permissions
 
-The file can hold a password, a hash, the password of the SOCKS5 server and header
-values, so gatir looks at who can get at it when it starts, on Linux and macOS:
+The file can hold secrets: a password or hash, the password of the SOCKS5
+server, header values. When gatir starts on Linux or macOS, it checks who else
+can get at the file:
 
-- if it holds any of those and other users can read it, it warns and says to
-  `chmod 600` it;
-- if other users can change it, it warns whether it holds secrets or not, since
-  what the file says is where the traffic goes.
+- If the file holds a secret and other users can read it, gatir warns and tells
+  you to `chmod 600` it.
+- If other users can change it, gatir warns even when it holds no secret: the
+  file decides where your traffic goes.
 
-The warning does not stop gatir. Nothing is checked on Windows yet.
+The warning does not stop gatir. Windows is not checked yet.
 
 ## The log
 
-gatir logs to its standard error, at the level of `[log] level` or `--log-level`
-(`RUST_LOG` overrides both). Colors are used only when standard error is a
-terminal and `NO_COLOR` is not set, so a log that goes to a file, a pipe or a
-service manager has no escape sequences in it.
+gatir logs to standard error, at the level of `[log] level` or `--log-level`.
+The `RUST_LOG` environment variable replaces both. The log has colors only when
+standard error is a terminal and `NO_COLOR` is not set, so a log written to a
+file, a pipe or a service manager has no escape sequences in it.
 
-## Changing the configuration while gatir runs
+## Reloading
 
 On Linux and macOS, `kill -HUP <pid>` makes gatir read its configuration again,
-from the same file and with the same command-line options, and apply it. Every
-request, tunnel and SOCKS5 client already being served finishes under the
-settings it began with; the ones that come after use the new.
+from the same file and with the same command-line options. Requests, tunnels and
+SOCKS5 clients already in progress finish with the old settings; new ones use
+the new settings.
 
-What a reload applies:
+A reload applies:
 
-- the parents, the PAC script and its limits, and `no_proxy`;
-- the `[access]` rules and the `[headers]` table;
-- the credentials for the parent, and the user name and password of the SOCKS5
-  server;
-- the `[timeouts]`.
+- the parents, the PAC location, `refresh_secs`, `fetch_timeout_secs` and the
+  overrides, and `no_proxy`;
+- `[access]` and `[headers]`;
+- the credentials, and the SOCKS5 user name and password;
+- `[timeouts]`.
 
-Connections to a parent that were kept for reuse are closed, since they may have
-been authenticated as someone else, or lead to another parent. A PAC script that is
-read from the same place in the same way is kept, with the overrides of the new
-file added to it, and looked at again at once, so a reload is also how to say that
-it changed; if it cannot be read just then, the last version that worked stays.
-If the credentials did not change, the record of a parent that refused them is kept too: reading the same file again is no reason to try the account once more.
+What happens to what gatir already holds:
 
-What only a new start applies is `listen`, the `[[tunnels]]`, the addresses of
-`[socks5]`, and `[log] level`. If they changed, gatir says which, and goes on with
-the values it started with; everything else in the file is applied.
+- **Pooled connections** to parents are closed: they may have been
+  authenticated as someone else, or lead to another parent.
+- **The PAC script**: if its location and settings did not change, gatir keeps
+  the loaded script, applies the new overrides, and checks the script for
+  changes at once. So a reload is also a way to force a PAC refresh. If the
+  script cannot be read at that moment, the previous one stays in use.
+- **A refusal of the credentials**: if the credentials did not change, gatir
+  still waits out the cooldown, since reloading the same file is no reason to
+  try the account again.
 
-A file that cannot be read, or is not valid, or names a PAC file that cannot be
-used, changes nothing: gatir logs why, at the `error` level, and keeps the settings
-it has. Without this signal a `SIGHUP` would end the process, so gatir catches it
-from the start.
+Some settings apply only when gatir starts: `listen`, `[[tunnels]]`, the
+`listen` addresses of `[socks5]`, and `[log] level`. If one of them changed,
+gatir logs which, keeps the value it started with, and applies the rest.
+
+If the file cannot be read, is not valid, or names a PAC file that cannot be
+used, nothing changes: gatir logs why at the `error` level and keeps its current
+settings.
+
+gatir handles `SIGHUP` from the moment it starts, so the signal never
+terminates it.
