@@ -76,9 +76,6 @@ Send a few hosts to other proxies than the PAC script says (the \fB[[pac.overrid
 \fI$XDG_CONFIG_HOME/gatir/gatir.toml\fR, \fI~/.config/gatir/gatir.toml\fR, \fI/etc/gatir/gatir.toml\fR
 The configuration file, when \fB\-\-config\fR is not given: the first of them that exists is read. On Windows, \fI%APPDATA%\\gatir\\gatir.toml\fR takes the place of the first two. The file may hold a password, so gatir warns when other users can read it, and when they can change it.
 .TP
-\fI$XDG_CONFIG_HOME/gatir/pac/\fR, \fI~/.config/gatir/pac/\fR
-Where \fBgatir pac export\fR writes a script when it is given a file name alone, and where \fBgatir pac\fR looks for one named that way. It is the \fIpac\fR folder next to the configuration file named with \fB\-\-config\fR, if there is one. On Windows, \fI%APPDATA%\\gatir\\pac\fR.
-.TP
 \fI/usr/share/doc/gatir/\fR
 An example configuration (\fIexamples/gatir.example.toml\fR) and the documentation.
 .SH ENVIRONMENT

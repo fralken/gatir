@@ -22,8 +22,8 @@ const OVERRIDES: &str = "[[pac.overrides]]\n\
 hosts = [\"ghcr.io\", \"githubusercontent.com\"]\n\
 proxy = \"PROXY a.example.com:80; PROXY b.example.com:80\"\n";
 
-/// A gatir that finds nothing of the machine it runs on: its configuration
-/// folder is `dir`, so the `pac` folder is `dir/pac`.
+/// A gatir that finds nothing of the machine it runs on: it runs in `dir`, where
+/// its configuration is.
 fn gatir(dir: &Path) -> Command {
     let mut command = Command::cargo_bin("gatir").unwrap();
     command
@@ -52,6 +52,16 @@ fn configure(dir: &Path, toml: &str) {
     fs::write(dir.join("gatir.toml"), toml).unwrap();
 }
 
+/// What is in `dir`, by name, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 fn export(dir: &Path, output: &str) -> Command {
     let mut command = gatir(dir);
     command.args(["pac", "export", "--output", output]);
@@ -59,7 +69,7 @@ fn export(dir: &Path, output: &str) -> Command {
 }
 
 #[test]
-fn a_file_name_alone_goes_to_the_pac_folder_and_the_original_is_kept() {
+fn the_script_is_written_where_the_output_says_and_the_original_is_kept() {
     let dir = workdir();
     export(dir.path(), "local.pac").assert().success().stdout(
         predicate::str::contains(
@@ -71,7 +81,8 @@ fn a_file_name_alone_goes_to_the_pac_folder_and_the_original_is_kept() {
         .and(predicate::str::contains("local.pac")),
     );
 
-    let made = fs::read(dir.path().join("pac").join("local.pac")).unwrap();
+    // A relative path is from the current folder.
+    let made = fs::read(dir.path().join("local.pac")).unwrap();
     assert!(made.starts_with(ORIGINAL.as_bytes()));
     assert!(
         String::from_utf8(made)
@@ -79,11 +90,10 @@ fn a_file_name_alone_goes_to_the_pac_folder_and_the_original_is_kept() {
             .contains("gatir: local routes")
     );
     // Nothing else was left in the folder.
-    let names: Vec<_> = fs::read_dir(dir.path().join("pac"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, ["local.pac"]);
+    assert_eq!(
+        names(dir.path()),
+        ["gatir.toml", "local.pac", "original.pac"]
+    );
 }
 
 #[test]
@@ -99,7 +109,7 @@ fn without_an_output_the_script_goes_to_the_standard_output_and_nothing_else() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("\"githubusercontent.com\""), "{text}");
     assert!(text.ends_with("// ===== end of gatir: local routes =====\n"));
-    assert!(!dir.path().join("pac").exists());
+    assert_eq!(names(dir.path()), ["gatir.toml", "original.pac"]);
 }
 
 #[test]
@@ -116,13 +126,13 @@ fn several_overrides_are_all_in_the_script() {
         predicate::str::contains("-> PROXY a.example.com:80; PROXY b.example.com:80")
             .and(predicate::str::contains("*.crates.io -> DIRECT")),
     );
-    let made = fs::read_to_string(dir.path().join("pac").join("local.pac")).unwrap();
+    let made = fs::read_to_string(dir.path().join("local.pac")).unwrap();
     assert!(made.contains("\"*.crates.io\""), "{made}");
     assert_eq!(made.matches("// ===== gatir: local routes").count(), 1);
 }
 
 #[test]
-fn a_path_is_taken_as_written() {
+fn a_path_is_taken_as_it_is_written_and_its_folders_are_made() {
     let dir = workdir();
     let elsewhere = tempfile::tempdir().unwrap();
     let absolute = elsewhere.path().join("deep").join("abs.pac");
@@ -132,42 +142,19 @@ fn a_path_is_taken_as_written() {
         .success();
     assert!(absolute.is_file());
 
-    // `./name` is the current folder, not the pac folder.
     export(dir.path(), "./here.pac").assert().success();
     assert!(dir.path().join("here.pac").is_file());
-    assert!(!dir.path().join("pac").exists());
-}
-
-#[test]
-fn the_default_folder_is_in_the_users_configuration_folder() {
-    let dir = workdir();
-    let home = tempfile::tempdir().unwrap();
-    let folder = home.path().join("gatir");
-    fs::create_dir_all(&folder).unwrap();
-    fs::write(
-        folder.join("gatir.toml"),
-        format!(
-            "[pac]\nfile = {:?}\n{OVERRIDES}",
-            dir.path().join("original.pac").display().to_string()
-        ),
-    )
-    .unwrap();
-    Command::cargo_bin("gatir")
-        .unwrap()
-        .env("XDG_CONFIG_HOME", home.path())
-        .env_remove("NO_COLOR")
-        .current_dir(dir.path())
-        .args(["pac", "export", "--output", "x.pac"])
+    export(dir.path(), "sub/folder/there.pac")
         .assert()
         .success();
-    assert!(folder.join("pac").join("x.pac").is_file());
+    assert!(dir.path().join("sub/folder/there.pac").is_file());
 }
 
 #[test]
 fn an_existing_file_is_not_replaced_without_force() {
     let dir = workdir();
     export(dir.path(), "local.pac").assert().success();
-    let path = dir.path().join("pac").join("local.pac");
+    let path = dir.path().join("local.pac");
     fs::write(&path, "kept\n").unwrap();
 
     export(dir.path(), "local.pac").assert().failure().stderr(
@@ -181,7 +168,7 @@ fn an_existing_file_is_not_replaced_without_force() {
         .success()
         .stdout(predicate::str::contains("kept as"));
     assert_eq!(
-        fs::read_to_string(dir.path().join("pac").join("local.pac.prev")).unwrap(),
+        fs::read_to_string(dir.path().join("local.pac.prev")).unwrap(),
         "kept\n"
     );
     assert!(
@@ -220,7 +207,11 @@ fn what_cannot_be_made_creates_nothing() {
         fs::write(dir.path().join("text.pac"), "just words\n").unwrap();
         configure(dir.path(), toml);
         export(dir.path(), "x.pac").assert().failure();
-        assert!(!dir.path().join("pac").exists(), "{what}");
+        assert_eq!(
+            names(dir.path()),
+            ["gatir.toml", "original.pac", "text.pac"],
+            "{what}"
+        );
     }
 }
 
@@ -259,7 +250,7 @@ fn a_script_can_be_fetched_from_an_address() {
         .success()
         // The query may hold a token: it is not printed, nor written down.
         .stdout(predicate::str::contains("secret").not());
-    let made = fs::read_to_string(dir.path().join("pac").join("fetched.pac")).unwrap();
+    let made = fs::read_to_string(dir.path().join("fetched.pac")).unwrap();
     assert!(made.starts_with(ORIGINAL));
     assert!(!made.contains("secret"));
     assert!(made.contains(&format!("from http://{}/proxy.pac.", origin.authority())));
@@ -408,11 +399,7 @@ async fn an_exported_script_is_what_the_proxy_runs() {
 
     let table = format!(
         "[pac]\nfile = {:?}\n",
-        dir.path()
-            .join("pac")
-            .join("copy.pac")
-            .display()
-            .to_string()
+        dir.path().join("copy.pac").display().to_string()
     );
     let proxy = start_proxy(&table).await;
     let body = |authority: &'static str| {
@@ -426,19 +413,4 @@ async fn an_exported_script_is_what_the_proxy_runs() {
     assert_eq!(body("special.example.com").await, "local");
     assert_eq!(body("www.special.example.com").await, "local");
     assert_eq!(body("other.example.com").await, "company");
-}
-
-#[test]
-fn a_file_name_alone_that_is_not_in_the_pac_folder_says_where_it_looked() {
-    let dir = workdir();
-    // original.pac is in the current folder, not in the pac folder.
-    gatir(dir.path())
-        .args(["pac", "test", "--script", "original.pac", "ghcr.io"])
-        .assert()
-        .failure()
-        .stdout(
-            predicate::str::contains("original.pac")
-                .and(predicate::str::contains("pac folder"))
-                .and(predicate::str::contains("write ./NAME")),
-        );
 }

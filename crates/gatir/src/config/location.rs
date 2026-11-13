@@ -43,28 +43,6 @@ fn user_files(config_home: Option<OsString>, home: Option<OsString>) -> Vec<Path
     places
 }
 
-/// The folder for PAC scripts that gatir writes, and that a script named by its
-/// file name alone is looked for in: `pac`, next to the configuration file that
-/// is named, or else next to the user's own (`~/.config/gatir`, or
-/// `%APPDATA%\gatir` on Windows). `None` if there is no telling where that is.
-pub fn pac_dir(config: Option<&Path>) -> Option<PathBuf> {
-    pac_dir_for(
-        config,
-        user_files(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            std::env::var_os("HOME"),
-        ),
-    )
-}
-
-fn pac_dir_for(config: Option<&Path>, user_files: Vec<PathBuf>) -> Option<PathBuf> {
-    let file = match config {
-        Some(file) => file.to_path_buf(),
-        None => user_files.into_iter().next()?,
-    };
-    Some(file.parent()?.join("pac"))
-}
-
 /// The first of `places` for which `is_file` says yes.
 fn first_that_exists(places: Vec<PathBuf>, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     places.into_iter().find(|place| is_file(place))
@@ -207,26 +185,6 @@ mod tests {
         let folder = dir.path().join("folder.toml");
         std::fs::create_dir(&folder).unwrap();
         assert_eq!(first_that_exists(vec![folder], Path::is_file), None);
-    }
-
-    #[test]
-    fn the_pac_folder_is_next_to_the_file_that_is_named_or_else_the_users() {
-        let user = vec![PathBuf::from("/home/u/.config/gatir/gatir.toml")];
-        assert_eq!(
-            pac_dir_for(Some(Path::new("/srv/x/gatir.toml")), user.clone()),
-            Some(Path::new("/srv/x").join("pac"))
-        );
-        assert_eq!(
-            pac_dir_for(None, user),
-            Some(Path::new("/home/u/.config/gatir").join("pac"))
-        );
-        // The file of the machine is not the user's to write in.
-        assert_eq!(pac_dir_for(None, Vec::new()), None);
-        // A file named without a folder is in the current one.
-        assert_eq!(
-            pac_dir_for(Some(Path::new("gatir.toml")), Vec::new()),
-            Some(PathBuf::from("pac"))
-        );
     }
 
     #[cfg(unix)]

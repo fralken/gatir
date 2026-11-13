@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use clap::{Args, Subcommand};
 use hyper::Uri;
 
 use super::Source;
-use crate::config::{Overrides, PacConfig, PacLocation, pac_dir};
+use crate::config::{Overrides, PacConfig, PacLocation};
 use crate::pac::{
     Fetched, OperatingSystem, PacEnv, PacOverride, Route, SystemPac, SystemResolver, Trust,
     Validators, check, fetch, load_script, read_script_file, tool_limits, wrap,
@@ -43,10 +43,9 @@ pub enum PacCommand {
 
 #[derive(Debug, Args)]
 pub struct ExportArgs {
-    /// Where to write the script: a file name alone goes in the `pac` folder
-    /// next to the configuration file, anything with a folder in it is the path
-    /// as written. Without it, the standard output
-    #[arg(long, value_name = "NAME|PATH")]
+    /// Where to write the script, as the path is written (a relative one is
+    /// from the current folder). Without it, the standard output
+    #[arg(long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
     /// Replace the file if it exists (the old one is kept as NAME.prev)
@@ -62,8 +61,7 @@ pub struct TestArgs {
     pub urls: Vec<String>,
 
     /// A script to ask, as it is, without the overrides: a file, or an address.
-    /// A file name alone is looked for in the `pac` folder. Repeat it to
-    /// compare. Without it, the script of the configuration
+    /// Repeat it to compare. Without it, the script of the configuration
     #[arg(long = "script", value_name = "FILE|URL")]
     pub scripts: Vec<PacLocation>,
 }
@@ -84,7 +82,7 @@ pub(super) fn run(
     match command {
         PacCommand::Export(args) => {
             let pac = configured(&config, overrides)?;
-            export(&args, &pac, config.as_deref())
+            export(&args, &pac)
         }
         PacCommand::Test(args) => {
             let asked = if args.scripts.is_empty() {
@@ -92,7 +90,7 @@ pub(super) fn run(
                     .map_err(|err| anyhow::anyhow!("{err}; or ask a script with --script"))?;
                 vec![asked_by_configuration(pac)]
             } else {
-                asked_by_name(args.scripts, config.as_deref())?
+                asked_by_name(args.scripts)
             };
             test(&args.urls, asked)
         }
@@ -107,63 +105,6 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .context("cannot start the async runtime")
-}
-
-/// Whether `path` is a file name and nothing more: no folder, not even `./`.
-fn is_bare_name(path: &Path) -> bool {
-    let mut parts = path.components();
-    matches!(
-        (parts.next(), parts.next()),
-        (Some(Component::Normal(_)), None)
-    )
-}
-
-/// Where the file `name` is, for what is given as a file: a bare name is in the
-/// PAC folder, and anything with a folder in it is the path as written.
-fn in_pac_dir(name: &Path, config: Option<&Path>) -> anyhow::Result<PathBuf> {
-    if !is_bare_name(name) {
-        return Ok(name.to_path_buf());
-    }
-    let dir = pac_dir(config)
-        .context("cannot tell where the configuration folder is (no HOME): give the whole path")?;
-    Ok(dir.join(name))
-}
-
-/// A script to read, with whether it was named by a file name alone.
-struct Located {
-    location: PacLocation,
-    bare: bool,
-}
-
-fn located(location: PacLocation, config: Option<&Path>) -> anyhow::Result<Located> {
-    match location {
-        PacLocation::File(path) => {
-            let bare = is_bare_name(&path);
-            Ok(Located {
-                location: PacLocation::File(in_pac_dir(&path, config)?),
-                bare,
-            })
-        }
-        other @ (PacLocation::Url(_) | PacLocation::System) => Ok(Located {
-            location: other,
-            bare: false,
-        }),
-    }
-}
-
-impl Located {
-    async fn read(&self) -> anyhow::Result<Vec<u8>> {
-        read_script(&self.location).await.map_err(|err| {
-            if self.bare {
-                anyhow::anyhow!(
-                    "{err} (a file name alone is looked for in the pac folder: write ./NAME \
-                     for a file in the current folder)"
-                )
-            } else {
-                err
-            }
-        })
-    }
 }
 
 /// Where a script is: the address that the system gives, for the script of the
@@ -199,13 +140,9 @@ async fn read_script(location: &PacLocation) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-fn export(args: &ExportArgs, pac: &PacConfig, config: Option<&Path>) -> anyhow::Result<()> {
-    let output = args
-        .output
-        .as_deref()
-        .map(|name| in_pac_dir(name, config))
-        .transpose()?;
-    if let Some(output) = &output {
+fn export(args: &ExportArgs, pac: &PacConfig) -> anyhow::Result<()> {
+    let output = args.output.as_deref();
+    if let Some(output) = output {
         if output.is_dir() {
             bail!("{} is a folder: name the file", output.display());
         }
@@ -233,7 +170,7 @@ fn export(args: &ExportArgs, pac: &PacConfig, config: Option<&Path>) -> anyhow::
             .write_all(&script)
             .context("cannot write to the standard output");
     };
-    let kept = write_script(&output, &script, args.force)?;
+    let kept = write_script(output, &script, args.force)?;
 
     println!("from:        {from}");
     for over in &pac.overrides {
@@ -385,7 +322,7 @@ fn labels(scripts: &[PacLocation]) -> Vec<String> {
 /// A script to ask, and the ways of asking it: each has a label to show, and the
 /// overrides that are added to the script for it.
 struct Asked {
-    script: Located,
+    script: PacLocation,
     ways: Vec<(String, Vec<PacOverride>)>,
 }
 
@@ -402,34 +339,22 @@ fn asked_by_configuration(pac: PacConfig) -> Asked {
         ]
     };
     Asked {
-        script: Located {
-            location: pac.location,
-            bare: false,
-        },
+        script: pac.location,
         ways,
     }
 }
 
 /// The scripts that were named, each as it is.
-fn asked_by_name(scripts: Vec<PacLocation>, config: Option<&Path>) -> anyhow::Result<Vec<Asked>> {
-    let scripts = scripts
-        .into_iter()
-        .map(|location| located(location, config))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let labels = labels(
-        &scripts
-            .iter()
-            .map(|script| script.location.clone())
-            .collect::<Vec<_>>(),
-    );
-    Ok(scripts
+fn asked_by_name(scripts: Vec<PacLocation>) -> Vec<Asked> {
+    let labels = labels(&scripts);
+    scripts
         .into_iter()
         .zip(labels)
         .map(|(script, label)| Asked {
             script,
             ways: vec![(label, Vec::new())],
         })
-        .collect())
+        .collect()
 }
 
 fn test(urls: &[String], asked: Vec<Asked>) -> anyhow::Result<()> {
@@ -453,11 +378,13 @@ fn test(urls: &[String], asked: Vec<Asked>) -> anyhow::Result<()> {
         let mut loaded = Vec::new();
         for asked in &asked {
             // Read once, whatever the ways of asking it.
-            let bytes = asked.script.read().await.map_err(|err| err.to_string());
+            let bytes = read_script(&asked.script)
+                .await
+                .map_err(|err| err.to_string());
             for (label, overrides) in &asked.ways {
                 let pac = match &bytes {
                     Ok(bytes) => {
-                        let from = asked.script.location.to_string();
+                        let from = asked.script.to_string();
                         load_script(&wrap(bytes, overrides, &from), tool_limits(), env.clone())
                             .await
                             .map_err(|err| format!("the script is not usable: {err}"))
@@ -514,35 +441,6 @@ fn test(urls: &[String], asked: Vec<Asked>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_bare_file_name_is_not_a_path() {
-        assert!(is_bare_name(Path::new("zscaler-local.pac")));
-        for path in ["./a.pac", "dir/a.pac", "/abs/a.pac", "../a.pac", ".", ""] {
-            assert!(!is_bare_name(Path::new(path)), "{path}");
-        }
-        #[cfg(windows)]
-        for path in ["C:\\pac\\a.pac", "dir\\a.pac", "C:a.pac"] {
-            assert!(!is_bare_name(Path::new(path)), "{path}");
-        }
-    }
-
-    #[test]
-    fn a_bare_name_goes_to_the_pac_folder_and_a_path_stays_where_it_is() {
-        let config = Path::new("/srv/gatir/gatir.toml");
-        assert_eq!(
-            in_pac_dir(Path::new("a.pac"), Some(config)).unwrap(),
-            Path::new("/srv/gatir").join("pac").join("a.pac")
-        );
-        assert_eq!(
-            in_pac_dir(Path::new("/tmp/a.pac"), Some(config)).unwrap(),
-            PathBuf::from("/tmp/a.pac")
-        );
-        assert_eq!(
-            in_pac_dir(Path::new("./a.pac"), Some(config)).unwrap(),
-            PathBuf::from("./a.pac")
-        );
-    }
 
     #[test]
     fn urls_and_bare_hosts_are_read_the_way_gatir_asks_scripts() {

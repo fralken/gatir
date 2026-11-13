@@ -164,11 +164,9 @@ https://www.example.org/
 
 A host name alone is `https://HOST/`, which is what gatir asks for a tunnel.
 `--script FILE|URL` asks a script of your choosing, as it is, without the
-overrides, and may be repeated to compare; a file name alone is looked for in
-the `pac` folder next to the configuration file (`~/.config/gatir/pac`, or
-`%APPDATA%\gatir\pac`). The names a script looks up are looked up for real, so
-the answer is the one gatir would get here and now. The exit status is not zero
-if a script could not be used.
+overrides, and may be repeated to compare. The names a script looks up are
+looked up for real, so the answer is the one gatir would get here and now. The
+exit status is not zero if a script could not be used.
 
 ### Writing the script as a file
 
@@ -180,10 +178,10 @@ gatir pac export --output local.pac
 gatir pac export > local.pac
 ```
 
-`--output` is a file name, which goes in the `pac` folder, or a path with a
-folder in it, which is used as written (`./name.pac` is the current folder);
-without it the script goes to the standard output. An existing file is not
-replaced without `--force`, which keeps the old one as `name.pac.prev`. The
+`--output` is a path, used as it is written (a relative one is from the current
+folder, and a folder that is missing is made); without it the script goes to the
+standard output. An existing file is not replaced without `--force`, which keeps
+the old one as `name.pac.prev`. The
 script is checked before it is written: it is loaded with the engine of gatir,
 and each host of the overrides is asked what it answers, so an entry that an
 earlier one hides is reported.
