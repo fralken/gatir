@@ -9,7 +9,7 @@ or through which proxies. gatir runs it in place of a fixed list of parents.
 file = "proxy.pac"        # relative to this file, or absolute
 # or, instead of a file:
 url = "http://wpad.example.com/proxy.pac"
-# or, on macOS, the address the system is set to use:
+# or, on macOS and Windows, the address the system is set to use:
 system = true
 ```
 
@@ -32,12 +32,15 @@ refresh_secs = 3600       # how often to look again (60 for a file, and for the 
 fetch_timeout_secs = 15   # for the whole fetch, redirects included
 ```
 
-### The script of the system (macOS)
+### The script of the system (macOS and Windows)
 
-`system = true` takes the address from the "Automatic Proxy Configuration" of
-the network settings (System Settings, Network, Proxies), which gatir asks of
-the system, so that the address does not have to be copied into the
-configuration. It is asked again at every look at the script, and a script that
+`system = true` takes the address from the proxy settings of the system, which
+gatir asks of it, so that the address does not have to be copied into the
+configuration. On macOS it is the "Automatic Proxy Configuration" of the network
+settings (System Settings, Network, Proxies), read through the SystemConfiguration
+framework. On Windows it is the "setup script" of the proxy settings of the user
+(Settings, Network, Proxy), read through WinHTTP, which takes group policy into
+account. It is asked again at every look at the script, and a script that
 the company's tools serve from an address that changes (a name with a hash in
 it, say) is followed: the next look fetches the new one, and what the old
 address said about its script (its `ETag`) is not sent to the new. The
@@ -52,10 +55,13 @@ before the setting is made is not an error. The overrides work as with any
 script, and `gatir pac test` and `gatir pac export` use the address the system
 gives at that moment (`export` says which in its `from:` line).
 
-Other systems are not supported yet: a Linux desktop has no one place for the
-setting (it depends on the desktop), and for Windows it is to come. There
-`system = true` is refused when the configuration is read, which says to name
-the script with `file` or `url`.
+On Windows the setting is the one of the user that gatir runs as. If it only
+says "Automatically detect settings" (WPAD), with no address, gatir cannot follow
+it yet: it says so, and the address has to be given with `url`.
+
+A Linux desktop has no one place for the setting (it depends on the desktop), so
+there `system = true` is refused when the configuration is read, which says to
+name the script with `file` or `url`.
 
 A version of the script that cannot be read, or does not load, never replaces
 the one in use. The problem is logged, the last version that worked stays in

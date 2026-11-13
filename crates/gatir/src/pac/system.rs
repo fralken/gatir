@@ -2,11 +2,23 @@
 //!
 //! On macOS it is the "Automatic Proxy Configuration" of the network settings
 //! (System Settings, Network, Proxies), which gatir asks of the
-//! SystemConfiguration framework. Linux has no single place for it, and Windows
-//! is not supported yet: there, `[pac] system` is refused when the
-//! configuration is read.
+//! SystemConfiguration framework. On Windows it is the "setup script" of the
+//! proxy settings of the user, which WinHTTP gives. Linux has no single place
+//! for it: there, `[pac] system` is refused when the configuration is read.
 
 use crate::config::PacLocation;
+
+// What only one operating system can say lives in a module of its own, which
+// gives `read`; this one is what they share.
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(target_os = "macos")]
+use macos::read;
+#[cfg(windows)]
+use windows::read;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SystemPacError {
@@ -18,6 +30,11 @@ pub enum SystemPacError {
     NoAddress,
     #[error("the PAC address of the system cannot be used: {0}")]
     Unusable(&'static str),
+    #[error(
+        "the system looks for the PAC script by itself (automatic detection), and does not say \
+         where it found it: name its address with pac.url"
+    )]
+    DetectedByTheSystem,
     #[error("the network settings of the system cannot be read")]
     Unreadable,
     #[error("reading the PAC script of the system is not supported on this platform")]
@@ -77,42 +94,14 @@ fn interpret(enabled: bool, address: Option<&str>) -> Result<PacLocation, System
     })
 }
 
-#[cfg(target_os = "macos")]
-fn read() -> Result<Settings, SystemPacError> {
-    use system_configuration::core_foundation::number::CFNumber;
-    use system_configuration::core_foundation::string::CFString;
-    use system_configuration::dynamic_store::SCDynamicStoreBuilder;
-
-    let store = SCDynamicStoreBuilder::new("gatir")
-        .build()
-        .ok_or(SystemPacError::Unreadable)?;
-    // Nothing at all means that no proxy setting has been made.
-    let Some(proxies) = store.get_proxies() else {
-        return Ok(Settings {
-            enabled: false,
-            address: None,
-        });
-    };
-    let enabled = proxies
-        .find(CFString::from_static_string("ProxyAutoConfigEnable"))
-        .and_then(|value| value.downcast::<CFNumber>())
-        .and_then(|number| number.to_i32())
-        .is_some_and(|number| number != 0);
-    let address = proxies
-        .find(CFString::from_static_string("ProxyAutoConfigURLString"))
-        .and_then(|value| value.downcast::<CFString>())
-        .map(|address| address.to_string());
-    Ok(Settings { enabled, address })
-}
-
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn read() -> Result<Settings, SystemPacError> {
     Err(SystemPacError::Unsupported)
 }
 
 /// Whether this platform can say where the system's script is.
 pub const fn is_supported() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", windows))
 }
 
 #[cfg(test)]
@@ -161,7 +150,13 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_error_that_asks_for_an_address_says_which_setting() {
+        let text = SystemPacError::DetectedByTheSystem.to_string();
+        assert!(text.contains("pac.url"), "{text}");
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn the_settings_of_this_machine_can_be_read() {
         // What they say depends on the machine: only that they can be read.
@@ -175,7 +170,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn other_platforms_say_that_they_cannot() {
         assert!(!is_supported());

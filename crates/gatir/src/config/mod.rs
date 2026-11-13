@@ -423,8 +423,8 @@ impl RawPac {
             (None, None, None) if system => {
                 if !crate::pac::system_pac_is_supported() {
                     return Err(ConfigError::invalid(
-                        "pac.system is only supported on macOS: name the script with pac.file \
-                         or pac.url",
+                        "pac.system is only supported on macOS and Windows: name the script with \
+                         pac.file or pac.url",
                     ));
                 }
                 PacLocation::System
@@ -1619,7 +1619,7 @@ mod tests {
         } else {
             let text = result.unwrap_err().to_string();
             assert!(
-                text.contains("pac.system is only supported on macOS"),
+                text.contains("pac.system is only supported on macOS and Windows"),
                 "{text}"
             );
         }

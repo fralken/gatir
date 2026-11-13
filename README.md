@@ -12,10 +12,10 @@ inspired by CNTLM, and is written in Rust.
   (Negotiate) with the ticket of the logged-in user. A password can be replaced by
   its hash, so that it is not kept in a file.
 - **Proxy auto-configuration**: a PAC script from a file, an `http(s)` address
-  or (on macOS) the one the system is set to use, kept up to date, chooses the
-  parent for each request, with `no_proxy` on top. A few hosts can be sent to
-  other proxies than the script says, from the configuration, without a copy of
-  the script to keep.
+  or (on macOS and Windows) the one the system is set to use, kept up to date,
+  chooses the parent for each request, with `no_proxy` on top. A few hosts can
+  be sent to other proxies than the script says, from the configuration, without
+  a copy of the script to keep.
 - **SOCKS5** server, and **local port forwarding** (`-L`), for programs that do
   not use HTTP proxies.
 - **Reload**: `kill -HUP` makes a running gatir read its configuration again.
