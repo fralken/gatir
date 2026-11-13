@@ -86,14 +86,18 @@ A PAC script that chooses the proxy for each request. See
 | `file` | path | none | `--pac` |
 | `url` | `http://` or `https://` address | none | `--pac` |
 | `system` | `true` or `false` | `false` | |
-| `refresh_secs` | 1 to 604800 | 3600 for `url`, 60 for `file` and `system` | |
+| `refresh_secs` | 1 to 604800 | depends on the location: see below | |
 | `fetch_timeout_secs` | 1 to 300 | 15 | |
 
 - **`file`**, **`url`**, **`system`**: where the script is; set exactly one.
   A relative `file` is relative to the configuration file. `system = true` uses
   the script your system's proxy settings name (macOS and Windows only).
   `--pac` replaces the location, and keeps the other settings of the table.
-- **`refresh_secs`**: how often gatir checks whether the script changed.
+- **`refresh_secs`**: how often gatir checks whether the script changed. If you
+  leave it out, it depends on the location: every 60 seconds for `file` and
+  `system`, which cost little to check, and every 3600 for `url`, where an
+  unchanged script is not downloaded again. A value you set applies whatever
+  the location.
 - **`fetch_timeout_secs`**: how long gatir waits for a script from an address.
 
 ### `[[pac.overrides]]`

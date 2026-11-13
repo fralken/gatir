@@ -1,82 +1,87 @@
-# An example configuration for gatir. Copy it to ~/.config/gatir/gatir.toml (or
-# name the copy with --config) and edit it. Every name and value here is made up.
+# An example configuration for gatir. Copy it to ~/.config/gatir/gatir.toml,
+# or name the copy with --config, and edit it. Every name and value here is made
+# up.
 #
 # Commented-out settings are optional: remove the leading "# " to turn one on.
 # docs/settings.md lists every setting, with its default.
 
 # Where gatir listens for programs that use an HTTP proxy. Keep it on the
-# loopback: whoever connects is served with your identity. Addresses are IP
-# only, never a name: "localhost" is not understood, and IPv4 and IPv6 are two
-# separate addresses to listen on, not one ("::1" alone leaves out IPv4
-# clients: list both, as ["127.0.0.1:3128", "[::1]:3128"], for both).
+# loopback: anyone who can connect uses your identity. Write IP addresses, not
+# names. IPv4 and IPv6 are separate: to listen on both, also add "[::1]:3128".
 listen = ["127.0.0.1:3128"]
 
-# The corporate proxy, or several, tried in order. A PAC script (below) is the
-# other way of finding the proxy: use one of the two.
+# Your company's proxy. List several to try them in order. A PAC script (see
+# [pac] below) is the other way to choose the proxy: use one or the other.
 parents = ["proxy.example.com:8080"]
 
-# Destinations reached directly instead of through the parent. A name matches
-# only itself (write "*.example.com" for its sub-domains), and * and ? stand for
-# any text. Addresses and ranges match only when a client asks for an address,
-# not for a name.
+# Destinations reached directly, without the proxy. A name matches only itself:
+# write "*.example.com" for its sub-domains. * stands for any text, ? for one
+# character. Addresses and ranges match only when a program asks for an
+# address, not for a name.
 no_proxy = ["localhost", "127.0.0.1", "*.internal.example.com", "10.0.0.0/8"]
 
 [credentials]
-# ntlmv2 (the default), ntlm2sr, nt, or negotiate: Kerberos with the ticket of
-# the logged-in user, which needs no password here.
+# ntlmv2 (the default), ntlm2sr or nt. Or negotiate, which uses the Kerberos
+# ticket of the logged-in user and needs no password.
 method = "ntlmv2"
 username = "alice"
 domain = "EXAMPLE"
-# Give the password, or a hash of it that `gatir hash` prints, so that the
-# password itself is not kept in the file. Keep the file readable by you only.
+# The password, or the hash of it that `gatir hash` prints, which keeps the
+# password itself out of this file. Either way, make the file readable by you
+# only (chmod 600).
 password = "change-me"
 # nt_hash = "0123456789abcdef0123456789abcdef"
 
-# Origin servers, reached directly, that also ask for NTLM themselves (401,
-# not the parent's 407) with these same credentials: an intranet site with
-# Windows-integrated authentication, say. Matched like no_proxy. Without this,
-# a 401 from any server is left for the client.
+# Servers reached directly that ask for NTLM themselves (a 401, not the
+# proxy's 407), such as an intranet site with Windows sign-in. gatir answers
+# them with the credentials above. Same patterns as no_proxy. Without this
+# list, gatir leaves a server's 401 to the program.
 # origin_hosts = ["intranet.example.com", "*.corp.example.com"]
 
+# A PAC script that chooses the proxy for each request. Name it in one of three
+# ways: a file, an address, or (on macOS and Windows) the one your system's
+# proxy settings use.
 # [pac]
 # file = "proxy.pac"
 # url = "https://pac.example.com/proxy.pac"
-# On macOS and Windows, the address that the system is set to use (the file,
-# the url and this one are alternatives):
 # system = true
-# refresh_secs = 3600
+# How often to check the script for changes, in seconds. If you leave it out,
+# it depends on where the script is: every 60 seconds for a file or the
+# system's script, every hour for an address.
+# refresh_secs = 300
 #
-# Hosts that go to other proxies than the script says, whatever it says. The
-# first entry that lists a host decides. A name covers its sub-domains; * and ?
-# stand for any text. The proxy is DIRECT, or PROXY host:port, several separated
-# by semicolons and tried in order.
+# Hosts that go to other proxies than the script says. The first entry that
+# lists a host decides. Here a name also covers its sub-domains, and * and ?
+# are wildcards. The proxy is DIRECT, or PROXY host:port; separate several with
+# semicolons to try them in order.
 # [[pac.overrides]]
 # hosts = ["downloads.example.com", "*.cdn.example.net"]
 # proxy = "PROXY a.example.com:80; PROXY b.example.com:80"
 
-# Who may use gatir, by their address. The first rule that matches decides.
+# Which programs may use gatir, by the address they connect from. The first
+# rule that matches decides. Needed if gatir listens beyond the loopback.
 # [access]
 # default = "deny"
 # rules = [{ allow = "127.0.0.1" }, { allow = "192.168.0.0/16" }]
 
-# Header fields set on every request sent through a parent proxy (plain HTTP
-# requests, and the CONNECT that opens an HTTPS tunnel), replacing the ones the
-# client sent. Never sent to a server reached directly. The values are secrets.
+# Header fields added to every request sent through the proxy, replacing the
+# program's own. They are never sent to a server reached directly. The values
+# are kept secret in logs.
 # [headers]
 # X-Example = "value"
 
-# A local port carried to a fixed destination, as ssh -L does.
+# A local port forwarded to a fixed destination through the proxy, like ssh -L.
 # [[tunnels]]
 # listen = "127.0.0.1:2222"
 # target = "git.example.com:22"
 
-# A SOCKS5 server, with a user name and password if you set both.
+# A SOCKS5 server. Set both a user name and a password to require them.
 # [socks5]
 # listen = ["127.0.0.1:1080"]
 # username = "bob"
 # password = "change-me-too"
 
-# How long to wait, in seconds.
+# How long to wait, in seconds. These are the defaults.
 # [timeouts]
 # connect_secs = 10
 # client_idle_secs = 60
@@ -84,5 +89,6 @@ password = "change-me"
 # tunnel_idle_secs = 600
 # shutdown_grace_secs = 10
 
+# How much gatir logs: error, warn, info (the default), debug or trace.
 # [log]
 # level = "info"
