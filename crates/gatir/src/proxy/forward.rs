@@ -284,7 +284,7 @@ async fn authenticate<'a>(
     target: &Target,
     lapsed: bool,
 ) -> Result<Authenticated<'a>, Failure> {
-    let admission = auth.admit().await?;
+    let admission = auth.admit()?;
     let limit = context.timeouts.response;
     let real = head.filter(|head| lapsed || head.method != Method::HEAD);
     let is_real = real.is_some();
@@ -325,7 +325,7 @@ async fn authenticate<'a>(
     match outcome {
         Outcome::Proof { header, made } => {
             request.headers_mut().insert(proof_goes_in, header);
-            Ok(Authenticated::Proof(admission.made_from(made)))
+            Ok(Authenticated::Proof(admission.for_proof(made).await?))
         }
         Outcome::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
         Outcome::Answered(response) => {

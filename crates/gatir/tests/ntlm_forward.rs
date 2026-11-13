@@ -315,6 +315,45 @@ async fn parallel_requests_with_good_credentials_all_get_through() {
     assert_eq!(parent.messages(3), parent.connection_count());
 }
 
+/// Only an NTLM proof waits for the one ahead of it. A parent that never asks
+/// for credentials gets none, so a slow answer on one connection does not delay
+/// the next.
+#[tokio::test]
+async fn a_slow_answer_from_a_parent_that_wants_no_credentials_holds_up_nothing() {
+    let parent = MockOrigin::start(|request| {
+        if request.target.ends_with("/slow") {
+            Reply::ok("slow").after(std::time::Duration::from_secs(5))
+        } else {
+            Reply::ok("fast")
+        }
+    })
+    .await;
+    let proxy = start_proxy(&config_for(parent.addr(), "ntlmv2", "s3cret")).await;
+
+    let addr = proxy.addr;
+    let slow = tokio::spawn(async move {
+        let mut client = RawClient::connect(addr).await.unwrap();
+        client
+            .send(get("origin.example.com", "/slow", ""))
+            .await
+            .unwrap();
+        client.read_response(false).await.unwrap().status
+    });
+    eventually("the slow request to reach the parent", || {
+        parent.requests().len() == 1
+    })
+    .await;
+
+    let fast = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ask(&proxy, get("origin.example.com", "/fast", "")),
+    )
+    .await
+    .expect("a new connection must not wait for the slow answer");
+    assert_eq!(fast.status, 200, "{}", fast.body_text());
+    assert_eq!(slow.await.unwrap(), 200);
+}
+
 #[tokio::test]
 async fn a_parent_without_ntlm_is_reported_with_the_schemes_it_offers() {
     let parent = parent_with(Options {

@@ -351,6 +351,48 @@ async fn parallel_requests_all_get_through() {
     assert_eq!(proofs, parent.connection_count());
 }
 
+/// A ticket costs the account nothing if it is refused, so new connections
+/// never wait for each other: a slow answer on one does not delay the next.
+#[tokio::test]
+async fn a_slow_answer_does_not_hold_up_a_new_connection() {
+    let parent = MockNtlmParent::start(
+        Account::new("alice", "CORP", "s3cret"),
+        accepting("ticket for HTTP@127.0.0.1"),
+        |request| {
+            if request.target.ends_with("/slow") {
+                Reply::ok("slow").after(Duration::from_secs(5))
+            } else {
+                Reply::ok("fast")
+            }
+        },
+    )
+    .await;
+    let proxy = proxy_for(&parent).await;
+
+    let addr = proxy.addr;
+    let slow = tokio::spawn(async move {
+        let mut client = RawClient::connect(addr).await.unwrap();
+        client
+            .send(get("origin.example.com", "/slow", ""))
+            .await
+            .unwrap();
+        client.read_response(false).await.unwrap().status
+    });
+    eventually("the slow request to reach the parent", || {
+        parent.served().len() == 1
+    })
+    .await;
+
+    let fast = tokio::time::timeout(
+        Duration::from_secs(2),
+        ask(&proxy, get("origin.example.com", "/fast", "")),
+    )
+    .await
+    .expect("a new connection must not wait for the slow answer");
+    assert_eq!(fast.status, 200, "{}", fast.body_text());
+    assert_eq!(slow.await.unwrap(), 200);
+}
+
 #[tokio::test]
 async fn a_ticket_the_parent_refuses_is_reported_and_asked_for_again() {
     let parent = parent_with(accepting("a different ticket")).await;

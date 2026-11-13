@@ -275,7 +275,7 @@ async fn connect_through_parent(
             .ok_or(timed_out)?
             .map_err(Failure::first_answer)?,
         Some(auth) => {
-            let admitted = auth.admit().await?;
+            let admitted = auth.admit()?;
             match auth
                 .negotiate(
                     &mut sender,
@@ -297,7 +297,7 @@ async fn connect_through_parent(
                 // The parent asked for nothing: this is its answer.
                 Outcome::Answered(response) => response,
                 Outcome::Proof { header, made } => {
-                    admission = Some(admitted.made_from(made));
+                    admission = Some(admitted.for_proof(made).await?);
                     answer_within(limit, sender.send_request(connect(Some(header))))
                         .await
                         .ok_or(timed_out)?

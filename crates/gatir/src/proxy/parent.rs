@@ -37,13 +37,14 @@
 //! has no password to answer such a challenge with, so it does not apply.
 //!
 //! Every attempt with wrong NTLM credentials counts as a failed logon against
-//! the account, and a few of them lock it. So [`ParentAuth::admit`] lets one
-//! attempt at a time through until the credentials have worked once, and
-//! stays away from the parent for a while after it refuses them. What the
-//! system answers a challenge with is NTLM too, made from the password of the
-//! logged-on user (a stale one, after a change elsewhere, is the usual cause of
-//! a refusal), so it is held off in the same way. A Kerberos ticket that the
-//! proxy does not accept costs the account nothing, so it never is.
+//! the account, and a few of them lock it. So until the credentials have
+//! worked once, only one NTLM proof at a time is sent ([`Admission::for_proof`]),
+//! and after a refusal gatir stays away from the parent for a while. The NTLM
+//! answer the system makes is derived from the logged-on user's password (a
+//! stale one, after a change elsewhere, is the usual cause of a refusal), so
+//! it gets the same treatment. Everything else runs in parallel: a request a
+//! parent answers without asking for credentials, and a Kerberos ticket, whose
+//! refusal costs the account nothing.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -91,7 +92,8 @@ pub(super) struct ParentAuth {
     rejected_at: Mutex<Option<Instant>>,
     /// Whether the credentials have worked, and not been refused since.
     verified: AtomicBool,
-    /// Held during an attempt while the credentials are not known to work.
+    /// Held from the moment an NTLM proof is ready until the answer to it
+    /// arrives, while the credentials are not known to work.
     gate: tokio::sync::Mutex<()>,
 }
 
@@ -113,7 +115,8 @@ pub(super) enum Outcome {
 }
 
 /// Permission to try to authenticate, held until the parent has said whether
-/// it accepts the proof.
+/// it accepts the proof. It holds the gate only once a proof is ready
+/// ([`Admission::for_proof`]).
 pub(super) struct Admission<'a> {
     auth: &'a ParentAuth,
     _gate: Option<tokio::sync::MutexGuard<'a, ()>>,
@@ -182,23 +185,12 @@ impl ParentAuth {
         }
     }
 
-    /// Asks to authenticate a new connection.
-    pub(super) async fn admit(&self) -> Result<Admission<'_>, Failure> {
+    /// Asks to authenticate a new connection. Fails during a cooldown.
+    pub(super) fn admit(&self) -> Result<Admission<'_>, Failure> {
         self.check()?;
-        if self.verified.load(Ordering::Acquire) {
-            return Ok(Admission {
-                auth: self,
-                _gate: None,
-                made: None,
-            });
-        }
-        let gate = self.gate.lock().await;
-        // The attempt ahead of this one may have settled the question.
-        self.check()?;
-        let gate = (!self.verified.load(Ordering::Acquire)).then_some(gate);
         Ok(Admission {
             auth: self,
-            _gate: gate,
+            _gate: None,
             made: None,
         })
     }
@@ -578,10 +570,23 @@ async fn answer_challenge(
 }
 
 impl Admission<'_> {
-    /// Records the service a Negotiate proof was made for.
-    pub(super) fn made_from(mut self, made: Option<String>) -> Self {
+    /// Called once a proof is ready to be sent. Every proof is NTLM (see the
+    /// module doc), so until the credentials are known to work, this waits
+    /// until no other proof is waiting for an answer. Fails if the proof
+    /// ahead of this one was refused. `made` is the service a Negotiate proof
+    /// was made for.
+    pub(super) async fn for_proof(mut self, made: Option<String>) -> Result<Self, Failure> {
         self.made = made;
-        self
+        let auth = self.auth;
+        if !auth.verified.load(Ordering::Acquire) {
+            let gate = auth.gate.lock().await;
+            // The proof ahead of this one may have settled the question.
+            auth.check()?;
+            if !auth.verified.load(Ordering::Acquire) {
+                self._gate = Some(gate);
+            }
+        }
+        Ok(self)
     }
 
     /// The parent accepted the proof.
