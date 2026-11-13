@@ -209,7 +209,7 @@ pub struct Overrides {
     #[arg(skip)]
     pub password: Option<SecretString>,
 
-    /// Forward a local port to a destination through the proxy, as in OpenSSH: [BIND:]PORT:HOST:HOSTPORT;
+    /// Forward a local port to a destination through the proxy, as in OpenSSH: `[BIND:]PORT:HOST:HOSTPORT`;
     /// repeat for several (replaces `[[tunnels]]` from the file)
     #[arg(short = 'L', long = "tunnel", global = true, value_name = "SPEC")]
     pub tunnels: Vec<Tunnel>,

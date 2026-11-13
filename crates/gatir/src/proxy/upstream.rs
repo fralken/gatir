@@ -18,7 +18,7 @@ use super::body::Body;
 use super::failure::{
     ConnectError, Failure, ParentAttempt, connect_failure, describe, try_connect,
 };
-use super::parent::ParentAuth;
+use super::parent::{ParentAuth, Reconnect};
 use super::pool::{Pool, PoolKey};
 use crate::config::HostPort;
 use crate::noproxy::NoProxy;
@@ -171,6 +171,18 @@ impl Upstreams {
     /// Opens a TCP connection to the destination `origin` (`host:port`) through
     /// `hop`. A parent that accepts the connection is not known to work until
     /// it answers: see [`Upstreams::worked`].
+    /// A new connection through `hop` to `origin`, ready for requests: for an
+    /// exchange that has to go on over a fresh connection (see the `reconnect`
+    /// parameter of `ParentAuth::open`).
+    pub(super) fn reconnect<'r>(
+        &'r self,
+        hop: &'r Hop,
+        origin: &'r str,
+        limit: Duration,
+    ) -> Reconnect<'r> {
+        Box::pin(async move { handshake(self.connect_hop(hop, origin, limit).await?).await })
+    }
+
     pub(super) async fn connect_hop(
         &self,
         hop: &Hop,

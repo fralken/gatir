@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use super::body::{Body, Sent, full, response_within, watch};
 use super::failure::{Failure, ParentAttempt, ended_without_answer};
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent::{Admission, Outcome, ParentAuth, negotiate_origin, reusable};
+use super::parent::{Admission, Opening, ParentAuth, reusable, warn_no_credentials};
 use super::pool::Lease;
 use super::server::{Context, Live};
 use super::upstream::{Hop, Opened, handshake};
@@ -101,9 +101,7 @@ async fn forward(request: Request<Incoming>, context: &Context) -> Result<Respon
         && context.auth.is_none()
         && response.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
     {
-        tracing::warn!(
-            "the parent proxy answered 407: it wants authentication, but no credentials are configured"
-        );
+        warn_no_credentials();
     }
 
     let (mut parts, body) = response.into_parts();
@@ -247,10 +245,7 @@ impl<'a> Forwarding<'a> {
             self.context.upstreams.worked(&lease.hop);
         }
         if let Some(proof) = self.admission.take() {
-            return Err(match &lease.hop {
-                Hop::Parent(_) => proof.refused(),
-                Hop::Direct => proof.refused_by_origin(&self.target.address),
-            });
+            return Err(proof.refused());
         }
         let Some(head) = self.head.as_ref().filter(|_| !self.lapsed) else {
             return Err(Failure::AuthenticationLapsed(lease.hop.who()));
@@ -399,7 +394,6 @@ async fn authenticate<'a>(
     target: &Target,
     lapsed: bool,
 ) -> Result<Authenticated<'a>, Failure> {
-    let admission = auth.admit()?;
     let limit = context.timeouts.response;
     let real = replay.filter(|head| lapsed || head.method != Method::HEAD);
     let is_real = real.is_some();
@@ -410,42 +404,41 @@ async fn authenticate<'a>(
     };
 
     lease.needs_auth = false;
-    let (outcome, proof_goes_in) = match &lease.hop {
+    let (opening, proof_goes_in) = match &lease.hop {
         Hop::Parent(parent) => {
             let hop = lease.hop.clone();
-            let outcome = auth
-                .negotiate(&mut lease.sender, carrier, &parent.host, limit, || {
-                    Box::pin(async {
-                        let stream = context
-                            .upstreams
-                            .connect_hop(&hop, &target.address, context.timeouts.connect)
-                            .await?;
-                        handshake(stream).await
-                    })
-                })
+            let reconnect = || {
+                context
+                    .upstreams
+                    .reconnect(&hop, &target.address, context.timeouts.connect)
+            };
+            let opening = auth
+                .open(&mut lease.sender, carrier, &parent.host, limit, reconnect)
                 .await?;
-            (outcome, PROXY_AUTHORIZATION)
+            (opening, PROXY_AUTHORIZATION)
         }
         Hop::Direct => {
-            let ntlm = auth.ntlm_for_origin(&target.host).expect(
-                "a direct connection needs authentication only when the host is one of \
-                 credentials.origin_hosts",
-            );
-            auth.check_origin(&target.address)?;
-            let outcome =
-                negotiate_origin(ntlm, &target.address, &mut lease.sender, carrier, limit).await?;
-            (outcome, AUTHORIZATION)
+            let opening = auth
+                .open_origin(
+                    &target.address,
+                    &target.host,
+                    &mut lease.sender,
+                    carrier,
+                    limit,
+                )
+                .await?;
+            (opening, AUTHORIZATION)
         }
     };
     // Whatever it said, it said something.
     context.upstreams.worked(&lease.hop);
-    match outcome {
-        Outcome::Proof { header, made } => {
+    match opening {
+        Opening::Proof { header, admission } => {
             request.headers_mut().insert(proof_goes_in, header);
-            Ok(Authenticated::Proof(admission.for_proof(made).await?))
+            Ok(Authenticated::Proof(admission))
         }
-        Outcome::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
-        Outcome::Answered(response) => {
+        Opening::Answered(response) if is_real => Ok(Authenticated::Answered(response)),
+        Opening::Answered(response) => {
             // The probe got an answer, which is not for the client. If it
             // cannot be read to the end, the connection is of no further use.
             let (_, body) = response.into_parts();

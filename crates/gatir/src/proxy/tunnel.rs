@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use super::body::{Body, answer_within, full};
 use super::failure::Failure;
 use super::headers::{apply_rules, strip_hop_by_hop};
-use super::parent::Outcome;
+use super::parent::{Opening, warn_no_credentials};
 use super::server::{Context, Live};
 use super::upstream::{Hop, handshake};
 use crate::config::HostPort;
@@ -274,29 +274,26 @@ async fn connect_through_parent(
             .ok_or(timed_out)?
             .map_err(Failure::first_answer)?,
         Some(auth) => {
-            let admitted = auth.admit()?;
+            let reconnect = || {
+                live.upstreams
+                    .reconnect(&hop, address, live.timeouts.connect)
+            };
             match auth
-                .negotiate(
+                .open(
                     &mut sender,
                     || connect(None),
                     &parent.host,
                     limit,
-                    || {
-                        Box::pin(async {
-                            let stream = live
-                                .upstreams
-                                .connect_hop(&hop, address, live.timeouts.connect)
-                                .await?;
-                            handshake(stream).await
-                        })
-                    },
+                    reconnect,
                 )
                 .await?
             {
-                // The parent asked for nothing: this is its answer.
-                Outcome::Answered(response) => response,
-                Outcome::Proof { header, made } => {
-                    admission = Some(admitted.for_proof(made).await?);
+                Opening::Answered(response) => response,
+                Opening::Proof {
+                    header,
+                    admission: admitted,
+                } => {
+                    admission = Some(admitted);
                     answer_within(limit, sender.send_request(connect(Some(header))))
                         .await
                         .ok_or(timed_out)?
@@ -313,9 +310,7 @@ async fn connect_through_parent(
         if let Some(sent) = admission {
             return Err(sent.refused());
         }
-        tracing::warn!(
-            "the parent proxy answered 407: it wants authentication, but no credentials are configured"
-        );
+        warn_no_credentials();
     } else if let Some(sent) = admission {
         // Whatever the parent thinks of the tunnel, it took the credentials.
         sent.accepted();

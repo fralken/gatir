@@ -28,7 +28,7 @@
 //!   identity of the logged-on user: no password is configured, and the
 //!   messages go with the `NTLM` scheme.
 //!
-//! [`ParentAuth::negotiate_origin`] is a third, narrower exchange: with a
+//! [`ParentAuth::open_origin`] is a third, narrower exchange: with a
 //! server reached directly (never through a parent, and never through a
 //! `CONNECT` tunnel, which gatir cannot see inside), named in
 //! `credentials.origin_hosts`, that asks for NTLM itself (`401`,
@@ -125,14 +125,38 @@ pub(super) enum Outcome {
     },
 }
 
-/// Permission to try to authenticate, held until the parent has said whether
-/// it accepts the proof. It holds the gate only once a proof is ready
+/// What came of the first half of an exchange on a new connection.
+pub(super) enum Opening<'a> {
+    /// The other side asked for nothing: this is its answer to what opened the
+    /// exchange.
+    Answered(Response<Incoming>),
+    /// The connection is ready for the real request, which must carry
+    /// `header`: in `Proxy-Authorization` for a parent, in `Authorization` for
+    /// a server. `admission` waits for the verdict on it.
+    Proof {
+        header: HeaderValue,
+        admission: Admission<'a>,
+    },
+}
+
+/// Permission to try to authenticate, held until the other side has said
+/// whether it accepts the proof. It holds the gate only once a proof is ready
 /// ([`Admission::for_proof`]).
 pub(super) struct Admission<'a> {
     auth: &'a ParentAuth,
     _gate: Option<tokio::sync::MutexGuard<'a, ()>>,
     /// The service a Negotiate proof was made for, to say so if it is refused.
     made: Option<String>,
+    /// The server (`host:port`) the proof is for, when it is not a parent.
+    origin: Option<String>,
+}
+
+/// Says that a parent asked for authentication, and gatir has no credentials
+/// to give it.
+pub(super) fn warn_no_credentials() {
+    tracing::warn!(
+        "the parent proxy answered 407: it wants authentication, but no credentials are configured"
+    );
 }
 
 impl ParentAuth {
@@ -217,13 +241,54 @@ impl ParentAuth {
     }
 
     /// Asks to authenticate a new connection. Fails during a cooldown.
-    pub(super) fn admit(&self) -> Result<Admission<'_>, Failure> {
+    fn admit(&self) -> Result<Admission<'_>, Failure> {
         self.check()?;
         Ok(Admission {
             auth: self,
             _gate: None,
             made: None,
+            origin: None,
         })
+    }
+
+    /// Runs the first half of the exchange with the parent at `parent_host`,
+    /// on a new connection: see [`ParentAuth::negotiate`] for `carrier` and
+    /// `reconnect`.
+    pub(super) async fn open<'r>(
+        &self,
+        sender: &mut SendRequest<Body>,
+        carrier: impl Fn() -> Request<Body>,
+        parent_host: &str,
+        limit: Duration,
+        reconnect: impl FnOnce() -> Reconnect<'r>,
+    ) -> Result<Opening<'_>, Failure> {
+        let admission = self.admit()?;
+        let outcome = self
+            .negotiate(sender, carrier, parent_host, limit, reconnect)
+            .await?;
+        admission.settle(outcome).await
+    }
+
+    /// Runs the first half of the NTLM exchange with the server `server`
+    /// (`host:port`, whose host is `host`, one of `credentials.origin_hosts`),
+    /// reached directly on a new connection.
+    pub(super) async fn open_origin(
+        &self,
+        server: &str,
+        host: &str,
+        sender: &mut SendRequest<Body>,
+        carrier: impl Fn() -> Request<Body>,
+        limit: Duration,
+    ) -> Result<Opening<'_>, Failure> {
+        let ntlm = self.ntlm_for_origin(host).expect(
+            "a direct connection needs authentication only when the host is one of \
+             credentials.origin_hosts",
+        );
+        self.check_origin(server)?;
+        let mut admission = self.admit()?;
+        admission.origin = Some(server.to_owned());
+        let outcome = negotiate_origin(ntlm, server, sender, carrier, limit).await?;
+        admission.settle(outcome).await
     }
 
     /// Runs the exchange on a new connection to the parent at `parent_host`,
@@ -374,7 +439,7 @@ async fn negotiate_ticket<'r>(
 /// ticket to ask the system for, so, unlike [`ParentAuth::negotiate`], there
 /// is only ever one scheme and one shape to this exchange.
 /// `server` (`host:port`) names it in an error.
-pub(super) async fn negotiate_origin(
+async fn negotiate_origin(
     ntlm: &ntlm::Authenticator,
     server: &str,
     sender: &mut SendRequest<Body>,
@@ -612,13 +677,24 @@ async fn answer_challenge(
     Ok(negotiate_header(&token))
 }
 
-impl Admission<'_> {
+impl<'a> Admission<'a> {
+    /// What the first half of the exchange came to.
+    async fn settle(self, outcome: Outcome) -> Result<Opening<'a>, Failure> {
+        Ok(match outcome {
+            Outcome::Answered(response) => Opening::Answered(response),
+            Outcome::Proof { header, made } => Opening::Proof {
+                header,
+                admission: self.for_proof(made).await?,
+            },
+        })
+    }
+
     /// Called once a proof is ready to be sent. Every proof is NTLM (see the
     /// module doc), so until the credentials are known to work, this waits
     /// until no other proof is waiting for an answer. Fails if the proof
     /// ahead of this one was refused. `made` is the service a Negotiate proof
     /// was made for.
-    pub(super) async fn for_proof(mut self, made: Option<String>) -> Result<Self, Failure> {
+    async fn for_proof(mut self, made: Option<String>) -> Result<Self, Failure> {
         self.made = made;
         let auth = self.auth;
         if !auth.verified.load(Ordering::Acquire) {
@@ -638,10 +714,14 @@ impl Admission<'_> {
         tracing::debug!("the parent proxy accepted the credentials");
     }
 
-    /// The parent refused the proof. Every proof gatir can still have here is
-    /// password-derived (NTLM, configured or of the system: see the module
-    /// doc), so this always keeps gatir away from the parent for a while.
+    /// The other side refused the proof. Every proof gatir can still have here
+    /// is password-derived (NTLM, configured or of the system: see the module
+    /// doc), so this always keeps gatir away for a while: from the parent,
+    /// or, for a server, as [`Admission::refused_by_origin`] says.
     pub(super) fn refused(self) -> Failure {
+        if let Some(server) = self.origin.clone() {
+            return self.refused_by_origin(&server);
+        }
         match &self.auth.authenticator {
             Authenticator::Ntlm(ntlm) => {
                 let user = ntlm.user().to_owned();
@@ -666,7 +746,7 @@ impl Admission<'_> {
     /// the password may be wrong, and every attempt anywhere would be another
     /// failed logon, so it stops using the credentials altogether, as after a
     /// parent's refusal.
-    pub(super) fn refused_by_origin(self, server: &str) -> Failure {
+    fn refused_by_origin(self, server: &str) -> Failure {
         let Authenticator::Ntlm(ntlm) = &self.auth.authenticator else {
             unreachable!("origin auth needs the configured NTLM identity")
         };
