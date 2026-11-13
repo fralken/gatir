@@ -82,7 +82,8 @@ pub struct Options {
     pub close_on_negotiate: bool,
     /// Read the NEGOTIATE message and never answer it, keeping the connection open.
     pub stall_on_negotiate: bool,
-    /// Send `Connection: close` with the `407` that carries the challenge.
+    /// Send `Connection: close` with the `407` that carries the challenge (the
+    /// NTLM one, or the parent's token in `negotiate_exchange`).
     pub close_after_challenge: bool,
     /// Send `Connection: close` with every other `407`, and close the
     /// connection after it.
@@ -280,7 +281,8 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>, id: usize) {
             if *proof == exchange.first {
                 state = State::Continuing;
                 let field = format!("Negotiate {}", STANDARD.encode(&exchange.challenge));
-                Some((reply_407(&[field], false), false))
+                let close = shared.options.close_after_challenge;
+                Some((reply_407(&[field], close), close))
             } else if *proof == exchange.second && state == State::Continuing {
                 state = State::Authenticated;
                 None

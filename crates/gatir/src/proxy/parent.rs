@@ -83,6 +83,10 @@ pub(super) type Reconnect<'a> =
 pub(super) const COOLDOWN: Duration = Duration::from_secs(300);
 /// The most of a `407` body that is read to reach the end of the message.
 const DRAIN_LIMIT: usize = 64 * 1024;
+/// The parent closed a connection in the middle of an exchange that is bound
+/// to it.
+const CLOSED_DURING_AUTH: &str =
+    "the parent proxy did not keep the connection open during authentication";
 
 pub(super) struct ParentAuth {
     authenticator: Authenticator,
@@ -209,7 +213,7 @@ impl ParentAuth {
         carrier: impl Fn() -> Request<Body>,
         parent_host: &str,
         limit: Duration,
-        reconnect: impl FnMut() -> Reconnect<'r>,
+        reconnect: impl FnOnce() -> Reconnect<'r>,
     ) -> Result<Outcome, Failure> {
         match &self.authenticator {
             Authenticator::Ntlm(ntlm) => negotiate_ntlm(ntlm, sender, carrier, limit).await,
@@ -267,9 +271,7 @@ async fn negotiate_ntlm(
     let (parts, body) = response.into_parts();
     let header = ntlm.respond(parts.headers.get_all(PROXY_AUTHENTICATE))?;
     if !reusable(body, sender, limit).await {
-        return Err(Failure::Parent(
-            "the parent proxy did not keep the connection open during authentication",
-        ));
+        return Err(Failure::Parent(CLOSED_DURING_AUTH));
     }
     Ok(Outcome::Proof { header, made: None })
 }
@@ -283,7 +285,7 @@ async fn negotiate_ticket<'r>(
     sender: &mut SendRequest<Body>,
     carrier: impl Fn() -> Request<Body>,
     limit: Duration,
-    mut reconnect: impl FnMut() -> Reconnect<'r>,
+    reconnect: impl FnOnce() -> Reconnect<'r>,
 ) -> Result<Outcome, Failure> {
     let response = send_first(sender, carrier(), limit).await?;
     if response.status() != StatusCode::PROXY_AUTHENTICATION_REQUIRED {
@@ -329,11 +331,10 @@ async fn negotiate_ticket<'r>(
     // The parent answered the ticket with a token of its own: the system needs
     // another round to go on (NTLM inside Negotiate).
     let header = answer_challenge(context, service.clone(), &parts.headers, limit).await?;
+    // Unlike the ticket, this answer belongs to the connection the parent's
+    // token came on, so it cannot be sent on a fresh one.
     if !reusable(body, sender, limit).await {
-        // The token this answers does not depend on the connection either: it
-        // was made from what the parent's own token held, not from anything
-        // tied to this specific socket.
-        *sender = reconnect().await?;
+        return Err(Failure::Parent(CLOSED_DURING_AUTH));
     }
     Ok(Outcome::Proof {
         header,
@@ -501,9 +502,8 @@ async fn ntlm_from_system(
         "the parent proxy offers NTLM and not Negotiate: using the NTLM of the system, \
          with the identity of the logged-on user"
     );
-    let stays_open = "the parent proxy did not keep the connection open during authentication";
     if !reusable(refused, sender, limit).await {
-        return Err(Failure::Parent(stays_open));
+        return Err(Failure::Parent(CLOSED_DURING_AUTH));
     }
 
     let mut first = carrier();
@@ -530,7 +530,7 @@ async fn ntlm_from_system(
         reason: "the system had nothing to answer the NTLM challenge with".to_owned(),
     })?;
     if !reusable(body, sender, limit).await {
-        return Err(Failure::Parent(stays_open));
+        return Err(Failure::Parent(CLOSED_DURING_AUTH));
     }
     Ok(Outcome::Proof {
         header: ntlm::header(&token),

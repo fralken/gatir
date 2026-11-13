@@ -315,6 +315,38 @@ async fn a_system_that_cannot_answer_the_parents_token_is_reported() {
     );
 }
 
+/// The second token answers the parent's own token, which belongs to the
+/// connection it came on (NTLM inside SPNEGO): on another connection the
+/// parent would refuse it, and count a failed logon.
+#[tokio::test]
+async fn a_parent_that_closes_the_connection_after_its_token_is_reported() {
+    let parent = parent_with(Options {
+        close_after_challenge: true,
+        ..exchange()
+    })
+    .await;
+    let proxy = proxy_with(&parent, TwoRounds::default()).await;
+
+    for _ in 0..2 {
+        let response = ask(&proxy, get("origin.example.com", "/", ""), false).await;
+        assert_eq!(response.status, 502, "{}", response.body_text());
+        assert!(
+            response
+                .body_text()
+                .contains("did not keep the connection open during authentication"),
+            "{}",
+            response.body_text()
+        );
+    }
+    assert!(
+        parent
+            .requests()
+            .iter()
+            .all(|seen| seen.negotiate.as_deref() != Some(SECOND)),
+        "the second token must not go out on another connection"
+    );
+}
+
 #[tokio::test]
 async fn a_refused_second_token_is_not_tried_again_for_a_while() {
     // The second round is NTLM, made from the password of the logged-on user,
