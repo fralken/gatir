@@ -1,4 +1,5 @@
-//! Reading the `Proxy-Authenticate` fields of a `407`.
+//! Reading the challenges of a `407` (`Proxy-Authenticate`) or a `401`
+//! (`WWW-Authenticate`).
 
 use hyper::header::HeaderValue;
 

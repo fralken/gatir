@@ -2,8 +2,9 @@
 
 ## Which file is read
 
-`gatir run` and `gatir config check` read the file named with `--config`. Without
-it they look, in this order, for
+The commands that read the configuration (`run`, `config check`, `detect` and
+`pac`) read the file named with `--config`. Without it they look, in this order,
+for
 
 1. `$XDG_CONFIG_HOME/gatir/gatir.toml`, or `~/.config/gatir/gatir.toml` when that
    variable is not set (a relative `XDG_CONFIG_HOME` is ignored, as the XDG

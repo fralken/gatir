@@ -51,14 +51,15 @@ Neither engine can stop a long loop inside a built-in function, such as
 QuickJS. It has the limits that matter (an interrupt handler, a memory limit, a
 stack limit), it runs the scripts correctly, and it is small.
 
-The cost is C code in the process. It is Fabrice Bellard's QuickJS (MIT), widely
-used, and it is kept behind `pac::engine`: nothing else in gatir calls into it.
+The cost is C code in the process. `rquickjs` bundles QuickJS-ng (MIT), the
+maintained fork of Fabrice Bellard's QuickJS, and it is kept behind
+`pac::engine`: nothing else in gatir calls into it.
 What limits the damage a bad script can do:
 
 - time, memory and stack limits on every evaluation;
 - the one runaway the engine cannot interrupt is caught from outside: the worker
-  is given up on and replaced, and after too many, the script is declared broken
-  and requests get an error that says so;
+  is given up on and replaced, and while too many given-up workers are still
+  busy, requests get an error that says so;
 - name lookups, which a script cannot interrupt either, run on their own threads
   with a time limit.
 

@@ -211,7 +211,6 @@ pub fn each_variant(seeds: &[&[u8]], rounds: usize, mut check: impl FnMut(&[u8])
         for _ in 0..1 + rng.below(3) {
             mutate(&mut rng, &mut input);
         }
-        // Text that a parser is given is text.
         run(&input);
     }
 }

@@ -51,8 +51,9 @@ pub enum Secret {
     /// every NTLM response, so the plain password need not be stored.
     NtHash(SecretBox<[u8; NT_HASH_LEN]>),
     /// NTLMv2 hash of one user and domain: HMAC-MD5, keyed with the NT hash,
-    /// of the upper-cased user name and domain. It is all NTLMv2 needs, but it
-    /// cannot be used for the older methods.
+    /// of the upper-cased user name and the domain, which the tools that print
+    /// it upper-case too. It is all NTLMv2 needs, but it cannot be used for the
+    /// older methods.
     Ntlmv2Hash(SecretBox<[u8; NT_HASH_LEN]>),
 }
 

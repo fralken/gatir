@@ -255,8 +255,8 @@ impl Upstreams {
                 },
             }
         }
-        // Blame what was tried last and matters most: the destination itself if
-        // it was tried, else the parents.
+        // If the destination itself was tried, its failure says the most about
+        // it; otherwise every parent that was tried is listed.
         if let Some(failure) = direct_failure {
             return Err(failure);
         }

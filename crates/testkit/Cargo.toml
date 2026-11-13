@@ -1,6 +1,6 @@
 [package]
 name = "gatir-testkit"
-description = "Test support for gatir: mock origin and parent proxies, injectable clock and nonce"
+description = "Test support for gatir: mock origins and parent proxies, failing servers, a fuzz harness"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

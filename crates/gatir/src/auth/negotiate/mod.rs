@@ -71,8 +71,8 @@ pub trait TokenSource: Send + Sync + fmt::Debug {
     }
 }
 
-/// The exchange of a source that has one token and no more: what a Kerberos
-/// ticket needs, and what a source made up for a test gives.
+/// A context that gives one fixed token and needs no second round, for a
+/// token source made up for a test.
 pub fn single_token(token: Vec<u8>) -> Box<dyn SecurityContext> {
     Box::new(OneRound(Some(token)))
 }

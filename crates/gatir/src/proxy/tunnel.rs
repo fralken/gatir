@@ -224,12 +224,11 @@ fn spawn_tunnel<U>(
 /// client's own header fields (User-Agent and the like), if it has any, go
 /// along, minus the hop-by-hop ones and its proxy credentials.
 ///
-/// If the parent wants NTLM, the CONNECT request itself opens the exchange and
-/// is sent again with the proof. With Negotiate it carries the proof at once.
-/// If the connection dies while asking a parent for a Kerberos ticket (some
-/// close it right after refusing a bare, credential-less probe), a fresh one
-/// to the same parent carries the ticket instead: see the module doc of
-/// `parent`. Whichever connection ends up authenticated becomes the tunnel,
+/// With NTLM, the CONNECT request carries the first message, and is sent again
+/// with the proof. With Negotiate it goes out bare, and a ticket is asked for
+/// only once the parent's `407` wants one; if the parent closes the connection
+/// after that `407`, a fresh one carries the ticket (see the module doc of
+/// `parent`). Whichever connection ends up authenticated becomes the tunnel,
 /// so none of this is ever reused for anything else.
 async fn connect_through_parent(
     stream: TcpStream,

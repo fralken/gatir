@@ -1,10 +1,9 @@
 //! The PAC address of the user on Windows, from WinHTTP: the same
-//! configuration that *Settings, Network, Proxy* shows ("Use setup script"),
-//! with what group policy says about it already taken into account.
+//! configuration that *Settings, Network, Proxy* shows ("Use setup script").
 //!
 //! This is a C interface, so this module is one of the places where `unsafe` is
 //! allowed. The call fills a structure with strings that Windows allocated, and
-//! every one of them is given back.
+//! every one of them is freed with `GlobalFree`.
 
 #![allow(unsafe_code)]
 
@@ -15,14 +14,15 @@ use windows_sys::Win32::Networking::WinHttp::{
 
 use super::{Settings, SystemPacError};
 
-/// The longest address read, in UTF-16 units: a limit for a string that is not
-/// ended, which the system does not produce.
+/// The longest address read, in UTF-16 units. Only a sanity bound: Windows ends
+/// these strings with a zero, and reading past one that it did not end would
+/// already be unsound.
 const MAX_ADDRESS: usize = 64 * 1024;
 
 pub(super) fn read() -> Result<Settings, SystemPacError> {
     let mut config = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
     // SAFETY: `config` is a structure of the kind the function fills, and lives
-    // until the strings in it have been given back below.
+    // until the strings in it have been freed below.
     if unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut config) } == 0 {
         return Err(SystemPacError::Unreadable);
     }
@@ -57,9 +57,9 @@ fn text(string: *mut u16) -> Option<String> {
     if string.is_null() {
         return None;
     }
-    // SAFETY: the string is ended by a zero, as every string of this kind is,
-    // so the units up to it can be read; the length is capped all the same, so
-    // that a string that is not ended is not read for ever.
+    // SAFETY: Windows ends the string with a zero, so the units up to it can
+    // be read. The cap does not make an unended string safe to read; it only
+    // bounds what is copied.
     let units = unsafe {
         let mut length = 0;
         while length < MAX_ADDRESS && *string.add(length) != 0 {

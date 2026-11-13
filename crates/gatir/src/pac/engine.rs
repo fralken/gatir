@@ -24,7 +24,8 @@ use super::route::{self, Route};
 
 const PRELUDE: &str = include_str!("prelude.js");
 
-/// Workers given up on, past which the script is declared broken.
+/// Workers given up on and still busy, at which every evaluation fails with
+/// [`PacError::Broken`] until one of them is done.
 const MAX_STUCK: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,7 +40,10 @@ pub enum PacError {
     BadResult(String),
     #[error("the PAC script returned no proxy gatir can read: \"{0}\"")]
     NoRoutes(String),
-    #[error("too many evaluations of the PAC script got stuck: restart gatir")]
+    #[error(
+        "too many evaluations of the PAC script are stuck at once (in a name lookup that does \
+         not end, say): try again later"
+    )]
     Broken,
     #[error("the PAC engine is not running")]
     Unavailable,
@@ -51,7 +55,9 @@ pub enum PacError {
 /// What a script may use.
 #[derive(Debug, Clone)]
 pub struct PacLimits {
-    /// How long one evaluation may take, name lookups included.
+    /// How long one evaluation may take. A name lookup cannot be interrupted:
+    /// an evaluation still in one is waited for `grace` longer, then given up
+    /// on.
     pub time: Duration,
     /// Memory one engine may use, in bytes.
     pub memory: usize,

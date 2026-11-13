@@ -96,8 +96,8 @@ impl Ntlmv2Hash {
         hash
     }
 
-    /// A hash computed elsewhere: the value some NTLM proxies print as
-    /// `PassNTLMv2`. It is tied to one user and one domain.
+    /// A hash computed elsewhere, by another NTLM tool. It is tied to one user
+    /// and one domain.
     pub fn from_bytes(bytes: [u8; HASH_LEN]) -> Self {
         Self(Hash::new(bytes))
     }

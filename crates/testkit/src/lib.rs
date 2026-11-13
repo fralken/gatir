@@ -1,7 +1,7 @@
 //! Test support for gatir. Dev-only: never a dependency of the shipped binary.
 //!
-//! Mock origin servers and parent proxies (plain and NTLM). Later steps add
-//! failing and slow ones, and injectable clock/nonce sources.
+//! Mock origin servers and parent proxies (plain and NTLM), servers that fail
+//! (`tcp`), a TLS server, a raw HTTP client, and the fuzz harness.
 
 use std::net::SocketAddr;
 

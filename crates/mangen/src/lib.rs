@@ -74,10 +74,10 @@ Send a few hosts to other proxies than the PAC script says (the \fB[[pac.overrid
 .SH FILES
 .TP
 \fI$XDG_CONFIG_HOME/gatir/gatir.toml\fR, \fI~/.config/gatir/gatir.toml\fR, \fI/etc/gatir/gatir.toml\fR
-The configuration file, when \fB\-\-config\fR is not given: the first of them that exists is read. On Windows, \fI%APPDATA%\\gatir\\gatir.toml\fR takes the place of the first two. The file may hold a password, so gatir warns when other users can read it, and when they can change it.
+The configuration file, when \fB\-\-config\fR is not given: the first of them that exists is read. On Windows there is no \fI/etc\fR file, and \fI%APPDATA%\\gatir\\gatir.toml\fR is looked for after the first two. The file may hold a password, so gatir warns when other users can read it, and when they can change it.
 .TP
-\fI/usr/share/doc/gatir/\fR
-An example configuration (\fIexamples/gatir.example.toml\fR) and the documentation.
+\fI/usr/share/doc/gatir/\fR, \fI$(brew \-\-prefix)/share/doc/gatir/\fR
+An example configuration and the documentation: installed by the packages in the first (the example in \fIexamples/\fR), by Homebrew in the second.
 .SH ENVIRONMENT
 .TP
 \fBRUST_LOG\fR

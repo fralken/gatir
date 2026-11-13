@@ -9,7 +9,7 @@
 //!
 //! This is a C interface, so this module is one of the places where `unsafe` is
 //! allowed. Every call says why it is sound, and every buffer, name and context
-//! that the library hands over is given back.
+//! that the library hands over is released.
 
 #![allow(unsafe_code)]
 
@@ -71,15 +71,13 @@ impl Oid {
     }
 }
 
-// On macOS, the well-known OIDs below are read from the library itself
-// instead (see `resolve()`): its GSS-API, for at least the host-based-service
-// and Kerberos-principal-name name types and the SPNEGO mechanism, appears to
-// compare the *pointer* it is given against its own copies of these for some
-// of what it does, not only their bytes, and one of our own, at a different
-// address, however byte-identical, took a path that corrupted memory (found
-// by comparing against another proxy's own working equivalent of this call,
-// which passes the library's own `GSS_C_NT_HOSTBASED_SERVICE`, and reproduced
-// with a minimal C program with no gatir or Rust code at all).
+// The OIDs that gatir passes to the library. On macOS they are not these
+// constants but the library's own objects, read in `Gss::resolve`: Apple's
+// GSS-API corrupted memory when it was given a copy of one of its OIDs, with
+// the same bytes at another address (a small C program reproduced it), so it
+// appears to compare pointers. Apple's headers also pack these structures to
+// 2 bytes on x86_64, which `Oid` does not follow: harmless, since gatir never
+// builds or reads one on macOS.
 /// 1.3.6.1.5.5.2, SPNEGO (RFC 4178).
 #[cfg(not(target_os = "macos"))]
 const SPNEGO: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
@@ -135,10 +133,8 @@ pub struct Gss {
     release_buffer: ReleaseBuffer,
     delete_sec_context: DeleteSecContext,
     display_status: DisplayStatus,
-    /// SPNEGO, the host-based-service and the Kerberos-principal name type,
-    /// as the library itself keeps them (see the comment above `Oid::of`'s
-    /// callers for why: on macOS these must be the library's own, not a copy
-    /// of the same bytes at a different address).
+    /// SPNEGO, and the host-based-service and Kerberos-principal name types.
+    /// On macOS these are the library's own objects: see `resolve()`.
     spnego_mechanism: *const Oid,
     hostbased_service: *const Oid,
     krb5_principal_name: *const Oid,
@@ -200,8 +196,10 @@ impl Gss {
     fn resolve(library: Library) -> Result<Self, String> {
         macro_rules! symbol {
             ($name:literal as $type:ty) => {
-                // SAFETY: the function of this name has the type that the C
-                // bindings of RFC 2744 give it, which `$type` declares.
+                // SAFETY: the symbol of this name has the type that `$type`
+                // declares: a function as the C bindings of RFC 2744 give it,
+                // or, for the OIDs on macOS, a `gss_OID_desc` (Apple's
+                // <GSS/gssapi_oid.h>).
                 match unsafe { library.get::<$type>(concat!($name, "\0").as_bytes()) } {
                     Ok(function) => *function,
                     Err(err) => return Err(format!("the library has no {}: {err}", $name)),
@@ -294,7 +292,7 @@ impl Gss {
         found
     }
 
-    /// The bytes of a buffer that the library filled, which are given back.
+    /// The bytes of a buffer that the library filled, which are released.
     fn take(&self, buffer: &mut Buffer) -> Option<Vec<u8>> {
         if buffer.value.is_null() {
             return None;
@@ -332,8 +330,9 @@ impl Name {
         let mut handle = null_mut();
         let mut minor = 0;
         // SAFETY: `input` describes bytes that live through the call, and the
-        // library copies what it keeps; `kind` is the library's own OID, read
-        // only; `handle` and `minor` are places for the results.
+        // library copies what it keeps; `kind` is one of the OIDs of `Gss`,
+        // read only and alive as long as the process; `handle` and `minor` are
+        // places for the results.
         let major =
             unsafe { (gss.import_name)(&mut minor, &mut input, kind.cast_mut(), &mut handle) };
         if major & STATUS_ERROR_MASK != 0 {
@@ -346,9 +345,7 @@ impl Name {
 impl Drop for Name {
     fn drop(&mut self) {
         let mut minor = 0;
-        // SAFETY: the name was made by the library and is not used again; it
-        // may be null if the call that made it did not set it, which the
-        // library accepts.
+        // SAFETY: the name was made by the library and is not used again.
         unsafe { (self.gss.release_name)(&mut minor, &mut self.handle) };
     }
 }
@@ -357,7 +354,8 @@ impl Drop for Name {
 pub struct Context {
     gss: &'static Gss,
     handle: Handle,
-    /// Released after the context, which refers to it: fields drop in order.
+    /// Released after the context, which refers to it: `Drop for Context`
+    /// runs before the fields are dropped.
     name: Name,
     complete: bool,
 }
@@ -413,7 +411,7 @@ impl Context {
                 &mut valid_for,
             )
         };
-        // What the library allocated is copied out and given back, whether or
+        // What the library allocated is copied out and released, whether or
         // not the call went well.
         let token = self.gss.take(&mut output).filter(|bytes| !bytes.is_empty());
         if major & STATUS_ERROR_MASK != 0 {

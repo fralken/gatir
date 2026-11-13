@@ -5,9 +5,9 @@
 //! not Negotiate. No password is asked for or kept: Windows holds the
 //! credentials of the session.
 //!
-//! This is a C interface, so this module is the one place where `unsafe` is
+//! This is a C interface, so this module is one of the places where `unsafe` is
 //! allowed. Every call says why it is sound, and every handle and buffer that
-//! SSPI hands over is given back.
+//! SSPI hands over is released.
 
 #![allow(unsafe_code)]
 
@@ -116,8 +116,9 @@ impl Context {
 
 impl SecurityContext for Context {
     fn step(&mut self, from_parent: Option<&[u8]>) -> Result<Step, AuthError> {
-        // SSPI takes the input through a non-const pointer, and does not write
-        // to it: a copy costs nothing and keeps the caller's bytes out of it.
+        // SSPI takes the input through a non-const pointer. It does not write
+        // to it, but a copy means it never gets a pointer to the caller's
+        // bytes.
         let mut input_bytes = from_parent.map(<[u8]>::to_vec);
         let mut input = SecBuffer {
             cbBuffer: input_bytes.as_ref().map_or(0, |bytes| bytes.len() as u32),
@@ -147,7 +148,9 @@ impl SecurityContext for Context {
         let mut expiry = 0i64;
 
         // The first call has no context to pass and makes one; the next calls
-        // pass it, and get the same handle back. Both pointers come from one.
+        // pass it, and get the same handle back. `previous` and `handle` both
+        // point at `self.context`, which SSPI allows (phContext and
+        // phNewContext may be the same handle).
         let handle: *mut SecHandle = &raw mut self.context;
         let previous: *const SecHandle = if self.started { handle } else { null() };
         let input_ptr: *const SecBufferDesc = if input_bytes.is_some() {
@@ -177,7 +180,7 @@ impl SecurityContext for Context {
             )
         };
 
-        // Whatever SSPI allocated is copied out and given back, whether or not
+        // Whatever SSPI allocated is copied out and released, whether or not
         // the call went well.
         let token = if output.pvBuffer.is_null() {
             None

@@ -13,8 +13,8 @@ CNTLM.
 - Comments only where the *why* is non-obvious. No comments that restate code.
 - Prefer well-known, audited crates over hand-written protocol or crypto code.
   New dependencies must pass `cargo deny`.
-- `unsafe` is denied workspace-wide. If a platform binding (SSPI, GSSAPI)
-  needs it, allow it in that single module with a comment explaining why.
+- `unsafe` is denied workspace-wide. If a platform binding (SSPI, GSSAPI,
+  WinHTTP) needs it, allow it in that single module with a comment explaining why.
 - gatir is an original work. Implement from public specifications (RFCs,
   MS-NLMP, the PAC documentation) and black-box behavior. Do not copy or
   translate code, comments, tests, help text or documentation from other
@@ -36,8 +36,9 @@ CNTLM.
 ## Layout
 
 - `crates/gatir`: library + `gatir` binary.
-- `crates/testkit`: dev-only test support (mock origin/parent proxies,
-  injectable clock and nonce). Never a dependency of the shipped binary.
+- `crates/testkit`: dev-only test support (mock origins and parent proxies,
+  servers that fail, a TLS server, a raw HTTP client, the fuzz harness). Never a
+  dependency of the shipped binary.
 - `crates/mangen`: writes the manual pages from the `clap` definition, for a
   release. Not shipped.
 - `crates/loadgen`: `gatir-loadgen`, for load-testing a proxy by hand; see
@@ -82,8 +83,9 @@ at run time (`libloading`, in `auth/negotiate/gss/api.rs`) instead of linking it
 nothing about it is needed to build, and a computer without the library
 (`libgssapi_krb5` on Linux) can still run gatir with NTLM. The tests do load it, so
 Linux needs `libgssapi-krb5-2` to run them. On Windows, Negotiate goes through SSPI
-(`windows-sys`), in `auth/negotiate/sspi/api.rs`. Those two files are the places
-where `unsafe` is allowed.
+(`windows-sys`), in `auth/negotiate/sspi/api.rs`. Those two files, and
+`pac/system/windows.rs` (the PAC address of the Windows settings, from WinHTTP),
+are the places where `unsafe` is allowed.
 
 TLS (a PAC script fetched over https) goes through the operating system, with
 the `native-tls` crate: Security.framework on macOS, Schannel on Windows and
@@ -93,7 +95,7 @@ TLS implementation of its own. The test server (`crates/testkit`, `tls.rs`) is
 rustls with `ring` and makes its certificates with `rcgen`: dev-dependencies
 only, and a different implementation from the code under test on purpose.
 
-The PAC engine is QuickJS, through the `rquickjs` crate: C code compiled at
+The PAC engine is QuickJS-ng, through the `rquickjs` crate: C code compiled at
 build time, so a C compiler is needed (the macOS command line tools, gcc or
 clang on Linux, MSVC on Windows). It is the one place where C is accepted, for
 want of an embeddable Rust engine with time and memory limits, and it stays

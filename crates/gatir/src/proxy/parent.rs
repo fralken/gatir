@@ -112,7 +112,8 @@ pub(super) enum Outcome {
     /// The parent asked for no authentication: this is its answer.
     Answered(Response<Incoming>),
     /// The parent sent a challenge. The connection is ready for the real
-    /// request, which must carry this `Proxy-Authorization` value.
+    /// request, which must carry this value: in `Proxy-Authorization` for a
+    /// parent, in `Authorization` for a server in `credentials.origin_hosts`.
     Proof {
         header: HeaderValue,
         /// The service it was made for, with Negotiate: the password of the

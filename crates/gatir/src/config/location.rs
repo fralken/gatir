@@ -1,8 +1,8 @@
 //! Where the configuration file is looked for when none is named.
 //!
-//! The user's own file comes first, then the one for the whole machine, so that
-//! a service run by a user and a service run by the system both find theirs
-//! without being told.
+//! The user's own file comes first, then, on Unix, the one for the whole
+//! machine, so that a service run by a user and a service run by the system
+//! both find theirs without being told.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

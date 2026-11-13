@@ -1,7 +1,7 @@
 //! Idle HTTP/1 connections to origin servers and parent proxies, kept for reuse.
 //!
-//! A connection goes back into the pool only once the response it carried has
-//! been relayed to the client in full; until then it is busy. Nothing here
+//! A connection goes back into the pool only once the body of the response it
+//! carried has been read to the end; until then it is busy. Nothing here
 //! decides *whether* a connection may be reused: hyper closes a connection the
 //! peer ended or announced it would close, and [`Pool::take`] skips those.
 
@@ -107,15 +107,16 @@ pub(super) struct Lease {
     pub hop: Hop,
     /// True if it came from the pool, so it may have gone stale unnoticed.
     pub reused: bool,
-    /// True for a new connection to a parent that wants authentication: the
-    /// exchange must run on it before it carries the request. Pooled
-    /// connections have been through it already.
+    /// True for a new connection that must be authenticated before it carries
+    /// the request: to a parent, when there are credentials, or to a server
+    /// named in `credentials.origin_hosts`. Pooled connections have been
+    /// through it already.
     pub needs_auth: bool,
 }
 
 impl Lease {
     /// Wraps the response body so that the connection returns to `pool` once
-    /// the whole body has been relayed. If the body fails or is dropped first,
+    /// the whole body has been read. If the body fails or is dropped first,
     /// the connection is simply closed.
     pub(super) fn attach(self, pool: &Arc<Pool>, body: Incoming) -> Body {
         let pool = pool.clone();

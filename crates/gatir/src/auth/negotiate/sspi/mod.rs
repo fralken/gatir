@@ -1,8 +1,8 @@
 //! Negotiate on Windows, through SSPI.
 //!
-//! What is only text and numbers is here, and built on every platform, so that
-//! its tests run wherever the code is written. The calls to Windows are in
-//! `api`.
+//! What needs no Windows call (the service name, the text of a status) is
+//! here and built on every platform, so its tests run on any computer. The
+//! calls to Windows are in `api`.
 
 #[cfg(windows)]
 mod api;

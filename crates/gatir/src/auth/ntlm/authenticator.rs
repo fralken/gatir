@@ -59,9 +59,10 @@ impl Authenticator {
                 let mut bytes = *hash.expose_secret();
                 let v2_hash = Ntlmv2Hash::from_bytes(bytes);
                 bytes.zeroize();
-                // Such a hash is made from the upper-cased user and domain,
-                // and the server derives the same key from the domain it is
-                // sent, so the domain must go out in upper case too.
+                // The tools that print such a hash compute it over the
+                // upper-cased domain (NTOWFv2 itself does not upper-case it),
+                // and the server derives the key from the domain it is sent,
+                // so the domain goes out in upper case.
                 domain.make_ascii_uppercase();
                 Hash::Ntlmv2(v2_hash)
             }
