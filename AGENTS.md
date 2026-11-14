@@ -62,6 +62,7 @@ Why each of these is needed is explained further down, where it is relevant.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 ```
 
 The parsers that read what others send (the NTLM challenge, SOCKS5, the PAC
@@ -101,9 +102,13 @@ clang on Linux, MSVC on Windows). It is the one place where C is accepted, for
 want of an embeddable Rust engine with time and memory limits, and it stays
 behind `pac::engine`: nothing else in the project calls into it.
 
-`rust-toolchain.toml` selects the `stable` channel and `rust-version` in the
-workspace `Cargo.toml` is the minimum supported Rust version. CI runs the same
-checks on Linux, macOS and Windows, plus `cargo deny`.
+`rust-toolchain.toml` selects the `stable` channel, so the latest release of
+Rust builds gatir. `rust-version` in the workspace `Cargo.toml` is the oldest
+release gatir promises to build with. CI runs the checks above on Linux, macOS
+and Windows; it also builds the documentation with broken links as errors,
+checks the workspace with the release that `rust-version` names, and runs
+`cargo deny`. Raise `rust-version` when the code starts to need a newer
+release.
 
 ## Workflow
 

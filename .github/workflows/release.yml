@@ -47,7 +47,7 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v5
-      - name: Install the toolchain pinned in rust-toolchain.toml
+      - name: Install the toolchain that rust-toolchain.toml names
         run: rustup toolchain install
       - name: Install what the TLS binding needs to build, and the Kerberos library the tests load
         if: runner.os == 'Linux'

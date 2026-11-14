@@ -9,6 +9,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# The checks only read the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -19,7 +23,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
-      - name: Install the toolchain pinned in rust-toolchain.toml
+      - name: Install the toolchain that rust-toolchain.toml names
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install what the TLS binding needs to build, and the Kerberos library the tests load
@@ -31,6 +35,39 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the toolchain that rust-toolchain.toml names
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install what the TLS binding needs to build
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Documentation, with no broken links
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the version that rust-version in Cargo.toml names
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Install what the TLS binding needs to build
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Check
+        run: cargo "+$MSRV" check --workspace --all-targets --locked
 
   deny:
     name: cargo-deny
