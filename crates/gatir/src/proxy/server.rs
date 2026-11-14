@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::body::error_response;
+use super::clock::{Clock, SystemClock};
 use super::parent::ParentAuth;
 use super::pool::Pool;
 use super::portfwd;
@@ -76,6 +77,8 @@ pub struct Services {
     pub trust: Trust,
     /// Where `[pac] system` finds the script.
     pub system_pac: Arc<dyn SystemPac>,
+    /// Where the time comes from, for what the proxy remembers for a while.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl Default for Services {
@@ -84,6 +87,7 @@ impl Default for Services {
             tokens: None,
             trust: Trust::system(),
             system_pac: Arc::new(OperatingSystem),
+            clock: Arc::new(SystemClock),
         }
     }
 }
@@ -144,34 +148,41 @@ async fn build_live(
     };
     // Credentials matter when there is a parent proxy to give them to, or an
     // origin server that also asks for them directly.
-    let auth = match &config.credentials {
-        Some(credentials)
-            if !config.parents.is_empty()
-                || pac.is_some()
-                || !credentials.origin_hosts.entries().is_empty() =>
-        {
-            let kept = previous.and_then(|live| {
-                let unchanged = live
-                    .credentials
-                    .as_ref()
-                    .is_some_and(|used| used.same_as(credentials));
-                live.auth.clone().filter(|_| unchanged)
-            });
-            match kept {
-                Some(auth) => Some(auth),
-                None => Some(Arc::new(
-                    ParentAuth::new(credentials, services.tokens.clone()).map_err(|err| {
-                        io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
-                    })?,
-                )),
+    let auth =
+        match &config.credentials {
+            Some(credentials)
+                if !config.parents.is_empty()
+                    || pac.is_some()
+                    || !credentials.origin_hosts.entries().is_empty() =>
+            {
+                let kept = previous.and_then(|live| {
+                    let unchanged = live
+                        .credentials
+                        .as_ref()
+                        .is_some_and(|used| used.same_as(credentials));
+                    live.auth.clone().filter(|_| unchanged)
+                });
+                match kept {
+                    Some(auth) => Some(auth),
+                    None => Some(Arc::new(
+                        ParentAuth::new(
+                            credentials,
+                            services.tokens.clone(),
+                            services.clock.clone(),
+                        )
+                        .map_err(|err| {
+                            io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+                        })?,
+                    )),
+                }
             }
-        }
-        _ => None,
-    };
+            _ => None,
+        };
     let upstreams = Upstreams::new(
         config.parents.clone(),
         config.no_proxy.clone(),
         pac.as_ref().map(|(_, source)| source.clone()),
+        services.clock.clone(),
     );
     let live = Live {
         pool: Arc::new(Pool::default()),

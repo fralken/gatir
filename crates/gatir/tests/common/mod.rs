@@ -4,13 +4,13 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gatir::auth::TokenSource;
 use gatir::config::{Config, Overrides};
 use gatir::pac::Trust;
-use gatir::proxy::{Server, Services};
+use gatir::proxy::{Clock, Server, Services};
 use gatir_testkit::http::{RawClient, Response};
 use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
 use gatir_testkit::origin::{MockOrigin, Reply};
@@ -56,29 +56,67 @@ impl Drop for TestProxy {
 /// Starts a proxy on a free loopback port. `extra` is appended to the
 /// configuration and may contain further top-level keys and tables.
 pub async fn start_proxy(extra: &str) -> TestProxy {
-    run(bind(extra, None, None).await)
+    run(bind(extra, Services::default()).await)
 }
 
 /// Like [`start_proxy`], with `trust` for the certificates of `https://` PAC
 /// addresses.
 pub async fn start_proxy_trusting(extra: &str, trust: Trust) -> TestProxy {
-    run(bind(extra, None, Some(trust)).await)
+    let services = Services {
+        trust,
+        ..Services::default()
+    };
+    run(bind(extra, services).await)
 }
 
 /// Like [`start_proxy`], with Negotiate tokens from `tokens` in place of the
 /// system's Kerberos tickets.
 pub async fn start_proxy_with_tokens(extra: &str, tokens: Arc<dyn TokenSource>) -> TestProxy {
-    run(bind(extra, Some(tokens), None).await)
-}
-
-async fn bind(extra: &str, tokens: Option<Arc<dyn TokenSource>>, trust: Option<Trust>) -> Server {
-    let toml = format!("listen = [\"127.0.0.1:0\"]\n{extra}");
-    let config = Config::from_toml_str(&toml, Overrides::default()).expect("test configuration");
     let services = Services {
-        tokens,
-        trust: trust.unwrap_or_else(Trust::system),
+        tokens: Some(tokens),
         ..Services::default()
     };
+    run(bind(extra, services).await)
+}
+
+/// Like [`start_proxy`], with `clock` in place of the system's time.
+pub async fn start_proxy_with_clock(extra: &str, clock: Arc<FakeClock>) -> TestProxy {
+    let services = Services {
+        clock,
+        ..Services::default()
+    };
+    run(bind(extra, services).await)
+}
+
+/// A time that moves only when a test says so.
+#[derive(Debug)]
+pub struct FakeClock {
+    start: Instant,
+    elapsed: Mutex<Duration>,
+}
+
+impl FakeClock {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            elapsed: Mutex::new(Duration::ZERO),
+        })
+    }
+
+    pub fn advance(&self, by: Duration) {
+        *self.elapsed.lock().unwrap() += by;
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> Instant {
+        self.start + *self.elapsed.lock().unwrap()
+    }
+}
+
+async fn bind(extra: &str, services: Services) -> Server {
+    let toml = format!("listen = [\"127.0.0.1:0\"]\n{extra}");
+    let config = Config::from_toml_str(&toml, Overrides::default()).expect("test configuration");
     Server::bind_with(&config, services)
         .await
         .expect("bind the proxy")

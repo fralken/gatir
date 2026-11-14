@@ -64,6 +64,7 @@ use hyper::{Request, Response, StatusCode};
 use tokio::time::timeout;
 
 use super::body::{Body, answer_within};
+use super::clock::{Clock, since};
 use super::failure::Failure;
 use super::upstream::Hop;
 use crate::auth::{
@@ -100,6 +101,7 @@ pub(super) struct ParentAuth {
     /// The origin servers (`host:port`) that refused credentials which had
     /// worked elsewhere, and when.
     refused_by: Mutex<HashMap<String, Instant>>,
+    clock: Arc<dyn Clock>,
     /// Whether the credentials have worked, and not been refused since.
     verified: AtomicBool,
     /// Held from the moment an NTLM proof is ready until the answer to it
@@ -161,9 +163,12 @@ pub(super) fn warn_no_credentials() {
 
 impl ParentAuth {
     /// `tokens` replaces the system's Kerberos tickets, for tests.
+    /// `tokens` replaces the system's Kerberos tickets, and `clock` the
+    /// system's time, for tests.
     pub(super) fn new(
         credentials: &Credentials,
         tokens: Option<Arc<dyn TokenSource>>,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, AuthError> {
         let authenticator = match tokens {
             Some(tokens) => Authenticator::with_tokens(credentials, tokens)?,
@@ -174,6 +179,7 @@ impl ParentAuth {
             origin_hosts: credentials.origin_hosts.clone(),
             rejected_at: Mutex::new(None),
             refused_by: Mutex::new(HashMap::new()),
+            clock,
             verified: AtomicBool::new(false),
             gate: tokio::sync::Mutex::new(()),
         })
@@ -189,6 +195,11 @@ impl ParentAuth {
         }
     }
 
+    /// How long ago `at` was.
+    fn since(&self, at: Instant) -> Duration {
+        since(&*self.clock, at)
+    }
+
     fn rejected_at(&self) -> MutexGuard<'_, Option<Instant>> {
         self.rejected_at
             .lock()
@@ -198,8 +209,8 @@ impl ParentAuth {
     /// Fails while a refusal of the credentials is recent.
     pub(super) fn check(&self) -> Result<(), Failure> {
         match *self.rejected_at() {
-            Some(at) if at.elapsed() < COOLDOWN => {
-                Err(Failure::CoolingDown(COOLDOWN - at.elapsed()))
+            Some(at) if self.since(at) < COOLDOWN => {
+                Err(Failure::CoolingDown(COOLDOWN - self.since(at)))
             }
             _ => Ok(()),
         }
@@ -209,9 +220,9 @@ impl ParentAuth {
     pub(super) fn check_origin(&self, server: &str) -> Result<(), Failure> {
         let refused_by = self.refused_by();
         match refused_by.get(server) {
-            Some(at) if at.elapsed() < COOLDOWN => Err(Failure::OriginCoolingDown {
+            Some(&at) if self.since(at) < COOLDOWN => Err(Failure::OriginCoolingDown {
                 server: server.to_owned(),
-                remaining: COOLDOWN - at.elapsed(),
+                remaining: COOLDOWN - self.since(at),
             }),
             _ => Ok(()),
         }
@@ -227,8 +238,8 @@ impl ParentAuth {
     /// them for a while.
     fn hold_off(&self, whose: &str, by: &str) {
         let mut rejected_at = self.rejected_at();
-        let first = rejected_at.is_none_or(|at| at.elapsed() >= COOLDOWN);
-        *rejected_at = Some(Instant::now());
+        let first = rejected_at.is_none_or(|at| self.since(at) >= COOLDOWN);
+        *rejected_at = Some(self.clock.now());
         self.verified.store(false, Ordering::Release);
         if first {
             tracing::warn!(
@@ -756,8 +767,9 @@ impl<'a> Admission<'a> {
             self.auth.hold_off(&user, server);
         } else {
             let mut refused_by = self.auth.refused_by();
-            refused_by.retain(|_, at| at.elapsed() < COOLDOWN);
-            refused_by.insert(server.to_owned(), Instant::now());
+            let auth = self.auth;
+            refused_by.retain(|_, at| auth.since(*at) < COOLDOWN);
+            refused_by.insert(server.to_owned(), auth.clock.now());
             tracing::warn!(
                 user = %user,
                 %server,

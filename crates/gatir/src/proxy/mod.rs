@@ -1,6 +1,7 @@
 //! The proxy server: accepts clients and forwards their requests.
 
 mod body;
+mod clock;
 mod detect;
 mod failure;
 mod forward;
@@ -17,6 +18,7 @@ use std::io;
 
 use tokio_util::sync::CancellationToken;
 
+pub use clock::{Clock, SystemClock};
 pub use detect::{Attempt, AttemptOutcome, Probe, Report, run as detect};
 pub use server::{Reloader, Server, Services};
 

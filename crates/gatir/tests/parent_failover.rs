@@ -6,6 +6,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use common::*;
 use gatir_testkit::http::RawClient;
@@ -93,6 +94,29 @@ async fn a_parent_that_ended_a_connection_is_left_for_last_for_a_while() {
         }
         assert_eq!(dead.accepted(), 1, "{hangup:?}");
     }
+}
+
+/// The minute is over: the parent that failed is tried first again, in its
+/// place in the list.
+#[tokio::test]
+async fn a_parent_that_ended_a_connection_takes_its_place_back_after_a_minute() {
+    let dead = DeadServer::start(Hangup::Reset).await;
+    let live = live_parent("live").await;
+    let clock = FakeClock::new();
+    let (_dir, table) = pac_returning(&format!("PROXY {}; PROXY {}", dead.addr(), live.addr()));
+    let proxy = start_proxy_with_clock(&table, clock.clone()).await;
+
+    let request = || get("origin.example.com", "/", "");
+    assert_eq!(ask(&proxy, request()).await.body_text(), "live");
+    assert_eq!(dead.accepted(), 1);
+
+    clock.advance(Duration::from_secs(59));
+    assert_eq!(ask(&proxy, request()).await.body_text(), "live");
+    assert_eq!(dead.accepted(), 1, "still left for last");
+
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(ask(&proxy, request()).await.body_text(), "live");
+    assert_eq!(dead.accepted(), 2, "tried first again");
 }
 
 #[tokio::test]

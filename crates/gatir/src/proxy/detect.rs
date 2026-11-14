@@ -21,6 +21,7 @@ use hyper::header::{HOST, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use hyper::{Method, Request, StatusCode, Uri, Version};
 
 use super::body::{Body, full};
+use super::clock::SystemClock;
 use super::failure::{Failure, connect_failure, try_connect};
 use super::parent::{Outcome, ParentAuth, send};
 use super::upstream::handshake;
@@ -137,7 +138,7 @@ async fn try_one(
     tokens: Option<Arc<dyn TokenSource>>,
 ) -> Attempt {
     let outcome = 'outcome: {
-        let auth = match ParentAuth::new(credentials, tokens) {
+        let auth = match ParentAuth::new(credentials, tokens, Arc::new(SystemClock)) {
             Ok(auth) => auth,
             Err(err) => break 'outcome AttemptOutcome::Failed(err.to_string()),
         };

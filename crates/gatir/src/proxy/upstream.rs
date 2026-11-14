@@ -15,6 +15,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
 use super::body::Body;
+use super::clock::{Clock, since};
 use super::failure::{
     ConnectError, Failure, ParentAttempt, connect_failure, describe, try_connect,
 };
@@ -77,6 +78,7 @@ pub(super) struct Upstreams {
     pac: Option<Arc<PacSource>>,
     /// Parents that could not be reached, and when.
     unreachable: Mutex<HashMap<String, Instant>>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Upstreams {
@@ -84,6 +86,7 @@ impl Upstreams {
         parents: Vec<HostPort>,
         no_proxy: NoProxy,
         pac: Option<Arc<PacSource>>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             parents,
@@ -91,6 +94,7 @@ impl Upstreams {
             no_proxy,
             pac,
             unreachable: Mutex::new(HashMap::new()),
+            clock,
         }
     }
 
@@ -128,7 +132,7 @@ impl Upstreams {
     /// If all of them failed lately, the order is left as it is.
     fn order(&self, hops: Vec<Hop>) -> Vec<Hop> {
         let mut unreachable = self.unreachable();
-        unreachable.retain(|_, since| since.elapsed() < BAD_FOR);
+        unreachable.retain(|_, at| since(&*self.clock, *at) < BAD_FOR);
         let (mut good, bad): (Vec<Hop>, Vec<Hop>) = hops.into_iter().partition(|hop| match hop {
             Hop::Direct => true,
             Hop::Parent(parent) => !unreachable.contains_key(&parent.to_string()),
@@ -150,7 +154,7 @@ impl Upstreams {
     fn failed(&self, hop: &Hop) {
         if let Hop::Parent(parent) = hop {
             self.unreachable()
-                .insert(parent.to_string(), Instant::now());
+                .insert(parent.to_string(), self.clock.now());
         }
     }
 
@@ -346,6 +350,7 @@ fn hop_failure(hop: &Hop, origin: &str, error: ConnectError) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::SystemClock;
 
     fn parent(text: &str) -> HostPort {
         text.parse().unwrap()
@@ -357,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_parents_everything_is_direct() {
-        let upstreams = Upstreams::new(vec![], NoProxy::default(), None);
+        let upstreams = Upstreams::new(vec![], NoProxy::default(), None, Arc::new(SystemClock));
         assert_eq!(
             upstreams
                 .hops("http://example.com/", "example.com")
@@ -370,7 +375,12 @@ mod tests {
     #[tokio::test]
     async fn with_parents_only_no_proxy_destinations_are_direct() {
         let no_proxy = NoProxy::new(["localhost", "*.corp.example.com", "10.0.0.0/8"]).unwrap();
-        let upstreams = Upstreams::new(vec![parent("proxy.example.com:8080")], no_proxy, None);
+        let upstreams = Upstreams::new(
+            vec![parent("proxy.example.com:8080")],
+            no_proxy,
+            None,
+            Arc::new(SystemClock),
+        );
         let hops = |host: &'static str| {
             let upstreams = &upstreams;
             async move { upstreams.hops("http://x/", host).await.unwrap() }
@@ -395,6 +405,7 @@ mod tests {
             ],
             NoProxy::default(),
             None,
+            Arc::new(SystemClock),
         );
         assert_eq!(
             upstreams.hops("http://x/", "x").await.unwrap(),
@@ -417,7 +428,7 @@ mod tests {
 
     #[test]
     fn a_parent_that_could_not_be_reached_goes_last_for_a_while() {
-        let upstreams = Upstreams::new(vec![], NoProxy::default(), None);
+        let upstreams = Upstreams::new(vec![], NoProxy::default(), None, Arc::new(SystemClock));
         let hops = vec![
             hop("dead.example.com:1"),
             Hop::Direct,
@@ -441,7 +452,7 @@ mod tests {
 
     #[test]
     fn when_every_parent_failed_the_order_is_kept() {
-        let upstreams = Upstreams::new(vec![], NoProxy::default(), None);
+        let upstreams = Upstreams::new(vec![], NoProxy::default(), None, Arc::new(SystemClock));
         let hops = vec![hop("a.example.com:1"), hop("b.example.com:2")];
         upstreams.failed(&hops[0]);
         upstreams.failed(&hops[1]);
@@ -459,6 +470,7 @@ mod tests {
             vec![parent("other.example.com:2"), parent(&address)],
             NoProxy::default(),
             None,
+            Arc::new(SystemClock),
         );
         upstreams.failed(&accepting);
 

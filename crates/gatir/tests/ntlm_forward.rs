@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::*;
 use gatir_testkit::http::RawClient;
 use gatir_testkit::ntlm_parent::{MockNtlmParent, Options};
@@ -226,6 +228,35 @@ async fn rejected_credentials_are_reported_and_not_tried_again() {
     assert_eq!(parent.messages(3), 1);
     assert_eq!(parent.connection_count(), 1);
     assert!(parent.served().is_empty());
+}
+
+/// The pause after a refusal ends: five minutes later, gatir tries the
+/// credentials again, once.
+#[tokio::test]
+async fn rejected_credentials_are_tried_again_once_the_pause_is_over() {
+    let parent = alice_parent(Options::default()).await;
+    let clock = FakeClock::new();
+    let proxy = start_proxy_with_clock(&config(&parent, "not-the-password"), clock.clone()).await;
+
+    assert_eq!(
+        ask(&proxy, get("origin.example.com", "/", "")).await.status,
+        502
+    );
+    clock.advance(Duration::from_secs(299));
+    assert_eq!(
+        ask(&proxy, get("origin.example.com", "/", "")).await.status,
+        503
+    );
+    assert_eq!(parent.messages(3), 1);
+
+    clock.advance(Duration::from_secs(2));
+    let again = ask(&proxy, get("origin.example.com", "/", "")).await;
+    assert_eq!(again.status, 502, "{}", again.body_text());
+    assert_eq!(parent.messages(3), 2, "one more attempt, not more");
+    assert_eq!(
+        ask(&proxy, get("origin.example.com", "/", "")).await.status,
+        503
+    );
 }
 
 #[tokio::test]
