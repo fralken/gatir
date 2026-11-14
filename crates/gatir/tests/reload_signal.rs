@@ -12,9 +12,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::get;
+use common::{get, named};
 use gatir_testkit::http::RawClient;
-use gatir_testkit::origin::{MockOrigin, Reply};
 
 /// gatir running as a process, with what it logs collected.
 struct Running {
@@ -82,10 +81,6 @@ impl Drop for Running {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-async fn named(name: &'static str) -> MockOrigin {
-    MockOrigin::start(move |_| Reply::ok(name)).await
 }
 
 async fn free_port() -> u16 {

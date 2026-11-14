@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex};
 use common::*;
 use gatir::auth::{AuthError, SecurityContext, Step, TokenSource};
 use gatir_testkit::http::{RawClient, Response};
-use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, NegotiateExchange, Options};
-use gatir_testkit::origin::Reply;
+use gatir_testkit::ntlm_parent::{MockNtlmParent, NegotiateExchange, Options};
 
 const FIRST: &[u8] = b"first for HTTP@127.0.0.1";
 const CHALLENGE: &[u8] = b"the parent's own token";
@@ -76,19 +75,6 @@ fn exchange() -> Options {
     }
 }
 
-async fn parent_with(options: Options) -> MockNtlmParent {
-    MockNtlmParent::start(
-        Account::new("alice", "CORP", "s3cret"),
-        options,
-        |request| match request.method.as_str() {
-            "CONNECT" => Reply::raw("HTTP/1.1 200 Connection Established\r\n\r\n").then_echo(),
-            "HEAD" => Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"),
-            method => Reply::ok(&format!("{method} {} bytes", request.body.len())),
-        },
-    )
-    .await
-}
-
 async fn proxy_with(parent: &MockNtlmParent, source: TwoRounds) -> TestProxy {
     start_proxy_with_tokens(
         &format!(
@@ -108,7 +94,7 @@ async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>, head: bool) -> Respon
 
 #[tokio::test]
 async fn a_get_opens_bare_then_carries_the_first_token_and_then_the_second() {
-    let parent = parent_with(exchange()).await;
+    let parent = alice_parent(exchange()).await;
     let source = TwoRounds::default();
     let heard = source.heard.clone();
     let proxy = proxy_with(&parent, source).await;
@@ -137,7 +123,7 @@ async fn a_get_opens_bare_then_carries_the_first_token_and_then_the_second() {
 
 #[tokio::test]
 async fn a_post_is_sent_only_once_the_exchange_is_done() {
-    let parent = parent_with(exchange()).await;
+    let parent = alice_parent(exchange()).await;
     let proxy = proxy_with(&parent, TwoRounds::default()).await;
 
     let response = ask(
@@ -165,7 +151,7 @@ async fn a_post_is_sent_only_once_the_exchange_is_done() {
 
 #[tokio::test]
 async fn a_head_is_opened_with_a_probe_too() {
-    let parent = parent_with(exchange()).await;
+    let parent = alice_parent(exchange()).await;
     let proxy = proxy_with(&parent, TwoRounds::default()).await;
     let response = ask(
         &proxy,
@@ -184,7 +170,7 @@ async fn a_head_is_opened_with_a_probe_too() {
 
 #[tokio::test]
 async fn a_tunnel_is_authenticated_in_two_rounds() {
-    let parent = parent_with(exchange()).await;
+    let parent = alice_parent(exchange()).await;
     let proxy = proxy_with(&parent, TwoRounds::default()).await;
 
     let mut client = open_tunnel(&proxy, "example.com:443").await;
@@ -205,7 +191,7 @@ async fn a_tunnel_is_authenticated_in_two_rounds() {
 
 #[tokio::test]
 async fn the_connection_stays_authenticated_for_the_requests_after() {
-    let parent = parent_with(exchange()).await;
+    let parent = alice_parent(exchange()).await;
     let proxy = proxy_with(&parent, TwoRounds::default()).await;
 
     let mut client = RawClient::connect(proxy.addr).await.unwrap();
@@ -228,7 +214,7 @@ async fn the_connection_stays_authenticated_for_the_requests_after() {
 #[tokio::test]
 async fn a_parent_that_accepts_the_first_token_needs_no_second_round() {
     // The system asks for another round, and the parent has no use for it.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         offers: vec!["Negotiate".to_owned()],
         negotiate_token: Some(FIRST.to_vec()),
         ..Options::default()
@@ -261,7 +247,7 @@ async fn a_parent_that_accepts_the_first_token_needs_no_second_round() {
 #[tokio::test]
 async fn a_parent_that_refuses_or_does_not_offer_negotiate_is_reported() {
     // It offers Negotiate and does not accept the token.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         offers: vec!["Negotiate".to_owned()],
         ..Options::default()
     })
@@ -278,7 +264,7 @@ async fn a_parent_that_refuses_or_does_not_offer_negotiate_is_reported() {
     );
 
     // It offers something else.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         offers: vec!["Basic realm=\"x\"".to_owned()],
         ..Options::default()
     })
@@ -297,7 +283,7 @@ async fn a_parent_that_refuses_or_does_not_offer_negotiate_is_reported() {
 
 #[tokio::test]
 async fn a_system_that_cannot_answer_the_parents_token_is_reported() {
-    let parent = parent_with(exchange()).await;
+    let parent = alice_parent(exchange()).await;
     let proxy = proxy_with(
         &parent,
         TwoRounds {
@@ -320,7 +306,7 @@ async fn a_system_that_cannot_answer_the_parents_token_is_reported() {
 /// parent would refuse it, and count a failed logon.
 #[tokio::test]
 async fn a_parent_that_closes_the_connection_after_its_token_is_reported() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_after_challenge: true,
         ..exchange()
     })
@@ -351,7 +337,7 @@ async fn a_parent_that_closes_the_connection_after_its_token_is_reported() {
 async fn a_refused_second_token_is_not_tried_again_for_a_while() {
     // The second round is NTLM, made from the password of the logged-on user,
     // and a parent that refuses it has counted a failed logon.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         negotiate_exchange: Some(NegotiateExchange {
             first: FIRST.to_vec(),
             challenge: CHALLENGE.to_vec(),

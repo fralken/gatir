@@ -14,9 +14,8 @@ use common::*;
 use gatir::auth::ntlm;
 use gatir::auth::{AuthError, SecurityContext, Step, TokenSource};
 use gatir::config::{Config, Overrides};
-use gatir_testkit::http::{RawClient, Response};
-use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, NegotiateExchange, Options};
-use gatir_testkit::origin::Reply;
+use gatir_testkit::http::RawClient;
+use gatir_testkit::ntlm_parent::{MockNtlmParent, NegotiateExchange, Options};
 use hyper::header::HeaderValue;
 
 /// The system: Negotiate tokens that no parent here accepts, and NTLM as the
@@ -117,18 +116,6 @@ impl SecurityContext for NtlmContext {
     }
 }
 
-async fn parent_with(options: Options) -> MockNtlmParent {
-    MockNtlmParent::start(
-        Account::new("alice", "CORP", "s3cret"),
-        options,
-        |request| match request.method.as_str() {
-            "CONNECT" => Reply::raw("HTTP/1.1 200 Connection Established\r\n\r\n").then_echo(),
-            method => Reply::ok(&format!("{method} {} bytes", request.body.len())),
-        },
-    )
-    .await
-}
-
 async fn proxy_with(parent: &MockNtlmParent, system: System) -> TestProxy {
     start_proxy_with_tokens(
         &format!(
@@ -140,15 +127,9 @@ async fn proxy_with(parent: &MockNtlmParent, system: System) -> TestProxy {
     .await
 }
 
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
-}
-
 #[tokio::test]
 async fn ntlm_takes_over_when_the_parent_does_not_offer_negotiate() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = proxy_with(&parent, System::of_alice()).await;
 
     let response = ask(&proxy, get("origin.example.com", "/page", "")).await;
@@ -176,7 +157,7 @@ async fn ntlm_takes_over_when_the_parent_does_not_offer_negotiate() {
 
 #[tokio::test]
 async fn a_post_is_sent_once_and_only_with_the_final_message() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = proxy_with(&parent, System::of_alice()).await;
 
     let response = ask(
@@ -198,7 +179,7 @@ async fn a_post_is_sent_once_and_only_with_the_final_message() {
 
 #[tokio::test]
 async fn a_tunnel_is_authenticated_the_same_way() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = proxy_with(&parent, System::of_alice()).await;
 
     let mut client = open_tunnel(&proxy, "example.com:443").await;
@@ -215,7 +196,7 @@ async fn a_tunnel_is_authenticated_the_same_way() {
 
 #[tokio::test]
 async fn the_connection_stays_authenticated_for_the_requests_after() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = proxy_with(&parent, System::of_alice()).await;
 
     let mut client = RawClient::connect(proxy.addr).await.unwrap();
@@ -232,7 +213,7 @@ async fn the_connection_stays_authenticated_for_the_requests_after() {
 
 #[tokio::test]
 async fn a_system_that_cannot_do_ntlm_by_itself_reports_what_the_parent_offers() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = proxy_with(
         &parent,
         System {
@@ -258,7 +239,7 @@ async fn a_system_that_cannot_do_ntlm_by_itself_reports_what_the_parent_offers()
 #[tokio::test]
 async fn a_parent_that_offers_negotiate_too_gets_negotiate() {
     // It offers both, and takes the Negotiate token: the system's NTLM is not used.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         offers: vec!["Negotiate".to_owned(), "NTLM".to_owned()],
         negotiate_token: Some(b"ticket for HTTP@127.0.0.1".to_vec()),
         ..Options::default()
@@ -276,7 +257,7 @@ async fn a_parent_that_offers_negotiate_too_gets_negotiate() {
 #[tokio::test]
 async fn a_parent_that_does_not_answer_ntlm_with_a_challenge_is_reported() {
     // It says NTLM, and ignores NTLM messages.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         ntlm: false,
         ..Options::default()
     })
@@ -296,7 +277,7 @@ async fn a_parent_that_does_not_answer_ntlm_with_a_challenge_is_reported() {
 
 #[tokio::test]
 async fn a_refused_password_is_not_tried_again_for_a_while() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     // The password of the session is not the one the parent knows.
     let proxy = proxy_with(
         &parent,
@@ -329,7 +310,7 @@ async fn a_refused_password_is_not_tried_again_for_a_while() {
 async fn a_parent_that_answers_the_negotiate_token_with_its_own_is_not_sent_ntlm() {
     // It offers NTLM as well, but it is going on with Negotiate: the system
     // answers the token it sent, as it would with no NTLM of its own.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         offers: vec!["Negotiate".to_owned(), "NTLM".to_owned()],
         negotiate_exchange: Some(NegotiateExchange {
             first: b"ticket for HTTP@127.0.0.1".to_vec(),
@@ -350,7 +331,7 @@ async fn a_parent_that_answers_the_negotiate_token_with_its_own_is_not_sent_ntlm
 
 #[tokio::test]
 async fn a_parent_that_closes_the_connection_after_the_challenge_is_reported() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_after_challenge: true,
         ..Options::default()
     })
@@ -370,7 +351,7 @@ async fn a_parent_that_closes_the_connection_after_the_challenge_is_reported() {
 
 #[tokio::test]
 async fn a_parent_that_closes_the_connection_when_it_refuses_the_negotiate_token_is_reported() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_after_refusal: true,
         ..Options::default()
     })

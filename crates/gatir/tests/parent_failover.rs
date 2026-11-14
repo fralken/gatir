@@ -36,12 +36,6 @@ async fn live_parent(body: &'static str) -> MockOrigin {
     .await
 }
 
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> gatir_testkit::http::Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
-}
-
 /// The `[pac]` table of a script that returns `answer` for everything.
 fn pac_returning(answer: &str) -> (TempDir, String) {
     let dir = tempfile::tempdir().unwrap();

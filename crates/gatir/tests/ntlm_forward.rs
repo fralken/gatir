@@ -6,23 +6,8 @@ mod common;
 
 use common::*;
 use gatir_testkit::http::RawClient;
-use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
+use gatir_testkit::ntlm_parent::{MockNtlmParent, Options};
 use gatir_testkit::origin::{MockOrigin, Reply};
-
-async fn parent_with(options: Options) -> MockNtlmParent {
-    MockNtlmParent::start(
-        Account::new("alice", "CORP", "s3cret"),
-        options,
-        |request| {
-            if request.method == "HEAD" {
-                Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n")
-            } else {
-                Reply::ok(&format!("{} {} bytes", request.method, request.body.len()))
-            }
-        },
-    )
-    .await
-}
 
 fn config_for(parent: std::net::SocketAddr, method: &str, password: &str) -> String {
     ntlm_parent_config(parent, method, password)
@@ -32,17 +17,10 @@ fn config(parent: &MockNtlmParent, password: &str) -> String {
     ntlm_parent_config(parent.addr(), "ntlmv2", password)
 }
 
-/// Sends `request` on a new connection to the proxy and reads the answer.
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> gatir_testkit::http::Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
-}
-
 #[tokio::test]
 async fn a_get_is_authenticated_on_its_connection_before_it_is_served() {
     for method in ["ntlmv2", "ntlm2sr", "nt"] {
-        let parent = parent_with(Options::default()).await;
+        let parent = alice_parent(Options::default()).await;
         let proxy = start_proxy(&config_for(parent.addr(), method, "s3cret")).await;
 
         let response = ask(
@@ -78,7 +56,7 @@ async fn a_get_is_authenticated_on_its_connection_before_it_is_served() {
 #[tokio::test]
 async fn ntlmv2_follows_the_server_clock() {
     // The mock refuses a blob that lacks the timestamp and AV pairs it sent.
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         timestamp: Some(116_444_736_000_000_000),
         ..Options::default()
     })
@@ -91,7 +69,7 @@ async fn ntlmv2_follows_the_server_clock() {
 
 #[tokio::test]
 async fn authenticated_connections_are_reused() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "s3cret")).await;
 
     for path in ["/one", "/two", "/three"] {
@@ -107,7 +85,7 @@ async fn authenticated_connections_are_reused() {
 
 #[tokio::test]
 async fn a_post_is_preceded_by_a_get_that_opens_the_exchange() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "s3cret")).await;
 
     let response = ask(
@@ -143,7 +121,7 @@ async fn a_post_is_preceded_by_a_get_that_opens_the_exchange() {
 
 #[tokio::test]
 async fn a_chunked_upload_is_authenticated_the_same_way() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "s3cret")).await;
 
     let response = ask(
@@ -162,7 +140,7 @@ async fn a_chunked_upload_is_authenticated_the_same_way() {
 
 #[tokio::test]
 async fn a_head_is_opened_with_a_get_as_well() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "s3cret")).await;
 
     let mut client = RawClient::connect(proxy.addr).await.unwrap();
@@ -224,7 +202,7 @@ async fn a_parent_that_asks_for_nothing_still_sees_a_get_first_for_a_post() {
 
 #[tokio::test]
 async fn rejected_credentials_are_reported_and_not_tried_again() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "not-the-password")).await;
 
     let first = ask(&proxy, get("origin.example.com", "/", "")).await;
@@ -252,7 +230,7 @@ async fn rejected_credentials_are_reported_and_not_tried_again() {
 
 #[tokio::test]
 async fn parallel_requests_with_wrong_credentials_make_one_attempt() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "not-the-password")).await;
 
     let mut tasks = Vec::new();
@@ -291,7 +269,7 @@ async fn parallel_requests_with_wrong_credentials_make_one_attempt() {
 
 #[tokio::test]
 async fn parallel_requests_with_good_credentials_all_get_through() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "s3cret")).await;
 
     let mut tasks = Vec::new();
@@ -356,7 +334,7 @@ async fn a_slow_answer_from_a_parent_that_wants_no_credentials_holds_up_nothing(
 
 #[tokio::test]
 async fn a_parent_without_ntlm_is_reported_with_the_schemes_it_offers() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         ntlm: false,
         offers: vec!["Basic realm=\"corp\"".to_owned(), "Negotiate".to_owned()],
         ..Options::default()
@@ -383,7 +361,7 @@ async fn a_parent_without_ntlm_is_reported_with_the_schemes_it_offers() {
 
 #[tokio::test]
 async fn a_parent_that_hangs_up_during_the_exchange_gives_a_gateway_error() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_on_negotiate: true,
         ..Options::default()
     })
@@ -403,7 +381,7 @@ async fn a_parent_that_hangs_up_during_the_exchange_gives_a_gateway_error() {
 
 #[tokio::test]
 async fn a_challenge_that_closes_the_connection_cannot_be_answered() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_after_challenge: true,
         ..Options::default()
     })
@@ -423,7 +401,7 @@ async fn a_challenge_that_closes_the_connection_cannot_be_answered() {
 
 #[tokio::test]
 async fn a_pooled_connection_that_loses_its_authentication_is_replaced() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         forget_after: Some(1),
         ..Options::default()
     })
@@ -447,7 +425,7 @@ async fn a_pooled_connection_that_loses_its_authentication_is_replaced() {
 
 #[tokio::test]
 async fn a_post_cannot_be_repeated_when_its_connection_loses_authentication() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         forget_after: Some(1),
         ..Options::default()
     })
@@ -488,7 +466,7 @@ async fn a_post_cannot_be_repeated_when_its_connection_loses_authentication() {
 
 #[tokio::test]
 async fn the_clients_own_proxy_credentials_are_never_used() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&config(&parent, "s3cret")).await;
 
     let response = ask(
@@ -509,7 +487,7 @@ async fn the_clients_own_proxy_credentials_are_never_used() {
 
 #[tokio::test]
 async fn destinations_reached_directly_get_no_credentials() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let origin = MockOrigin::start(|_| Reply::ok("direct")).await;
     let proxy = start_proxy(&format!(
         "parents = [\"{}\"]\nno_proxy = [\"127.0.0.1\"]\n\
@@ -529,7 +507,7 @@ async fn an_ntlmv2_hash_from_another_implementation_authenticates() {
     // The hash of alice / s3cret in the domain "corp", as printed by another
     // NTLM implementation, which upper-cases the domain before hashing. The
     // domain must therefore go out as CORP, which is what the mock expects.
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = start_proxy(&format!(
         "parents = [\"{}\"]\n\
          [credentials]\nusername = \"alice\"\ndomain = \"corp\"\n\

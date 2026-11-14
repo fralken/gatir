@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use gatir::auth::{AuthError, SecurityContext, TokenSource, single_token};
-use gatir_testkit::http::{RawClient, Response};
+use gatir_testkit::http::RawClient;
 use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
 use gatir_testkit::origin::{MockOrigin, Reply};
 
@@ -55,19 +55,6 @@ fn accepting(token: &str) -> Options {
     }
 }
 
-async fn parent_with(options: Options) -> MockNtlmParent {
-    MockNtlmParent::start(
-        Account::new("alice", "CORP", "s3cret"),
-        options,
-        |request| match request.method.as_str() {
-            "CONNECT" => Reply::raw("HTTP/1.1 200 Connection Established\r\n\r\n").then_echo(),
-            "HEAD" => Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"),
-            method => Reply::ok(&format!("{method} {} bytes", request.body.len())),
-        },
-    )
-    .await
-}
-
 /// The configuration of a proxy that uses Negotiate to reach `parent`.
 fn config(parent: &MockNtlmParent) -> String {
     format!(
@@ -80,15 +67,9 @@ async fn proxy_for(parent: &MockNtlmParent) -> TestProxy {
     start_proxy_with_tokens(&config(parent), Arc::new(Tickets)).await
 }
 
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
-}
-
 #[tokio::test]
 async fn a_bare_request_opens_the_exchange_then_the_real_one_carries_the_ticket() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
     let response = ask(
@@ -122,7 +103,7 @@ async fn a_bare_request_opens_the_exchange_then_the_real_one_carries_the_ticket(
 /// the ticket must still get through, on a second connection.
 #[tokio::test]
 async fn a_parent_that_closes_after_the_bare_probe_still_gets_the_ticket_on_a_new_connection() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_after_refusal: true,
         ..accepting("ticket for HTTP@127.0.0.1")
     })
@@ -149,7 +130,7 @@ async fn a_parent_that_closes_after_the_bare_probe_still_gets_the_ticket_on_a_ne
 
 #[tokio::test]
 async fn the_configured_service_name_is_used() {
-    let parent = parent_with(accepting("ticket for HTTP/proxy.example.com@EXAMPLE.COM")).await;
+    let parent = alice_parent(accepting("ticket for HTTP/proxy.example.com@EXAMPLE.COM")).await;
     let proxy = start_proxy_with_tokens(
         &format!(
             "parents = [\"{}\"]\n[credentials]\nmethod = \"negotiate\"\n\
@@ -166,7 +147,7 @@ async fn the_configured_service_name_is_used() {
 
 #[tokio::test]
 async fn a_post_is_sent_once_the_bare_probes_have_authenticated_the_connection() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
     let response = ask(
@@ -195,7 +176,7 @@ async fn a_post_is_sent_once_the_bare_probes_have_authenticated_the_connection()
 
 #[tokio::test]
 async fn a_head_is_opened_with_probes_too() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
     let mut client = RawClient::connect(proxy.addr).await.unwrap();
@@ -220,7 +201,7 @@ async fn a_head_is_opened_with_probes_too() {
 
 #[tokio::test]
 async fn an_authenticated_connection_is_reused_without_another_ticket() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
     for path in ["/one", "/two", "/three"] {
@@ -247,7 +228,7 @@ async fn an_authenticated_connection_is_reused_without_another_ticket() {
 
 #[tokio::test]
 async fn a_tunnel_opens_bare_then_a_connect_carries_the_ticket() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
     let mut client = open_tunnel(&proxy, "example.com:443").await;
@@ -269,7 +250,7 @@ async fn a_tunnel_opens_bare_then_a_connect_carries_the_ticket() {
 /// ends up going out on, whichever one that is.
 #[tokio::test]
 async fn a_tunnel_reconnects_when_the_bare_probe_closes_the_connection() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         close_after_refusal: true,
         ..accepting("ticket for HTTP@127.0.0.1")
     })
@@ -295,7 +276,7 @@ async fn a_tunnel_reconnects_when_the_bare_probe_closes_the_connection() {
 
 #[tokio::test]
 async fn a_connection_that_loses_its_authentication_is_replaced() {
-    let parent = parent_with(Options {
+    let parent = alice_parent(Options {
         forget_after: Some(1),
         ..accepting("ticket for HTTP@127.0.0.1")
     })
@@ -325,7 +306,7 @@ async fn a_connection_that_loses_its_authentication_is_replaced() {
 
 #[tokio::test]
 async fn parallel_requests_all_get_through() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = proxy_for(&parent).await;
 
     let mut tasks = Vec::new();
@@ -395,7 +376,7 @@ async fn a_slow_answer_does_not_hold_up_a_new_connection() {
 
 #[tokio::test]
 async fn a_ticket_the_parent_refuses_is_reported_and_asked_for_again() {
-    let parent = parent_with(accepting("a different ticket")).await;
+    let parent = alice_parent(accepting("a different ticket")).await;
     let proxy = proxy_for(&parent).await;
 
     for _ in 0..2 {
@@ -416,7 +397,7 @@ async fn a_ticket_the_parent_refuses_is_reported_and_asked_for_again() {
 
 #[tokio::test]
 async fn a_parent_without_negotiate_is_reported_with_the_schemes_it_offers() {
-    let parent = parent_with(Options::default()).await;
+    let parent = alice_parent(Options::default()).await;
     let proxy = proxy_for(&parent).await;
 
     let response = ask(&proxy, get("origin.example.com", "/", "")).await;
@@ -432,7 +413,7 @@ async fn a_parent_without_negotiate_is_reported_with_the_schemes_it_offers() {
 
 #[tokio::test]
 async fn without_a_ticket_the_bare_probe_still_went_out() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = start_proxy_with_tokens(&config(&parent), Arc::new(NoTickets)).await;
 
     let response = ask(&proxy, get("origin.example.com", "/", "")).await;
@@ -453,7 +434,7 @@ async fn without_a_ticket_the_bare_probe_still_went_out() {
 
 #[tokio::test]
 async fn a_kdc_that_does_not_answer_gives_a_gateway_timeout() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let proxy = start_proxy_with_tokens(
         &format!("{}[timeouts]\nresponse_secs = 1\n", config(&parent)),
         Arc::new(SlowKdc),
@@ -477,7 +458,7 @@ async fn a_kdc_that_does_not_answer_gives_a_gateway_timeout() {
 
 #[tokio::test]
 async fn destinations_reached_directly_get_no_ticket() {
-    let parent = parent_with(accepting("ticket for HTTP@127.0.0.1")).await;
+    let parent = alice_parent(accepting("ticket for HTTP@127.0.0.1")).await;
     let origin = MockOrigin::start(|_| Reply::ok("direct")).await;
     let proxy = start_proxy_with_tokens(
         &format!(

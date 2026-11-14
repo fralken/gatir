@@ -17,7 +17,7 @@ use gatir_testkit::origin::{MockOrigin, Reply};
 use tempfile::TempDir;
 
 /// A server that names itself in every answer, and opens a tunnel for CONNECT.
-async fn named(name: &'static str) -> MockOrigin {
+async fn named_parent(name: &'static str) -> MockOrigin {
     MockOrigin::start(move |request| {
         if request.method == "CONNECT" {
             Reply::raw("HTTP/1.1 200 Connection Established\r\n\r\n").then_echo()
@@ -42,15 +42,13 @@ fn to(addr: SocketAddr) -> String {
     format!("PROXY {addr}")
 }
 
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> gatir_testkit::http::Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
-}
-
 #[tokio::test]
 async fn the_script_picks_the_parent_for_each_host() {
-    let (a, b, origin) = (named("A").await, named("B").await, named("direct").await);
+    let (a, b, origin) = (
+        named_parent("A").await,
+        named_parent("B").await,
+        named_parent("direct").await,
+    );
     let script = format!(
         r#"function FindProxyForURL(url, host) {{
              if (dnsDomainIs(host, ".a.test")) return "{}";
@@ -86,7 +84,7 @@ async fn the_script_picks_the_parent_for_each_host() {
 
 #[tokio::test]
 async fn the_script_sees_the_whole_url_with_the_host_in_lower_case() {
-    let (a, origin) = (named("A").await, named("direct").await);
+    let (a, origin) = (named_parent("A").await, named_parent("direct").await);
     let script = format!(
         r#"function FindProxyForURL(url, host) {{
              if (shExpMatch(url, "*/private/*")) return "{}";
@@ -124,7 +122,7 @@ async fn the_script_sees_the_whole_url_with_the_host_in_lower_case() {
 
 #[tokio::test]
 async fn a_list_moves_on_from_a_parent_that_is_down() {
-    let (b, origin) = (named("B").await, named("direct").await);
+    let (b, origin) = (named_parent("B").await, named_parent("direct").await);
     let dead = closed_port().await;
     // Down, then up: the second is used.
     let script = format!(
@@ -164,7 +162,7 @@ async fn a_list_moves_on_from_a_parent_that_is_down() {
 
 #[tokio::test]
 async fn a_list_ending_in_direct_falls_back_to_the_destination() {
-    let origin = named("direct").await;
+    let origin = named_parent("direct").await;
     let dead = closed_port().await;
     let script = format!(
         r#"function FindProxyForURL(url, host) {{ return "{}; DIRECT"; }}"#,
@@ -181,7 +179,7 @@ async fn a_list_ending_in_direct_falls_back_to_the_destination() {
 
 #[tokio::test]
 async fn kinds_gatir_cannot_use_are_skipped() {
-    let b = named("B").await;
+    let b = named_parent("B").await;
     let script = format!(
         r#"function FindProxyForURL(url, host) {{
              if (host === "only.socks") return "SOCKS5 127.0.0.1:1; HTTPS 127.0.0.1:2";
@@ -215,7 +213,7 @@ async fn a_script_error_is_a_gateway_error_that_says_why() {
                     }"#;
     let (_dir, table) = pac_table(script, "");
     let proxy = start_proxy(&table).await;
-    let origin = named("direct").await;
+    let origin = named_parent("direct").await;
 
     for (host, expected) in [
         ("boom.test", "the script gave up"),
@@ -242,7 +240,7 @@ async fn a_script_error_is_a_gateway_error_that_says_why() {
 
 #[tokio::test]
 async fn a_tunnel_is_decided_by_the_address_it_leads_to() {
-    let (a, b) = (named("A").await, named("B").await);
+    let (a, b) = (named_parent("A").await, named_parent("B").await);
     let script = format!(
         r#"function FindProxyForURL(url, host) {{
              if (url === "https://tunnel.test/") return "{}";
@@ -267,7 +265,7 @@ async fn a_tunnel_is_decided_by_the_address_it_leads_to() {
 
 #[tokio::test]
 async fn no_proxy_is_asked_before_the_script() {
-    let (a, origin) = (named("A").await, named("direct").await);
+    let (a, origin) = (named_parent("A").await, named_parent("direct").await);
     let script = format!(
         r#"function FindProxyForURL(url, host) {{ return "{}"; }}"#,
         to(a.addr())
@@ -315,7 +313,7 @@ async fn the_parent_the_script_chose_can_ask_for_ntlm() {
 
 #[tokio::test]
 async fn a_script_shared_by_many_requests_answers_them_all() {
-    let (a, origin) = (named("A").await, named("direct").await);
+    let (a, origin) = (named_parent("A").await, named_parent("direct").await);
     let script = format!(
         r#"function FindProxyForURL(url, host) {{
              return dnsDomainIs(host, ".a.test") ? "{}" : "DIRECT";

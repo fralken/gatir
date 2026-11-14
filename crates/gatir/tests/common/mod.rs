@@ -11,7 +11,9 @@ use gatir::auth::TokenSource;
 use gatir::config::{Config, Overrides};
 use gatir::pac::Trust;
 use gatir::proxy::{Server, Services};
-use gatir_testkit::http::RawClient;
+use gatir_testkit::http::{RawClient, Response};
+use gatir_testkit::ntlm_parent::{Account, MockNtlmParent, Options};
+use gatir_testkit::origin::{MockOrigin, Reply};
 use gatir_testkit::tcp::TcpServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -113,6 +115,36 @@ pub fn ntlm_parent_config(parent: SocketAddr, method: &str, password: &str) -> S
          [credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"{password}\"\n\
          method = \"{method}\"\n"
     )
+}
+
+/// Sends `request` on a new connection to the proxy, and reads the answer.
+pub async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> Response {
+    let mut client = RawClient::connect(proxy.addr).await.unwrap();
+    client.send(request).await.unwrap();
+    client.read_response(false).await.unwrap()
+}
+
+/// A server that answers every request with `name`: a parent, or an origin,
+/// that a test can tell apart from the others.
+pub async fn named(name: &'static str) -> MockOrigin {
+    MockOrigin::start(move |_| Reply::ok(name)).await
+}
+
+/// A parent that wants NTLM from `alice` in `CORP`, password `s3cret`. Once a
+/// connection is authenticated, it opens tunnels that echo, answers `HEAD`
+/// with an empty `200`, and answers anything else with the method and the
+/// size of the body (`"POST 5 bytes"`).
+pub async fn alice_parent(options: Options) -> MockNtlmParent {
+    MockNtlmParent::start(
+        Account::new("alice", "CORP", "s3cret"),
+        options,
+        |request| match request.method.as_str() {
+            "CONNECT" => Reply::raw("HTTP/1.1 200 Connection Established\r\n\r\n").then_echo(),
+            "HEAD" => Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"),
+            method => Reply::ok(&format!("{method} {} bytes", request.body.len())),
+        },
+    )
+    .await
 }
 
 /// A proxy-style GET request (absolute-form target).

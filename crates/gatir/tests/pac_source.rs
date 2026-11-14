@@ -15,22 +15,10 @@ use gatir::config::{PacConfig, PacLocation};
 use gatir::pac::{
     FetchError, Fetched, PacSource, SystemPac, SystemPacError, Trust, Validators, fetch,
 };
-use gatir_testkit::http::RawClient;
 use gatir_testkit::origin::{MockOrigin, Reply};
-
-/// A server that names itself in every answer.
-async fn named(name: &'static str) -> MockOrigin {
-    MockOrigin::start(move |_| Reply::ok(name)).await
-}
 
 fn choosing(parent: SocketAddr) -> String {
     format!(r#"function FindProxyForURL(url, host) {{ return "PROXY {parent}"; }}"#)
-}
-
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> gatir_testkit::http::Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
 }
 
 /// What the parent named in the script answers, or the error page.

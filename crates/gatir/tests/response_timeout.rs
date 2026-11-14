@@ -13,12 +13,6 @@ use gatir_testkit::origin::{MockOrigin, Reply};
 
 const LIMIT: &str = "[timeouts]\nresponse_secs = 1\n";
 
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> gatir_testkit::http::Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
-}
-
 #[tokio::test]
 async fn a_slow_origin_gets_a_gateway_timeout() {
     let origin = MockOrigin::start(|_| Reply::ok("late").after(Duration::from_secs(4))).await;

@@ -14,11 +14,6 @@ use gatir_testkit::origin::{MockOrigin, Reply};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// A server that names itself in every answer.
-async fn named(name: &'static str) -> MockOrigin {
-    MockOrigin::start(move |_| Reply::ok(name)).await
-}
-
 /// Applies `extra`, with the address the proxies of these tests listen on, and
 /// returns what still needs a restart.
 async fn apply(proxy: &TestProxy, extra: &str) -> Vec<&'static str> {
@@ -28,12 +23,6 @@ async fn apply(proxy: &TestProxy, extra: &str) -> Vec<&'static str> {
     )
     .expect("test configuration");
     proxy.reloader.apply(&config).await.expect("the reload")
-}
-
-async fn ask(proxy: &TestProxy, request: impl AsRef<[u8]>) -> gatir_testkit::http::Response {
-    let mut client = RawClient::connect(proxy.addr).await.unwrap();
-    client.send(request).await.unwrap();
-    client.read_response(false).await.unwrap()
 }
 
 /// What the parent (or the origin) named in the answer, for a request to `site.test`.
