@@ -12,8 +12,9 @@ use hyper::header::HeaderValue;
 use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
-use super::{
-    Challenge, Dialect, Entropy, Identity, Key, NtHash, Ntlmv2Hash, authenticate, negotiate,
+use super::hash::{NtHash, Ntlmv2Hash};
+use super::message::{
+    Challenge, Dialect, Entropy, Identity, Key, MessageError, authenticate, negotiate,
 };
 use crate::auth::{AuthError, offers};
 use crate::config::{Credentials, Secret};
@@ -30,14 +31,7 @@ pub struct Authenticator {
     user: String,
     domain: String,
     workstation: String,
-    secret: Hash,
-}
-
-/// The hash the responses are computed from.
-#[derive(Debug)]
-enum Hash {
-    Nt(NtHash),
-    Ntlmv2(Ntlmv2Hash),
+    key: Key,
 }
 
 impl Authenticator {
@@ -45,15 +39,15 @@ impl Authenticator {
         let dialect = Dialect::from_method(credentials.method).ok_or(AuthError::NotNtlm)?;
         let mut domain = credentials.domain.clone();
         // The plain password is not kept: the hash is all NTLM needs.
-        let secret = match &credentials.secret {
+        let key = match &credentials.secret {
             Some(Secret::Password(password)) => {
-                Hash::Nt(NtHash::from_password(password.expose_secret()))
+                Key::Nt(NtHash::from_password(password.expose_secret()))
             }
             Some(Secret::NtHash(hash)) => {
                 let mut bytes = *hash.expose_secret();
                 let nt_hash = NtHash::from_bytes(bytes);
                 bytes.zeroize();
-                Hash::Nt(nt_hash)
+                Key::Nt(nt_hash)
             }
             Some(Secret::Ntlmv2Hash(hash)) => {
                 let mut bytes = *hash.expose_secret();
@@ -64,10 +58,15 @@ impl Authenticator {
                 // and the server derives the key from the domain it is sent,
                 // so the domain goes out in upper case.
                 domain.make_ascii_uppercase();
-                Hash::Ntlmv2(v2_hash)
+                Key::Ntlmv2(v2_hash)
             }
             None => return Err(AuthError::NoSecret),
         };
+        // The configuration refuses this too; a caller that builds the
+        // credentials by hand finds out here, not at every request.
+        if matches!(key, Key::Ntlmv2(_)) && dialect != Dialect::V2 {
+            return Err(AuthError::Message(MessageError::NtHashRequired));
+        }
         Ok(Self {
             dialect,
             user: credentials.username.clone(),
@@ -76,7 +75,7 @@ impl Authenticator {
                 .workstation
                 .clone()
                 .unwrap_or_else(default_workstation),
-            secret,
+            key,
         })
     }
 
@@ -116,11 +115,13 @@ impl Authenticator {
         let bytes = challenge(fields)?;
         let challenge =
             Challenge::parse(&bytes).map_err(|err| AuthError::BadChallenge(err.to_string()))?;
-        let key = match &self.secret {
-            Hash::Nt(hash) => Key::Nt(hash),
-            Hash::Ntlmv2(hash) => Key::Ntlmv2(hash),
-        };
-        let message = authenticate(self.dialect, &self.identity(), key, &challenge, entropy)?;
+        let message = authenticate(
+            self.dialect,
+            &self.identity(),
+            &self.key,
+            &challenge,
+            entropy,
+        )?;
         Ok(header(&message))
     }
 }
@@ -412,10 +413,11 @@ mod tests {
         for method in [AuthMethod::Nt, AuthMethod::Ntlm2sr] {
             let mut creds = alice_with_hash("CORP");
             creds.method = method;
-            let auth = Authenticator::new(&creds).unwrap();
-            let challenge = fields(&[&format!("NTLM {}", spec_challenge())]);
-            let error = auth.respond(&challenge).unwrap_err();
-            assert!(matches!(error, AuthError::Message(_)), "{error}");
+            let error = Authenticator::new(&creds).unwrap_err();
+            assert!(
+                matches!(error, AuthError::Message(MessageError::NtHashRequired)),
+                "{error}"
+            );
         }
     }
 

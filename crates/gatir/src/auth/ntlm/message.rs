@@ -227,39 +227,27 @@ pub fn negotiate(dialect: Dialect, identity: &Identity<'_>) -> Result<Vec<u8>, M
 }
 
 /// What a response is computed from.
-#[derive(Debug, Clone, Copy)]
-pub enum Key<'a> {
+#[derive(Debug)]
+pub enum Key {
     /// The NT hash of the password, enough for every dialect.
-    Nt(&'a NtHash),
+    Nt(NtHash),
     /// The NTLMv2 hash of a user and domain, enough for NTLMv2 only. The
     /// domain sent in the message must be the one the hash was made with.
-    Ntlmv2(&'a Ntlmv2Hash),
-}
-
-impl<'a> From<&'a NtHash> for Key<'a> {
-    fn from(hash: &'a NtHash) -> Self {
-        Self::Nt(hash)
-    }
-}
-
-impl<'a> From<&'a Ntlmv2Hash> for Key<'a> {
-    fn from(hash: &'a Ntlmv2Hash) -> Self {
-        Self::Ntlmv2(hash)
-    }
+    Ntlmv2(Ntlmv2Hash),
 }
 
 /// Builds the AUTHENTICATE message (type 3) answering `challenge`.
-pub fn authenticate<'a>(
+pub fn authenticate(
     dialect: Dialect,
     identity: &Identity<'_>,
-    key: impl Into<Key<'a>>,
+    key: &Key,
     challenge: &Challenge,
     entropy: &Entropy,
 ) -> Result<Vec<u8>, MessageError> {
     let mut negotiated = challenge.flags & flags::AGREED;
     let server_challenge = &challenge.server_challenge;
 
-    let (lm, nt): (Vec<u8>, Vec<u8>) = match (dialect, key.into()) {
+    let (lm, nt): (Vec<u8>, Vec<u8>) = match (dialect, key) {
         (Dialect::V2, key) => {
             let derived;
             let v2_hash = match key {
@@ -641,8 +629,14 @@ mod tests {
             time: 0,
         };
         let nt_hash = NtHash::from_password("Password");
-        let message =
-            authenticate(Dialect::V2, &identity(), &nt_hash, &challenge, &entropy).unwrap();
+        let message = authenticate(
+            Dialect::V2,
+            &identity(),
+            &Key::Nt(nt_hash),
+            &challenge,
+            &entropy,
+        )
+        .unwrap();
 
         assert_eq!(&message[..8], b"NTLMSSP\0");
         assert_eq!(u32_at(&message, 8), 3);
@@ -691,7 +685,7 @@ mod tests {
         let message = authenticate(
             Dialect::V2,
             &identity(),
-            &NtHash::from_password("p"),
+            &Key::Nt(NtHash::from_password("p")),
             &challenge,
             &entropy,
         )
@@ -713,7 +707,7 @@ mod tests {
         let message = authenticate(
             Dialect::V2,
             &identity(),
-            &NtHash::from_password("p"),
+            &Key::Nt(NtHash::from_password("p")),
             &challenge,
             &entropy,
         )
@@ -736,7 +730,7 @@ mod tests {
         let message = authenticate(
             Dialect::V2,
             &identity(),
-            &NtHash::from_password("p"),
+            &Key::Nt(NtHash::from_password("p")),
             &challenge,
             &entropy,
         )
@@ -758,7 +752,7 @@ mod tests {
         let message = authenticate(
             Dialect::V2,
             &identity(),
-            &NtHash::from_password("p"),
+            &Key::Nt(NtHash::from_password("p")),
             &challenge,
             &entropy,
         )
@@ -782,7 +776,7 @@ mod tests {
             authenticate(
                 Dialect::V2,
                 &identity(),
-                &NtHash::from_password("p"),
+                &Key::Nt(NtHash::from_password("p")),
                 &challenge,
                 &entropy
             ),
@@ -804,7 +798,7 @@ mod tests {
         authenticate(
             dialect,
             &identity(),
-            &NtHash::from_password("Password"),
+            &Key::Nt(NtHash::from_password("Password")),
             &challenge,
             &entropy,
         )
@@ -861,7 +855,7 @@ mod tests {
         let message = authenticate(
             Dialect::V1Extended,
             &identity,
-            &NtHash::from_password("Password"),
+            &Key::Nt(NtHash::from_password("Password")),
             &challenge,
             &entropy,
         )
@@ -924,7 +918,7 @@ mod tests {
         let message = authenticate(
             Dialect::V2,
             &identity,
-            &NtHash::from_password("Password"),
+            &Key::Nt(NtHash::from_password("Password")),
             &challenge,
             &entropy,
         )
