@@ -123,7 +123,10 @@ async fn a_request_in_flight_finishes_under_the_settings_it_began_with() {
             client.read_response(false).await.unwrap().body_text()
         }
     });
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    eventually("the request to reach the slow parent", || {
+        slow.requests().len() == 1
+    })
+    .await;
     apply(&proxy, &parents(&fast)).await;
 
     // A new request already goes to B; the one that was sent still gets A.
@@ -186,7 +189,7 @@ async fn a_connection_in_use_during_a_reload_is_not_kept_afterwards() {
             client.read_response(false).await.unwrap().status
         }
     });
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    eventually("the request to be served", || parent.served().len() == 1).await;
     apply(&proxy, &ntlm_config(&parent, "not-it")).await;
     assert_eq!(in_flight.await.unwrap(), 200);
 

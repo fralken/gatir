@@ -203,9 +203,10 @@ impl PacSource {
         }
     }
 
-    /// One look at the script. What it finds replaces what is in use only if
-    /// it loads.
-    async fn refresh(&self) -> Result<(), String> {
+    /// One look at the script, now, after any look already under way. What it
+    /// finds replaces what is in use only if it loads; if it finds nothing
+    /// usable, the reason is returned.
+    pub async fn refresh(&self) -> Result<(), String> {
         let _alone = self.looking.lock().await;
         let outcome = self.read_and_load().await;
         let mut state = self.lock();

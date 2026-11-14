@@ -356,9 +356,14 @@ async fn a_system_that_has_no_script_is_followed_when_it_has_one_and_never_loses
     system.set(Ok(PacLocation::Url(pac.url())));
     eventually("the script", || async { chosen(&source).await.is_ok() }).await;
 
-    // The setting is taken away: the script that worked stays.
+    // The setting is taken away: a look finds nothing, and the script that
+    // worked stays.
     system.set(Err(SystemPacError::NotSet));
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let reason = source.refresh().await.unwrap_err();
+    assert!(
+        reason.contains("not set to use an automatic proxy"),
+        "{reason}"
+    );
     assert_eq!(chosen(&source).await, Ok(format!("PROXY {}", a.addr())));
 }
 
@@ -445,28 +450,33 @@ async fn a_file_is_read_again_and_a_bad_version_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("proxy.pac");
     std::fs::write(&file, choosing(a.addr())).unwrap();
-    let proxy = start_proxy(&format!(
-        "[pac]\nfile = {:?}\nrefresh_secs = 1\n",
-        file.display().to_string()
-    ))
-    .await;
-    assert_eq!(through(&proxy).await, "A");
+    let mut settings = PacConfig::with_defaults(PacLocation::File(file.clone()));
+    settings.refresh = Duration::from_secs(1);
+    let source = PacSource::start(&settings).await.expect("start");
+    let through = |parent: SocketAddr| Ok(format!("PROXY {parent}"));
+    assert_eq!(chosen(&source).await, through(a.addr()));
 
+    // An edited file is read again on its own.
     std::fs::write(&file, choosing(b.addr())).unwrap();
-    eventually("the edited file", || async { through(&proxy).await == "B" }).await;
+    eventually("the edited file", || async {
+        chosen(&source).await == through(b.addr())
+    })
+    .await;
 
     // Neither a script that does not compile nor a file that is gone
     // takes away the one in use.
     std::fs::write(&file, "function FindProxyForURL(").unwrap();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert_eq!(through(&proxy).await, "B");
+    let reason = source.refresh().await.unwrap_err();
+    assert!(reason.contains("not usable"), "{reason}");
+    assert_eq!(chosen(&source).await, through(b.addr()));
     std::fs::remove_file(&file).unwrap();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert_eq!(through(&proxy).await, "B");
+    let missing = std::fs::File::open(&file).unwrap_err().to_string();
+    assert_eq!(source.refresh().await, Err(missing));
+    assert_eq!(chosen(&source).await, through(b.addr()));
 
     std::fs::write(&file, choosing(a.addr())).unwrap();
     eventually("the file to come back", || async {
-        through(&proxy).await == "A"
+        chosen(&source).await == through(a.addr())
     })
     .await;
 }
