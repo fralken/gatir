@@ -61,7 +61,10 @@ pub(super) fn parse(raw: BTreeMap<String, SecretValue>) -> Result<Vec<HeaderRule
 
 #[cfg(test)]
 mod tests {
+
     use secrecy::SecretString;
+
+    use crate::config::testing::{error_text, load};
 
     use super::*;
 
@@ -127,5 +130,43 @@ mod tests {
     fn rejects_the_same_name_written_with_different_case() {
         let text = error(&[("x-thing", "1"), ("X-Thing", "2")]);
         assert!(text.contains("more than once"), "{text}");
+    }
+
+    #[test]
+    fn parses_request_headers() {
+        let config =
+            load("[headers]\n\"User-Agent\" = \"corp/1.0\"\n\"X-Requested-By\" = \"gatir\"")
+                .unwrap();
+        let names: Vec<&str> = config
+            .request_headers
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["user-agent", "x-requested-by"]);
+        assert!(config.request_headers.iter().all(|(_, v)| v.is_sensitive()));
+        assert!(
+            config
+                .summary()
+                .contains("headers:     user-agent, x-requested-by")
+        );
+        assert!(load("").unwrap().request_headers.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_request_headers() {
+        assert!(error_text("[headers]\nHost = \"example.com\"").contains("managed by gatir"));
+        assert!(error_text("[headers]\n\"X-Thing\" = 12345").contains("quoted strings"));
+    }
+
+    #[test]
+    fn header_values_never_appear_in_debug_summary_or_errors() {
+        let config = load("[headers]\nX-Api-Key = \"super-secret-key\"").unwrap();
+        for text in [format!("{config:?}"), config.summary()] {
+            assert!(!text.contains("super-secret-key"), "{text}");
+        }
+        let text = error_text("[headers]\nX-Api-Key = 424242");
+        assert!(!text.contains("424242"), "{text}");
+        let text = error_text("[headers]\nHost = \"super-secret-key\"");
+        assert!(!text.contains("super-secret-key"), "{text}");
     }
 }

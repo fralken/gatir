@@ -117,7 +117,10 @@ impl fmt::Display for Tunnel {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::config::testing::{error_text, load};
+    use crate::config::*;
 
     fn tunnel(listen: &str, host: &str, port: u16) -> Tunnel {
         Tunnel {
@@ -187,5 +190,79 @@ mod tests {
         assert_eq!(tunnel.to_string(), "127.0.0.1:2222 -> git.example.com:22");
         let tunnel: Tunnel = "[::1]:2222:[2001:db8::1]:22".parse().unwrap();
         assert_eq!(tunnel.to_string(), "[::1]:2222 -> [2001:db8::1]:22");
+    }
+
+    #[test]
+    fn tunnels_are_listed_as_tables() {
+        let config = load(
+            "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"git.example.com:22\"\n\
+             [[tunnels]]\nlisten = \"[::1]:8443\"\ntarget = \"[2001:db8::1]:443\"",
+        )
+        .unwrap();
+        let shown: Vec<String> = config.tunnels.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "127.0.0.1:2222 -> git.example.com:22",
+                "[::1]:8443 -> [2001:db8::1]:443"
+            ]
+        );
+        assert!(load("").unwrap().tunnels.is_empty());
+        assert!(
+            config
+                .summary()
+                .contains("tunnels:     127.0.0.1:2222 -> git.example.com:22, ")
+        );
+        assert!(load("").unwrap().summary().contains("tunnels:     none"));
+    }
+
+    #[test]
+    fn rejects_tunnels_that_make_no_sense() {
+        for (toml, expected) in [
+            ("[[tunnels]]\nlisten = \"127.0.0.1:2222\"", "missing field"),
+            ("[[tunnels]]\ntarget = \"git:22\"", "missing field"),
+            (
+                "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"git\"",
+                "invalid address",
+            ),
+            (
+                "[[tunnels]]\nlisten = \"2222\"\ntarget = \"git:22\"",
+                "invalid socket address",
+            ),
+            (
+                "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"git:22\"\nsecret = 1",
+                "unknown field",
+            ),
+            (
+                "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"a:22\"\n\
+                 [[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"b:22\"",
+                "127.0.0.1:2222 is used by more than one listener",
+            ),
+            (
+                "listen = [\"127.0.0.1:3128\"]\n[[tunnels]]\nlisten = \"127.0.0.1:3128\"\ntarget = \"a:22\"",
+                "127.0.0.1:3128 is used by more than one listener",
+            ),
+        ] {
+            let text = error_text(toml);
+            assert!(text.contains(expected), "{toml:?} -> {text}");
+        }
+    }
+
+    #[test]
+    fn tunnels_on_the_command_line_replace_those_of_the_file() {
+        let file = "[[tunnels]]\nlisten = \"127.0.0.1:2222\"\ntarget = \"file.example.com:22\"";
+        let config = Config::from_toml_str(
+            file,
+            Overrides {
+                tunnels: vec!["3333:cli.example.com:22".parse().unwrap()],
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.tunnels.len(), 1);
+        assert_eq!(config.tunnels[0].target.host, "cli.example.com");
+        // Without any on the command line, the file's stay.
+        let config = Config::from_toml_str(file, Overrides::default()).unwrap();
+        assert_eq!(config.tunnels[0].target.host, "file.example.com");
     }
 }

@@ -327,3 +327,240 @@ impl Visitor<'_> for SecretVisitor {
         Err(Self::reject())
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use secrecy::{ExposeSecret, SecretString};
+
+    use crate::config::testing::{error_text, load};
+    use crate::config::*;
+
+    use super::*;
+
+    #[test]
+    fn method_defaults_to_ntlmv2() {
+        let config = load("[credentials]\nusername = \"a\"\npassword = \"p\"").unwrap();
+        assert_eq!(config.credentials.unwrap().method, AuthMethod::Ntlmv2);
+    }
+
+    #[test]
+    fn accepts_an_nt_hash() {
+        let hash = "8846f7eaee8fb117ad06bdd830b7586c";
+        let config = load(&format!(
+            "[credentials]\nusername = \"a\"\nnt_hash = \"{hash}\""
+        ))
+        .unwrap();
+        match config.credentials.unwrap().secret {
+            Some(Secret::NtHash(bytes)) => {
+                assert_eq!(hex::encode(bytes.expose_secret()), hash);
+            }
+            other => panic!("unexpected secret: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_an_ntlmv2_hash() {
+        let hash = "dd4ee4752f859325fa0813cbfb374400";
+        let config = load(&format!(
+            "[credentials]\nusername = \"a\"\nntlmv2_hash = \"{hash}\""
+        ))
+        .unwrap();
+        let creds = config.credentials.unwrap();
+        assert_eq!(creds.method, AuthMethod::Ntlmv2);
+        match creds.secret {
+            Some(Secret::Ntlmv2Hash(bytes)) => {
+                assert_eq!(hex::encode(bytes.expose_secret()), hash);
+            }
+            other => panic!("unexpected secret: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_needs_no_secret() {
+        let config = load("[credentials]\nmethod = \"negotiate\"").unwrap();
+        let creds = config.credentials.unwrap();
+        assert_eq!(creds.method, AuthMethod::Negotiate);
+        assert!(creds.secret.is_none());
+    }
+
+    #[test]
+    fn negotiate_can_name_the_service_of_the_parent() {
+        let config = load(
+            "[credentials]\nmethod = \"negotiate\"\nspn = \" HTTP/proxy.example.com@EXAMPLE.COM \"",
+        )
+        .unwrap();
+        let creds = config.credentials.unwrap();
+        assert_eq!(
+            creds.spn.as_deref(),
+            Some("HTTP/proxy.example.com@EXAMPLE.COM")
+        );
+        assert_eq!(
+            load("[credentials]\nmethod = \"negotiate\"")
+                .unwrap()
+                .credentials
+                .unwrap()
+                .spn,
+            None
+        );
+    }
+
+    #[test]
+    fn origin_hosts_are_matched_like_no_proxy() {
+        let config = load(
+            "[credentials]\nusername = \"a\"\npassword = \"p\"\n\
+             origin_hosts = [\"intranet.example.com\", \"*.corp.example.com\"]",
+        )
+        .unwrap();
+        let creds = config.credentials.unwrap();
+        assert!(creds.origin_hosts.matches("intranet.example.com"));
+        assert!(creds.origin_hosts.matches("app.corp.example.com"));
+        assert!(!creds.origin_hosts.matches("example.com"));
+        assert_eq!(
+            load("[credentials]\nusername = \"a\"\npassword = \"p\"")
+                .unwrap()
+                .credentials
+                .unwrap()
+                .origin_hosts
+                .entries(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn rejects_incoherent_credentials() {
+        let cases = [
+            ("[credentials]\npassword = \"p\"", "username is required"),
+            (
+                "[credentials]\nusername = \"a\"",
+                "credentials.password, credentials.nt_hash or credentials.ntlmv2_hash is required",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nmethod = \"nt\"",
+                "credentials.password or credentials.nt_hash is required",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nnt_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"\nntlmv2_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"",
+                "mutually exclusive",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nntlmv2_hash = \"abcd\"",
+                "credentials.ntlmv2_hash must be exactly 32 hexadecimal",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nmethod = \"nt\"\nntlmv2_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"",
+                "can only be used with method \"ntlmv2\"",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\npassword = \"p\"\nnt_hash = \"8846f7eaee8fb117ad06bdd830b7586c\"",
+                "mutually exclusive",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\npassword = \"\"",
+                "must not be empty",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nnt_hash = \"abcd\"",
+                "32 hexadecimal",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\nnt_hash = \"zz46f7eaee8fb117ad06bdd830b7586c\"",
+                "32 hexadecimal",
+            ),
+            (
+                "[credentials]\nmethod = \"negotiate\"\npassword = \"p\"",
+                "logged-in identity",
+            ),
+            (
+                "[credentials]\nmethod = \"kerberos\"\nusername = \"a\"",
+                "unknown variant",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\npassword = \"p\"\nspn = \"HTTP@proxy\"",
+                "credentials.spn only applies to method",
+            ),
+            (
+                "[credentials]\nmethod = \"negotiate\"\nspn = \"  \"",
+                "credentials.spn must not be empty",
+            ),
+            (
+                "[credentials]\nmethod = \"negotiate\"\norigin_hosts = [\"intranet.example.com\"]",
+                "credentials.origin_hosts needs an NTLM secret",
+            ),
+            (
+                "[credentials]\nusername = \"a\"\npassword = \"p\"\norigin_hosts = [\"\"]",
+                "must not be empty",
+            ),
+        ];
+        for (toml, expected) in cases {
+            let text = error_text(toml);
+            assert!(text.contains(expected), "{toml:?} -> {text}");
+        }
+    }
+
+    #[test]
+    fn a_prompted_password_replaces_a_file_hash() {
+        for key in ["nt_hash", "ntlmv2_hash"] {
+            let toml = format!(
+                "[credentials]\nusername = \"a\"\n{key} = \"8846f7eaee8fb117ad06bdd830b7586c\""
+            );
+            let overrides = Overrides {
+                password: Some(SecretString::from("prompted".to_owned())),
+                ..Overrides::default()
+            };
+            let creds = Config::from_toml_str(&toml, overrides)
+                .unwrap()
+                .credentials
+                .unwrap();
+            assert_eq!(creds.secret.unwrap().kind(), "password", "{key}");
+        }
+    }
+
+    #[test]
+    fn command_line_alone_can_define_credentials() {
+        let overrides = Overrides {
+            username: Some("bob".into()),
+            password: Some(SecretString::from("p".to_owned())),
+            ..Overrides::default()
+        };
+        let creds = Config::from_toml_str("", overrides)
+            .unwrap()
+            .credentials
+            .unwrap();
+        assert_eq!(creds.username, "bob");
+        assert_eq!(creds.method, AuthMethod::Ntlmv2);
+    }
+
+    #[test]
+    fn credentials_are_the_same_only_if_everything_about_them_is() {
+        let credentials = |toml: &str| load(toml).unwrap().credentials.unwrap();
+        let base = "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"";
+        assert!(credentials(base).same_as(&credentials(base)));
+        assert!(credentials(base).same_as(&credentials(base).clone()));
+
+        let hash = "8846f7eaee8fb117ad06bdd830b7586c";
+        for other in [
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-two\"".to_owned(),
+            "[credentials]\nusername = \"bob\"\ndomain = \"CORP\"\npassword = \"pw-one\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"OTHER\"\npassword = \"pw-one\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\nmethod = \"nt\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\nworkstation = \"PC\"".to_owned(),
+            "[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\npassword = \"pw-one\"\n\
+             origin_hosts = [\"intranet.example.com\"]"
+                .to_owned(),
+            format!("[credentials]\nusername = \"alice\"\ndomain = \"CORP\"\nnt_hash = \"{hash}\""),
+        ] {
+            assert!(!credentials(base).same_as(&credentials(&other)), "{other}");
+        }
+        // The same hash, and the same hash as another kind, which is not the same secret.
+        let nt = format!("[credentials]\nusername = \"a\"\nnt_hash = \"{hash}\"");
+        let v2 = format!("[credentials]\nusername = \"a\"\nntlmv2_hash = \"{hash}\"");
+        assert!(credentials(&nt).same_as(&credentials(&nt)));
+        assert!(!credentials(&nt).same_as(&credentials(&v2)));
+        // Kerberos has no secret, and a service name that can differ.
+        let kerberos =
+            |spn: &str| format!("[credentials]\nmethod = \"negotiate\"\nspn = \"{spn}\"");
+        assert!(credentials(&kerberos("HTTP@a")).same_as(&credentials(&kerberos("HTTP@a"))));
+        assert!(!credentials(&kerberos("HTTP@a")).same_as(&credentials(&kerberos("HTTP@b"))));
+    }
+}
