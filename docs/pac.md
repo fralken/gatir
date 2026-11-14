@@ -222,6 +222,9 @@ a pathological regular expression is stopped. The limits are fixed:
 - one evaluation may take 5 seconds and 64 MB;
 - four evaluations can run at once;
 - a name lookup is waited for 2 seconds, and its answer is remembered for 60.
+  A name is looked up once at a time: a script that asks for it again while
+  it is looked up waits for that lookup, and once a lookup was waited for in
+  vain, the next calls for that name answer at once, without an address.
 
 Some work cannot be interrupted from inside: a loop inside a built-in function,
 or a name lookup that does not end. gatir waits 2 more seconds for such an

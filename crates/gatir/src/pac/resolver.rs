@@ -2,16 +2,17 @@
 //!
 //! A PAC script may call `dnsResolve` several times per request, and a lookup
 //! that hangs cannot be interrupted from inside the script engine. So lookups
-//! run on their own threads, the script waits for them for a limited time only,
-//! and answers are cached: a script that asks about the same name again does
-//! not wait again, and neither does the one after it if the first gave up.
+//! run on their own threads, and the script waits for them for a limited time
+//! only. A name is looked up once at a time: whoever asks for it while its
+//! lookup runs waits for that lookup, and once someone has waited for it in
+//! vain, those who ask next do not wait at all. Answers are cached, so a name
+//! that was answered is not waited for again either.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// At most this many lookups are in progress at once; more are refused.
@@ -65,10 +66,55 @@ struct Cached {
     until: Instant,
 }
 
+/// A lookup under way, shared by everyone who asks for its name meanwhile.
+#[derive(Default)]
+struct Pending {
+    state: Mutex<PendingState>,
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct PendingState {
+    /// The answer, once the lookup is done.
+    addresses: Option<Vec<IpAddr>>,
+    /// Someone waited for the whole time limit without an answer.
+    given_up: bool,
+}
+
+impl Pending {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits at most `timeout` for the answer. Does not wait at all if someone
+    /// already waited in vain: the lookup has shown that it is slow.
+    fn wait(&self, timeout: Duration) -> Option<Vec<IpAddr>> {
+        let state = self.lock();
+        if state.addresses.is_none() && state.given_up {
+            return None;
+        }
+        let (mut state, _) = self
+            .done
+            .wait_timeout_while(state, timeout, |state| state.addresses.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.addresses.is_none() {
+            state.given_up = true;
+        }
+        state.addresses.clone()
+    }
+
+    fn finish(&self, addresses: Vec<IpAddr>) {
+        self.lock().addresses = Some(addresses);
+        self.done.notify_all();
+    }
+}
+
 struct Inner {
     lookup: Box<Lookup>,
     ttl: Duration,
     cache: Mutex<HashMap<String, Cached>>,
+    /// The lookups under way, by name.
+    pending: Mutex<HashMap<String, Arc<Pending>>>,
     in_flight: AtomicUsize,
 }
 
@@ -134,6 +180,7 @@ impl SystemResolver {
                 lookup: Box::new(lookup),
                 ttl,
                 cache: Mutex::new(HashMap::new()),
+                pending: Mutex::new(HashMap::new()),
                 in_flight: AtomicUsize::new(0),
             }),
             timeout,
@@ -166,35 +213,67 @@ impl Resolver for SystemResolver {
         if let Some(addresses) = self.inner.cached(&name) {
             return addresses;
         }
+        let Some(pending) = self.pending(&name) else {
+            return Vec::new();
+        };
+        pending.wait(self.timeout).unwrap_or_else(|| {
+            tracing::debug!(%name, "name lookup timed out");
+            Vec::new()
+        })
+    }
+}
+
+impl SystemResolver {
+    /// The lookup of `name` under way, started now if there is none. `None`
+    /// if it cannot be started.
+    fn pending(&self, name: &str) -> Option<Arc<Pending>> {
+        let mut pending = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(under_way) = pending.get(name) {
+            return Some(under_way.clone());
+        }
+        // The answer may have arrived since the cache was asked.
+        if let Some(addresses) = self.inner.cached(name) {
+            let done = Arc::new(Pending::default());
+            done.finish(addresses);
+            return Some(done);
+        }
         if self.inner.in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
             self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!(%name, "too many name lookups in progress, giving up on this one");
-            return Vec::new();
+            return None;
         }
 
-        let (send, receive) = mpsc::channel();
+        let lookup = Arc::new(Pending::default());
         let inner = self.inner.clone();
-        let lookup_name = name.clone();
+        let shared = lookup.clone();
+        let lookup_name = name.to_owned();
         let started = std::thread::Builder::new()
             .name("gatir-dns".to_owned())
             .spawn(move || {
                 let mut addresses = (inner.lookup)(&lookup_name);
                 // IPv4 first: `dnsResolve` returns the first address.
                 addresses.sort_by_key(IpAddr::is_ipv6);
-                // Stored here, not by the caller, so a lookup the script gave up
-                // on still helps the next one.
-                inner.store(lookup_name, addresses.clone());
+                // Cached before the lookup stops being under way, so that a
+                // caller always finds one or the other.
+                inner.store(lookup_name.clone(), addresses.clone());
+                inner
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&lookup_name);
                 inner.in_flight.fetch_sub(1, Ordering::AcqRel);
-                let _ = send.send(addresses);
+                shared.finish(addresses);
             });
         if started.is_err() {
             self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
-            return Vec::new();
+            return None;
         }
-        receive.recv_timeout(self.timeout).unwrap_or_else(|_| {
-            tracing::debug!(%name, "name lookup timed out");
-            Vec::new()
-        })
+        pending.insert(name.to_owned(), lookup.clone());
+        Some(lookup)
     }
 }
 
@@ -275,6 +354,61 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(resolver.resolve("slow.example.com"), [v4(9, 9, 9, 9)]);
+    }
+
+    #[test]
+    fn a_name_asked_for_while_it_is_looked_up_waits_for_that_lookup() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let resolver = SystemResolver::with_lookup(
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                vec![v4(5, 5, 5, 5)]
+            },
+        );
+        let answers: Vec<Vec<IpAddr>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..5)
+                .map(|_| scope.spawn(|| resolver.resolve("shared.example.com")))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            answers.iter().all(|a| a == &[v4(5, 5, 5, 5)]),
+            "{answers:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn once_a_lookup_was_waited_for_in_vain_the_next_call_does_not_wait() {
+        // A script that asks about the same name three times, while the DNS
+        // does not answer, waits for it once, not three times.
+        let calls = Arc::new(AtomicU32::new(0));
+        let counted = calls.clone();
+        let resolver = SystemResolver::with_lookup(
+            Duration::from_millis(150),
+            Duration::from_secs(60),
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(800));
+                vec![v4(7, 7, 7, 7)]
+            },
+        );
+        let started = Instant::now();
+        for _ in 0..3 {
+            assert!(resolver.resolve("hanging.example.com").is_empty());
+        }
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(400), "{waited:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // When the lookup does end, its answer is there for the next call.
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(resolver.resolve("hanging.example.com"), [v4(7, 7, 7, 7)]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
